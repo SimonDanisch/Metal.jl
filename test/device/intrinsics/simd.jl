@@ -355,6 +355,75 @@ using Metal: metal_support
     end
 end # @testset "shuffle functions"
 
+@testset "reduction functions" begin
+    # `simd_sum` and friends: one instruction that reduces across the whole
+    # SIMD-group and leaves the result on EVERY lane. The alternative a caller
+    # would otherwise write is a log2(width) shuffle butterfly — five
+    # instructions at width 32 to do what the hardware does in one.
+
+    # Every lane, not just the first. A reduction and an inclusive scan agree on
+    # the last lane and nowhere else, so checking one element would pass an
+    # implementation wired to the wrong AIR intrinsic.
+    @testset "simd_sum($T)" for T in (Float32, Float16, Int32, UInt32)
+        function kernel(a, out)
+            i = thread_position_in_grid_1d()
+            out[i] = simd_sum(a[i])
+            return
+        end
+        n = Int(32)
+        a = MtlArray(T.(1:n))
+        out = MtlArray(zeros(T, n))
+        Metal.@sync @metal threads=n kernel(a, out)
+        @test all(==(T(sum(1:n))), Array(out))
+    end
+
+    @testset "simd_product/min/max($T)" for T in (Float32, Int32)
+        function kmin(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_min(a[i]); return
+        end
+        function kmax(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_max(a[i]); return
+        end
+        function kprod(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_product(a[i]); return
+        end
+        n = 32
+        a = MtlArray(T.(1:n)); out = MtlArray(zeros(T, n))
+        Metal.@sync @metal threads=n kmin(a, out)
+        @test all(==(T(1)), Array(out))
+        Metal.@sync @metal threads=n kmax(a, out)
+        @test all(==(T(n)), Array(out))
+        # A product of 1:32 overflows every type here, so reduce something that
+        # does not: three non-unit factors and the rest ones.
+        v = ones(Int, n); v[1:3] .= (2, 3, 4)
+        ap = MtlArray(T.(v))
+        Metal.@sync @metal threads=n kprod(ap, out)
+        @test all(==(T(24)), Array(out))
+    end
+
+    # Bitwise reductions are integer-only in MSL.
+    @testset "simd_and/or/xor($T)" for T in (Int32, UInt32)
+        function kand(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_and(a[i]); return
+        end
+        function kor(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_or(a[i]); return
+        end
+        function kxor(a, out)
+            i = thread_position_in_grid_1d(); out[i] = simd_xor(a[i]); return
+        end
+        n = 32
+        v = collect(1:n)
+        a = MtlArray(T.(v)); out = MtlArray(zeros(T, n))
+        Metal.@sync @metal threads=n kand(a, out)
+        @test all(==(T(reduce(&, v))), Array(out))
+        Metal.@sync @metal threads=n kor(a, out)
+        @test all(==(T(reduce(|, v))), Array(out))
+        Metal.@sync @metal threads=n kxor(a, out)
+        @test all(==(T(reduce(⊻, v))), Array(out))
+    end
+end
+
 @testset "matrix functions" begin
     # BFloat16 simdgroup matrices have no native LLVM type before Julia 1.13; the `bf16` AIR
     # intrinsics arrive with `i16` operands and are re-typed to native `bfloat` by GPUCompiler's

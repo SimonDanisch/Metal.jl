@@ -37,6 +37,35 @@ for T in (UInt8, Int8)
     end
 end
 
+"""
+    append_copy!(enc, dst::MTLBuffer, doff, bytes_per_row, bytes_per_image,
+                 src::MTLTexture, origin, size, slice = 0, level = 0)
+
+Copy a texture region into buffer memory.
+
+The only way off a PRIVATE texture: `getBytes!` needs shared or managed
+storage, and a render target the GPU writes wants neither — a frame graph's
+attachments live in device memory and are read back, if at all, through a copy
+like this one.
+
+`bytes_per_image` may be 0 for a 2D copy; Metal then derives it from the row
+stride and the height.
+"""
+function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLBuffer, doff::Integer,
+                      bytes_per_row::Integer, bytes_per_image::Integer,
+                      src::MTLTexture, origin::MTLOrigin, size::MTLSize,
+                      slice::Integer = 0, level::Integer = 0)
+    @objc [enc::id{MTLBlitCommandEncoder} copyFromTexture:src::id{MTLTexture}
+                                          sourceSlice:slice::NSUInteger
+                                          sourceLevel:level::NSUInteger
+                                          sourceOrigin:origin::MTLOrigin
+                                          sourceSize:size::MTLSize
+                                          toBuffer:dst::id{MTLBuffer}
+                                          destinationOffset:doff::NSUInteger
+                                          destinationBytesPerRow:bytes_per_row::NSUInteger
+                                          destinationBytesPerImage:bytes_per_image::NSUInteger]::Nothing
+end
+
 # only for managed resources
 function append_sync!(enc::MTLBlitCommandEncoder, src::MTLBuffer)
     @objc [enc::id{MTLBlitCommandEncoder} synchronizeResource:src::id{MTLBuffer}]::Nothing

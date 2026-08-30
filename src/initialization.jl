@@ -72,6 +72,11 @@ function __init__()
     @autoreleasepool try
         load_framework("CoreGraphics")
         load_framework("MetalPerformanceShadersGraph")
+        # `CAMetalLayer` lives here, and it is the only way anything Metal draws
+        # reaches a screen — see `lib/mtl/layer.jl`. Loaded beside the others
+        # rather than by whoever first asks for a layer, so the class resolves
+        # wherever it is named.
+        load_framework("QuartzCore")
         ver = MTL.MTLCompileOptions().languageVersion
         @debug "Successfully loaded Metal; targeting v$ver."
 

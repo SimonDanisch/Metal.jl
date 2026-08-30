@@ -117,6 +117,13 @@ Base.@kwdef struct MetalLibFunction
     air_version::VersionNumber
     metal_version::VersionNumber
 
+    # Which AIR program this is. Hardcoded to `PROGRAM_KERNEL` on write until
+    # Metal.jl could emit anything else; a vertex or fragment program packed
+    # under the kernel tag is rejected by the loader with no useful diagnostic.
+    # The reader has always parsed the tag — it just had nowhere to put it, so a
+    # metallib could not round-trip its own stage.
+    program_type::ProgramType = PROGRAM_KERNEL
+
     air_module::Vector{UInt8}
 
     source_id::Union{Nothing,String} = nothing
@@ -768,6 +775,8 @@ function Base.read(io::IO, ::Type{MetalLib})
         push!(functions, MetalLibFunction(;
             name = function_list[i]["NAME"],
             air_module = module_list[i],
+            # Retained now, so a parsed library writes back the stage it had.
+            program_type = function_list[i]["TYPE"],
             air_version=function_list[i]["VERS"].air,
             metal_version=function_list[i]["VERS"].metal,
             optional_args...
@@ -896,7 +905,7 @@ function Base.write(io::IO, lib::MetalLib)
         # tags
         function_tags = TagGroup()
         function_tags["NAME"] = fun.name
-        function_tags["TYPE"] = PROGRAM_KERNEL
+        function_tags["TYPE"] = fun.program_type
         function_tags["HASH"] = module_hash
         function_tags["OFFT"] = (; public_md=public_md_offset,
                                    private_md=private_md_offset,

@@ -109,10 +109,45 @@ struct Adaptor
     cce::Union{Nothing,MTLComputeCommandEncoder}
 end
 
+"""
+Make `buf` resident for every dispatch on its device's queue.
+
+For the case where a GPU address is handed out with no encoder in scope — see
+the `adapt_storage` below. Metal's residency set is the only mechanism that
+works then: `useResource` needs an encoder, and by the time one exists nobody
+remembers this buffer.
+
+Committing per call is fine because this path runs when a caller BAKES an
+address (scene setup, building a pointer table), not per launch.
+"""
+function make_persistently_resident!(buf::MTLBuffer)
+    dev = buf.device
+    can_use_residency_sets(dev) || return buf
+    bq = global_queue(dev)
+    queue = bq isa MTLCommandQueue ? bq : getfield(bq, :queue)
+    resset = install_queue_residency!(queue, dev)
+    MTL.add_allocation!(resset, buf)
+    MTL.commit!(resset)
+    return buf
+end
+
 # convert Metal buffers to their GPU address
 function Adapt.adapt_storage(to::Adaptor, buf::MTLBuffer)
     if to.cce !== nothing
+        # Inside a launch: the encoder makes it resident for this dispatch.
         MTL.use!(to.cce, buf, MTL.ReadWriteUsage)
+    else
+        # No encoder. The caller is converting an array to a raw GPU address to
+        # STORE somewhere — a pointer table, an argument buffer, a struct field
+        # the launch path never walks. Nothing will `useResource` it at dispatch
+        # time, so unless it is made resident now the GPU reads unmapped memory.
+        #
+        # That failure is silent and intermittent: reads come back as zeros when
+        # the page happens not to be mapped, which is why it shows up as a
+        # texture that is sometimes black. Raycore's `store_texture` reaches
+        # exactly this path via `KA.argconvert`, and its image textures and
+        # environment maps were the symptom.
+        make_persistently_resident!(buf)
     end
     reinterpret(Core.LLVMPtr{Nothing,AS.Device}, buf.gpuAddress)
 end

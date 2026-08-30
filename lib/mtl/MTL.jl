@@ -46,6 +46,11 @@ include("compute_pipeline.jl")
 include("command_enc.jl")
 include("command_enc/blit.jl")
 include("command_enc/compute.jl")
+include("command_enc/render.jl")
+include("layer.jl")
+# Hardware ray tracing. The ObjC classes come from `libmtl.jl`; these are the
+# methods — descriptors, sizing, and the build/refit encoder.
+include("acceleration_structure.jl")
 include("binary_archive.jl")
 include("capture.jl")
 include("texture.jl")

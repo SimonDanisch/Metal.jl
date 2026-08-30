@@ -41,6 +41,7 @@ include("storage_type.jl")
 include("../lib/mtl/MTL.jl")
 using .MTL
 export MTL
+export register_linked_function!
 
 # essential stuff
 include("state.jl")
@@ -60,6 +61,7 @@ include("device/intrinsics/math.jl")
 include("device/intrinsics/synchronization.jl")
 include("device/intrinsics/memory.jl")
 include("device/intrinsics/simd.jl")
+include("device/intrinsics/graphics.jl")
 include("device/intrinsics/tensor.jl")
 include("device/intrinsics/atomics.jl")
 include("device/malloc.jl")
@@ -76,6 +78,7 @@ include("array.jl")
 include("compiler/library.jl")
 include("compiler/archive.jl")
 include("compiler/compilation.jl")
+include("compiler/graphics.jl")
 include("compiler/exceptions.jl")
 include("compiler/execution.jl")
 include("compiler/reflection.jl")

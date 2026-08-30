@@ -10,6 +10,22 @@ function MTLComputePipelineDescriptor()
     return @objc [MTLComputePipelineDescriptor new]::MTLComputePipelineDescriptor
 end
 
+export MTLLinkedFunctions
+
+"""
+    MTLLinkedFunctions()
+
+An empty set of functions to link into a pipeline.
+
+Assign `.functions` (a `Vector{MTLFunction}` of `[[visible]]` functions) and set
+it on a `MTLComputePipelineDescriptor.linkedFunctions`. This is how a kernel
+calls something the Metal frontend had to compile — an `intersector<>`, for
+instance — that has no AIR symbol a compiler back-end could emit directly.
+"""
+function MTLLinkedFunctions()
+    return @objc [MTLLinkedFunctions new]::MTLLinkedFunctions
+end
+
 #
 # compute pipeline state
 #

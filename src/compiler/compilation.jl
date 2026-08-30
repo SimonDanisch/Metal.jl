@@ -3,9 +3,25 @@
 struct MetalCompilerParams <: AbstractCompilerParams
     # Highest targeted MTLGPUFamilyApple<n>, or 0 if the device reports none.
     apple_family::Int
+    # Which AIR program this compiles to: `:kernel`, `:vertex` or `:fragment`.
+    #
+    # A graphics stage is compiled exactly like a kernel — every Metal-specific
+    # transform in GPUCompiler's `finish_ir!` is gated on `job.config.kernel`,
+    # and a vertex program needs the address-space rewrites and the argument
+    # metadata just as much as a compute one — and is then REWRITTEN into a
+    # stage by `graphics_stage!`, which runs after that. See
+    # `compiler/graphics.jl` for what a stage has to look like and where the
+    # specification came from.
+    stage::Symbol
 end
+MetalCompilerParams(apple_family::Int) = MetalCompilerParams(apple_family, :kernel)
+
 const MetalCompilerConfig = CompilerConfig{MetalCompilerTarget, MetalCompilerParams}
 const MetalCompilerJob = CompilerJob{MetalCompilerTarget, MetalCompilerParams}
+
+"""Is this job compiling a vertex or fragment program rather than a kernel?"""
+isgraphics(job::CompilerJob) = false
+isgraphics(job::MetalCompilerJob) = job.config.params.stage !== :kernel
 
 """
     MetalResults
@@ -56,7 +72,14 @@ GPUCompiler.runtime_module(::MetalCompilerJob) = Metal
 
 GPUCompiler.method_table(::MetalCompilerJob) = method_table
 
-GPUCompiler.kernel_state_type(job::MetalCompilerJob) = KernelState
+# A graphics stage has NO kernel state. `KernelState` carries the machinery a
+# compute launch needs — exception reporting, the relocation table — and none of
+# it is reachable from a vertex or fragment program: nothing binds it, and it
+# would occupy buffer slot 0, silently shifting every buffer the caller does
+# bind. Returning `Nothing` here is what keeps `kernel_state_to_reference!` from
+# prepending the parameter in the first place.
+GPUCompiler.kernel_state_type(job::MetalCompilerJob) =
+    isgraphics(job) ? Nothing : KernelState
 
 # Keep relocations symbolic. Most kernels are relocation-free, so their metallib is
 # byte-stable across sessions, which restores pkgimage persistence (`can_persist_results`)
@@ -84,7 +107,106 @@ GPUCompiler.relocation_lowering(@nospecialize(job::MetalCompilerJob)) =
 GPUCompiler.isintrinsic(@nospecialize(job::MetalCompilerJob), fn::String) =
     invoke(GPUCompiler.isintrinsic,
            Tuple{CompilerJob{MetalCompilerTarget}, String}, job, fn) ||
-    startswith(fn, "__tensorops_")
+    startswith(fn, "__tensorops_") ||
+    startswith(fn, LINKED_FUNCTION_PREFIX)
+
+
+# ── Externally linked visible functions ───────────────────────────────────────
+#
+# Some things cannot be written in Julia and compiled to AIR. The ray-tracing
+# `intersector<>` is the example that forced this: it is a C++ class template
+# the Metal *frontend* instantiates and inlines, so there is no `air.*` symbol
+# for a `ccall` to name and no `@device_override` that could become one.
+#
+# Metal's answer is `MTLLinkedFunctions`: compile the thing as a `[[visible]]`
+# function in MSL (`MTLLibrary(dev, source)` runs the frontend at runtime, no
+# Xcode needed) and link it into the pipeline of a kernel that calls it. The
+# caller declares it as an ordinary extern:
+#
+#     ccall("extern __metal_linked_trace", llvmcall, Float32,
+#           (LLVMPtr{UInt8,1}, ...), scene_ptr, ...)
+#
+# Two things have to line up for that to work, and both are below: IR
+# validation has to stop treating the symbol as an unknown function (the
+# `isintrinsic` clause above — the same trick `__tensorops_` already uses), and
+# the pipeline has to be created with the function attached.
+#
+# The prefix is load-bearing, not decoration: it is what tells the validator
+# "this is deliberately unresolved, someone will link it". A typo'd name still
+# fails, just later and from Metal rather than from Julia.
+const LINKED_FUNCTION_PREFIX = "__metal_linked_"
+
+const linked_functions_lock = ReentrantLock()
+# Keyed on the device pointer, like `submission_state_per_queue` next door.
+const linked_functions = Dict{id{MTLDevice}, Vector{MTLFunction}}()
+
+"""
+    register_linked_function!(dev, fun)
+
+Make `fun` — a `[[visible]]` MSL function — available to every kernel compiled
+for `dev` that calls it by name.
+
+The name must start with `$(LINKED_FUNCTION_PREFIX)`, so that a Julia kernel
+referencing it survives IR validation. Registering the same name twice is a
+no-op, which keeps this callable from a lazy initializer.
+
+Pipelines built while any function is registered take the linked path, which
+skips the binary archive: the archive is keyed on the metallib alone and would
+otherwise serve native code compiled without the linked function.
+"""
+function register_linked_function!(dev::MTLDevice, fun::MTLFunction)
+    # `fun.name` is an `NSString`; compare as a Julia `String`.
+    name = String(fun.name)
+    startswith(name, LINKED_FUNCTION_PREFIX) || throw(ArgumentError(
+        "register_linked_function!: name must start with \"$(LINKED_FUNCTION_PREFIX)\" " *
+        "so that IR validation accepts a call to it; got \"$(name)\""))
+    Base.@lock linked_functions_lock begin
+        v = get!(() -> MTLFunction[], linked_functions, pointer(dev))
+        any(f -> String(f.name) == name, v) || push!(v, fun)
+    end
+    return fun
+end
+
+"""The visible functions registered for `dev`, in registration order."""
+function linked_functions_for(dev::MTLDevice)
+    Base.@lock linked_functions_lock begin
+        v = get(linked_functions, pointer(dev), nothing)
+        return v === nothing ? MTLFunction[] : copy(v)
+    end
+end
+
+"""
+Create a pipeline with `linked` attached.
+
+`privateFunctions`, not `functions`. Both link the code in, and the difference
+is what the compiler is then allowed to do with it: a function in `functions`
+stays reachable through a visible-function table, so it must survive as a real
+call with a stable ABI; one in `privateFunctions` is visible only to this
+pipeline and CAN BE INLINED. Nothing here ever calls the traversal through a
+function pointer — the kernel names it directly — so the visible-function table
+is API surface promising a reachability nobody uses.
+
+Measured, it is a wash: crown at 1000x1400 / 8 spp came out at 2.770 s against
+2.764 s with `functions`, killeroo at 1.112 s against 1.114 s. So this is not a
+speedup, it is the accurate description of what the pipeline needs; the Metal
+compiler evidently already handles the call boundary well.
+
+`maxCallStackDepth` has to be raised above its default of 1: a linked function
+that itself calls another (the intersector's own helpers count) overflows it,
+and the failure is a pipeline-creation error rather than anything that names
+the cause. Kept even with inlining allowed, because "allowed" is not "will".
+"""
+function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFunction})
+    desc = MTLComputePipelineDescriptor()
+    desc.computeFunction = fun
+    lf = MTL.MTLLinkedFunctions()
+    # `NSArray`, as with `desc.binaryArchives` in archive.jl — the setter takes
+    # an ObjC array, not a Julia Vector.
+    lf.privateFunctions = NSArray(linked)
+    desc.linkedFunctions = lf
+    desc.maxCallStackDepth = 4
+    return MTLComputePipelineState(dev, desc)
+end
 
 
 
@@ -279,6 +401,35 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
     entry = invoke(GPUCompiler.finish_ir!,
                    Tuple{CompilerJob{MetalCompilerTarget}, LLVM.Module, LLVM.Function},
                    job, mod, entry)
+
+    # A vertex or fragment program is a kernel up to this point and a stage from
+    # here on: the call above is what applied the address-space rewrites and
+    # emitted the argument metadata, and both are needed either way. See
+    # `compiler/graphics.jl`.
+    if isgraphics(job)
+        stage = job.config.params.stage
+        T_out = stage_output_type(job)
+        markers = stage_input_types(job)
+        # Builtins first: `vertex_index()` and friends become TRAILING parameters,
+        # so they have to be appended while the output pointer is still last —
+        # otherwise they would land after it and `stage_return!` would drop the
+        # wrong one.
+        entry, implicit = stage_builtins_before_output!(job, mod, entry)
+        append!(markers, implicit)
+        # Output next: it drops the trailing pointer, so the marker list — which
+        # already excludes it — lines up with the parameters afterwards.
+        entry = stage_return!(job, mod, entry)
+        entry = stage_inputs!(job, mod, entry, markers)
+        retag_stage!(job, mod, entry, stage, T_out, markers)
+        # A stage has no kernel state, so the throw sites GPUCompiler lowered
+        # cannot signal through one. Before the cleanup, so the emptied function
+        # is inlined away.
+        stage_drop_exception_signal!(mod)
+        # …and then get rid of the slots both passes introduced, before the
+        # thread-to-device casts around them reach the driver.
+        stage_cleanup!(job, mod)
+        entry = functions(mod)[LLVM.name(entry)]
+    end
 
     # downgrade intrinsics when targeting older AIR or Metal versions
     ## atomics
@@ -490,7 +641,25 @@ end
                                          debug_level=Base.JLOptions().debug_level,
                                          opt_level=2,
                                          macos=nothing, air=nothing, metal=nothing,
-                                         gpufamily=nothing, kwargs...)
+                                         gpufamily=nothing, stage::Symbol=:kernel, kwargs...)
+    stage in (:kernel, :vertex, :fragment) ||
+        throw(ArgumentError("stage must be :kernel, :vertex or :fragment, got :$stage"))
+    # A graphics stage reports no exceptions, so it is compiled at debug level 0
+    # whatever the session's `-g` is.
+    #
+    # Reporting means writing the `KernelState` exception mailbox, and a stage
+    # HAS no kernel state (see `kernel_state_type`): nothing binds one, and a
+    # buffer for it would take slot 0 and shift every buffer the caller does
+    # bind. At level >= 1 `@gputhrow` emits `record_exception!`, that reads
+    # `kernel_state()`, and the module then fails validation naming
+    # `julia.gpu.state_getter` — an intrinsic no shader author wrote, from a
+    # bounds check they did not know they had.
+    #
+    # What a stage keeps is the `llvm.trap` GPUCompiler emits at every throw
+    # site, so an out-of-bounds vertex fetch still aborts the lane rather than
+    # reading whatever is at that address. Only the reporting goes, and there
+    # was no channel to report on.
+    stage === :kernel || (debug_level = 0)
     # determine the versions of things to target
     if macos === nothing
         macos = macos_version()
@@ -524,7 +693,9 @@ end
 
     # create GPUCompiler objects
     target = MetalCompilerTarget(; macos, air, metal, kwargs...)
-    params = MetalCompilerParams(apple_family)
+    params = MetalCompilerParams(apple_family, stage)
+    # `kernel = true` even for a graphics stage: that flag is what turns on the
+    # address-space and argument-metadata work a stage also needs.
     CompilerConfig(target, params; kernel, name, always_inline, debug_level, opt_level)
 end
 
@@ -617,6 +788,7 @@ function compile_to_metallib(@nospecialize(job::CompilerJob))
     @signpost_interval log=log_compiler() "Create Metal library" begin
         metallib = try
             fun = MetalLibFunction(; name=entry, air_module=air,
+                                     program_type=air_program_type(job),
                                      air_version=job.config.target.air,
                                      metal_version=job.config.target.metal)
             lib = MetalLib(; functions = [fun],
@@ -673,6 +845,10 @@ end
         lib = MTLLibraryFromData(dev, metallib)
         fun = MTLFunction(lib, entry)
         try
+            # Linked functions bypass the binary archive — see
+            # `register_linked_function!` for why.
+            linked = linked_functions_for(dev)
+            isempty(linked) || return linked_pipeline(dev, fun, linked)
             return archived_pipeline(dev, fun, metallib, entry)
         catch err
             isa(err, NSError) || rethrow()

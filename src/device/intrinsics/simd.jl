@@ -2,6 +2,7 @@ export simdgroup_load, simdgroup_store, simdgroup_multiply, simdgroup_multiply_a
         MtlSimdgroupMatrix,
         simd_shuffle_down, simd_shuffle_up, simd_shuffle_and_fill_down, simd_shuffle_and_fill_up,
         simd_shuffle, simd_shuffle_xor, simd_ballot, simd_vote_all, simd_vote_any,
+        simd_sum, simd_product, simd_min, simd_max, simd_and, simd_or, simd_xor,
         quad_shuffle_down, quad_shuffle_up, quad_shuffle_and_fill_down, quad_shuffle_and_fill_up,
         quad_shuffle, quad_shuffle_xor, quad_ballot, quad_vote_all, quad_vote_any
 
@@ -237,6 +238,40 @@ for (jltype, suffix) in simd_shuffle_map, (mod_f, prefix) in ((threads_per_simdg
         @device_function $_shuffle_and_fill_up(data::$jltype, filling_data::$jltype, delta::Integer, modulo::Integer=$mod_f()) =
             ccall($"extern air.$(prefix)_shuffle_and_fill_up.$suffix",
                 llvmcall, $jltype, ($jltype, $jltype, Int16, Int16), data, filling_data, delta, modulo)
+    end
+end
+
+## SIMD Reduction Functions
+#
+# MSL's `simd_sum` and friends: one instruction that reduces a value across the
+# whole SIMD-group and leaves the result on EVERY lane. Without them a caller
+# has to write a log2(width) shuffle butterfly, which is five instructions at
+# width 32 where the hardware has one.
+#
+# The AIR names follow the shuffle intrinsics' convention exactly, including the
+# signed/unsigned split in the suffix for integers — `simd_shuffle_map` is
+# reused rather than re-spelled so the two families cannot drift apart.
+#
+# `and`/`or`/`xor` are integer-only in MSL, so they are generated from the
+# integer half of the map.
+
+const simd_reduction_ops = ((:simd_sum,     "simd_sum"),
+                            (:simd_product, "simd_product"),
+                            (:simd_min,     "simd_min"),
+                            (:simd_max,     "simd_max"))
+
+for (jltype, suffix) in simd_shuffle_map, (fname, airname) in simd_reduction_ops
+    @eval @device_function $fname(data::$jltype) =
+        ccall($"extern air.$(airname).$suffix", llvmcall, $jltype, ($jltype,), data)
+end
+
+# Bitwise reductions exist for integers only.
+for (jltype, suffix) in simd_shuffle_map
+    jltype in (:Float32, :Float16) && continue
+    for (fname, airname) in ((:simd_and, "simd_and"), (:simd_or, "simd_or"),
+                             (:simd_xor, "simd_xor"))
+        @eval @device_function $fname(data::$jltype) =
+            ccall($"extern air.$(airname).$suffix", llvmcall, $jltype, ($jltype,), data)
     end
 end
 
