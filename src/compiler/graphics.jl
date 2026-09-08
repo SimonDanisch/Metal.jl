@@ -55,6 +55,86 @@
 #   textures: {i32 <n>, air.texture, air.location_index, i32 <loc>, i32 1,
 #              air.sample, air.arg_type_name, "texture2d<half, sample>", …}
 #
+# ── The mesh stage, read out of a shipping metallib the same way ────────────
+#
+# NOT IMPLEMENTED HERE YET. This is the specification for it, recorded where the
+# vertex and fragment one is, and obtained the same way: a scan of the 296
+# metallibs under /System/Library found exactly one function with a program type
+# this reader has no name for, `particle_gaussian_mesh` in
+# `VFX.framework/Versions/A/Resources/default.metallib`. Reproduce with
+# `read(io, Metal.MetalLib)` and `parse(LLVM.Module, fn.air_module)`.
+#
+# PROGRAM TYPE is 7. `ProgramType` in `library.jl` stops at
+# `PROGRAM_INTERSECTION = 6`, so this value has no name there yet.
+#
+# NAMED METADATA is `air.mesh`, and its node has the same three operands as
+# `air.kernel` — {ptr @entry, outputs, inputs} — with the OUTPUTS EMPTY. That is
+# the structural difference from the vertex and fragment stages above: they
+# return a packed struct whose fields match the output list, and a mesh stage
+# returns nothing at all. Everything it produces goes through the object it is
+# handed.
+#
+# ENTRY SIGNATURE is `void`, and its FIRST parameter is the output object:
+#
+#   void (ptr addrspace(7), ptr addrspace(2), …, i32, i32, i32, i16)
+#
+# Address space 7 is the mesh object's. It is a parameter and not a global,
+# which is why an intrinsic that took only a slot could never be lowered here.
+#
+# THE OBJECT'S ARGUMENT ENTRY carries the bounds as compile-time constants:
+#
+#   {i32 0, air.mesh,
+#    !{"air.mesh_type_info", <vertex type>, <primitive type>,
+#      i32 96, i32 32, "air.triangle"},
+#    air.arg_type_name, "mesh<particle_vertex_io, particle_primitive_io, 96, 32, triangle>",
+#    air.arg_name, "output"}
+#
+# The two integers are max_vertices and max_primitives, and the string is the
+# topology. They are part of the TYPE, which is why `KernelInterface.MeshConfig`
+# holds them rather than a runtime: a backend cannot emit this entry without
+# them.
+#
+# THE INTRINSICS, all taking the object as their first argument:
+#
+#   air.set_position_mesh          (ptr addrspace(7), i32, <4 x float>)
+#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32, i32, <T>)
+#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32, i32, <T>)
+#   air.set_index_mesh             (ptr addrspace(7), i32, i8)
+#   air.set_primitive_count_mesh   (ptr addrspace(7), i32)
+#   air.set_clip_distance_mesh, air.set_render_target_array_index_mesh.i8,
+#   air.set_viewport_array_index_mesh.i8
+#
+# `<T>` is a suffix per value type — .f16 .i16 .i32 .v2f32 .v2i16 .v3f32 .v3f16
+# .v4f16 were present in this one module, so the set is open and driven by what
+# the shader writes.
+#
+# Three things follow for the lowering:
+#
+#   * POSITION IS ITS OWN INTRINSIC, not field zero of the vertex data. So
+#     `set_mesh_vertex!(out, slot, nt)` becomes one `air.set_position_mesh` plus
+#     one `air.set_vertex_data_mesh.<T>` per remaining field of the NamedTuple,
+#     indexed by field position.
+#   * INDICES ARE WRITTEN ONE AT A TIME AND ARE i8. One at a time is why
+#     `set_mesh_triangle!` takes the triple and a backend spends three calls:
+#     SPIR-V writes a `uvec3` in one, so the triple is the shape that fits both.
+#     `i8` is the harder consequence — a threadgroup's output holds at most 256
+#     vertices, which `MeshConfig` now refuses to exceed.
+#   * PER-PRIMITIVE DATA IS A SEPARATE INTRINSIC from per-vertex data. That is
+#     the flat varying, and `KernelInterface`'s vocabulary has no way to write
+#     one yet: `emit!(gs, vertex)` reaches `set_vertex_data` only. RayMakie's
+#     line shader writes ten of them, so this is the next gap to close, and it
+#     needs `varyings` to say which of its fields are flat.
+#
+# BUILTINS this one used: air.thread_position_in_grid,
+# air.thread_index_in_threadgroup, air.threads_per_threadgroup,
+# air.amplification_id.
+#
+# NO OBJECT STAGE was found. No function in any of the 296 libraries had a
+# program type of 8 or above, and this mesh shader has none — it reads
+# `air.thread_position_in_grid` and is dispatched by the host. So the object
+# stage's payload has no ground truth here, which is why `ObjectConfig` declares
+# none rather than guessing one.
+
 # ── The one non-obvious thing: how the stages are wired together ─────────────
 #
 # A varying is matched between stages by the STRING in the second slot, and by

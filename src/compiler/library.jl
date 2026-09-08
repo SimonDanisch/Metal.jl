@@ -62,6 +62,12 @@ end
     PROGRAM_VISIBLE      = 4
     PROGRAM_EXTERN       = 5
     PROGRAM_INTERSECTION = 6
+    # Read out of `particle_gaussian_mesh` in VFX.framework's shipping metallib,
+    # the only function with a type above 6 in the 296 libraries under
+    # /System/Library. Its AIR module registers the entry under `air.mesh`; see
+    # the mesh section in `compiler/graphics.jl`. No function anywhere had 8 or
+    # above, so an object stage's value is still unknown.
+    PROGRAM_MESH         = 7
     PROGRAM_NONE         = 255
 end
 
