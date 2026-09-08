@@ -42,8 +42,10 @@
 #   * an `MTLMeshRenderPipelineDescriptor` that creates a pipeline state, which
 #     means Metal validated the mesh stage's outputs against a fragment stage's
 #     inputs ACROSS BOTH PLANES — the `generated(...)` strings match;
-#   * IR that is `define void @entry(ptr addrspace(7))` with every intrinsic call
-#     surviving and `!air.mesh = !{!{ptr @entry, !{}, <args>}}`;
+#   * `define void @entry(ptr addrspace(7))` with `!air.mesh = !{!{ptr @entry,
+#     !{}, <args>}}` — checked in the module AS PACKED INTO THE METALLIB, not just
+#     in `compile(:llvm, job)` output, so a later pass dropping the calls is ruled
+#     out: all eleven survive with the right operands;
 #   * AND THE STAGE RUNS. A probe store from the body's first line lands.
 #
 # THE OBJECT OCCUPIES BUFFER SLOT 0. That is what made the stage look dead: the
