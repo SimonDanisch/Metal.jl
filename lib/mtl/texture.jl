@@ -64,6 +64,20 @@ function MTLTexture(heap::MTLHeap, descriptor, offset)
     return MTLTexture(ptr)
 end
 
+export replace_region!
+
+# Upload into a texture. The counterpart to `getBytes!` below, and the only way to
+# fill a texture that is not buffer-backed -- which a SAMPLED texture on an Apple
+# GPU has to be, because a linear texture cannot be a render target and the same
+# storage cannot be both.
+function replace_region!(tex::MTLTexture, region::MTLRegion, level::Integer,
+                         src::Ptr, bytesPerRow::Integer)
+    @objc [tex::id{MTLTexture} replaceRegion:region::MTLRegion
+                               mipmapLevel:level::NSUInteger
+                               withBytes:src::Ptr{Cvoid}
+                               bytesPerRow:bytesPerRow::NSUInteger]::Nothing
+end
+
 export getBytes!
 
 """

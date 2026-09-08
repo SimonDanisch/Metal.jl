@@ -1,7 +1,9 @@
 export MTLRenderCommandEncoder, MTLRenderPassDescriptor
+export MTLSamplerDescriptor, MTLSamplerState, MTLMeshRenderPipelineDescriptor
 export use!, set_front_facing_winding!,
        set_pipeline!, set_depth_stencil_state!, set_vertex_buffer!, set_vertex_bytes!,
        set_fragment_buffer!, set_fragment_bytes!, set_fragment_texture!,
+       set_fragment_sampler!,
        set_viewport!, set_cull_mode!, draw_primitives!, draw_primitives_indirect!,
        draw_indexed_primitives!,
        set_mesh_buffer!, set_mesh_bytes!, set_object_buffer!,
@@ -48,6 +50,13 @@ function MTLRenderPipelineState(dev::MTLDevice, desc::MTLMeshRenderPipelineDescr
     state === nothing && throw_error(err[])
     return state
 end
+
+# A sampler, and the descriptor it is built from. Neither was wrapped: nothing in
+# Metal.jl sampled a texture until Mantle's overlay path did.
+MTLSamplerDescriptor() = @objc [MTLSamplerDescriptor new]::MTLSamplerDescriptor
+
+MTLSamplerState(dev::MTLDevice, desc::MTLSamplerDescriptor) =
+    @objc [dev::id{MTLDevice} newSamplerStateWithDescriptor:desc::id{MTLSamplerDescriptor}]::MTLSamplerState
 
 MTLMeshRenderPipelineDescriptor() =
     @objc [MTLMeshRenderPipelineDescriptor new]::MTLMeshRenderPipelineDescriptor
@@ -113,6 +122,12 @@ set_fragment_buffer!(rce::MTLRenderCommandEncoder, buf::MTLBuffer, offset, index
 set_fragment_bytes!(rce::MTLRenderCommandEncoder, ptr::Ptr, len::Integer, index::Integer) =
     @objc [rce::id{MTLRenderCommandEncoder} setFragmentBytes:ptr::Ptr{Cvoid}
                                             length:len::NSUInteger
+                                            atIndex:(index-1)::NSUInteger]::Nothing
+
+# Its counterpart: a sampled texture needs both, and on Metal they occupy two
+# separate slot namespaces rather than one combined descriptor.
+set_fragment_sampler!(rce::MTLRenderCommandEncoder, st::MTLSamplerState, index) =
+    @objc [rce::id{MTLRenderCommandEncoder} setFragmentSamplerState:st::id{MTLSamplerState}
                                             atIndex:(index-1)::NSUInteger]::Nothing
 
 set_fragment_texture!(rce::MTLRenderCommandEncoder, tex::MTLTexture, index) =
