@@ -381,6 +381,7 @@ end
 stage_metadata_key(stage::Symbol) =
     stage === :vertex ? "air.vertex" :
     stage === :fragment ? "air.fragment" :
+    stage === :mesh ? "air.mesh" :
     error("no AIR metadata key for stage :$stage")
 
 """
@@ -394,6 +395,11 @@ every field is a render target. Field ORDER is the contract — the metadata lis
 and the struct's fields are matched positionally, not by name.
 """
 function stage_outputs(stage::Symbol, @nospecialize(T::Type))
+    # A mesh stage returns nothing at all: everything it produces goes through
+    # the object it was handed, so its `air.mesh` node carries an EMPTY output
+    # list. That is the structural difference from the two stages below, and it
+    # is what the shipping metallib shows.
+    stage === :mesh && return Metadata[]
     names = fieldnames(T)
     isempty(names) && error("a graphics stage must return at least one value")
     out = Metadata[]
@@ -465,7 +471,9 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     # metadata has to follow both, or the entries stop describing the parameters
     # they are indexed against.
     isempty(arg_infos) && error("no argument metadata to adapt")
-    pop!(arg_infos)                                   # the output pointer
+    # A mesh stage keeps every parameter it started with: nothing was dropped,
+    # because there was no output pointer to drop.
+    stage === :mesh || pop!(arg_infos)                # the output pointer
     nparams = length(collect(LLVM.parameters(function_type(entry))))
     while length(arg_infos) < nparams
         # A placeholder per appended builtin; `stage_input_metadata!` replaces it
@@ -478,6 +486,14 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
 
     isempty(markers) ||
         stage_input_metadata!(arg_infos, stage_align_markers(markers, length(arg_infos)))
+
+    # The object a mesh stage writes through. GPUCompiler described it as a
+    # buffer, which is what the kernel ABI made it; AIR needs `air.mesh` plus
+    # the whole type of the object, and that type is what bounds the stage.
+    if stage === :mesh
+        offset = length(arg_infos) - length(markers)
+        arg_infos[offset + 1] = air_mesh_argument(mesh_object_type(job))
+    end
 
     node = MDNode(Metadata[Metadata(entry),
                            MDNode(stage_outputs(stage, T_out)),
@@ -638,7 +654,10 @@ by the time this matters.
 """
 function stage_input_types(@nospecialize(job::CompilerJob))
     args = collect(job.source.specTypes.parameters[2:end])
-    pop!(args)                       # the output pointer
+    # A mesh stage has no trailing output pointer — it writes through the object
+    # that is its FIRST argument — so there is nothing to drop here, and that
+    # argument is retagged by `air_mesh_argument` rather than marked.
+    job.config.params.stage === :mesh || pop!(args)
     return Union{Nothing,Type}[a <: STAGE_INPUTS ? a : nothing for a in args]
 end
 
@@ -792,6 +811,7 @@ function air_program_type(@nospecialize(job::MetalCompilerJob))
     stage = job.config.params.stage
     return stage === :vertex   ? PROGRAM_VERTEX :
            stage === :fragment ? PROGRAM_FRAGMENT :
+           stage === :mesh     ? PROGRAM_MESH :
                                  PROGRAM_KERNEL
 end
 

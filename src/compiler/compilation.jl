@@ -408,7 +408,7 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
     # `compiler/graphics.jl`.
     if isgraphics(job)
         stage = job.config.params.stage
-        T_out = stage_output_type(job)
+        T_out = stage === :mesh ? Nothing : stage_output_type(job)
         markers = stage_input_types(job)
         # Builtins first: `vertex_index()` and friends become TRAILING parameters,
         # so they have to be appended while the output pointer is still last —
@@ -418,7 +418,12 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         append!(markers, implicit)
         # Output next: it drops the trailing pointer, so the marker list — which
         # already excludes it — lines up with the parameters afterwards.
-        entry = stage_return!(job, mod, entry)
+        #
+        # A MESH stage has none. Its entry stays `void` and everything it
+        # produces goes through the object it was handed, so there is no return
+        # value to build and `retag_stage!` retags that object's argument
+        # metadata instead.
+        stage === :mesh || (entry = stage_return!(job, mod, entry))
         entry = stage_inputs!(job, mod, entry, markers)
         retag_stage!(job, mod, entry, stage, T_out, markers)
         # A stage has no kernel state, so the throw sites GPUCompiler lowered
@@ -642,8 +647,8 @@ end
                                          opt_level=2,
                                          macos=nothing, air=nothing, metal=nothing,
                                          gpufamily=nothing, stage::Symbol=:kernel, kwargs...)
-    stage in (:kernel, :vertex, :fragment) ||
-        throw(ArgumentError("stage must be :kernel, :vertex or :fragment, got :$stage"))
+    stage in (:kernel, :vertex, :fragment, :mesh) ||
+        throw(ArgumentError("stage must be :kernel, :vertex, :fragment or :mesh, got :$stage"))
     # A graphics stage reports no exceptions, so it is compiled at debug level 0
     # whatever the session's `-g` is.
     #

@@ -79,6 +79,10 @@ include("compiler/library.jl")
 include("compiler/archive.jl")
 include("compiler/compilation.jl")
 include("compiler/graphics.jl")
+# The mesh stage, after `graphics.jl`: it reuses `mangle_varying`, `air_stage_name`
+# and the argument-metadata machinery declared there, and only the object it
+# writes through is its own.
+include("compiler/mesh.jl")
 include("compiler/exceptions.jl")
 include("compiler/execution.jl")
 include("compiler/reflection.jl")
