@@ -3,7 +3,9 @@ export use!, set_front_facing_winding!,
        set_pipeline!, set_depth_stencil_state!, set_vertex_buffer!, set_vertex_bytes!,
        set_fragment_buffer!, set_fragment_bytes!, set_fragment_texture!,
        set_viewport!, set_cull_mode!, draw_primitives!, draw_primitives_indirect!,
-       draw_indexed_primitives!
+       draw_indexed_primitives!,
+       set_mesh_buffer!, set_mesh_bytes!, set_object_buffer!,
+       draw_mesh_threadgroups!
 
 # The rasterisation half of the command interface. `compute.jl` is its
 # counterpart and the model for the shape of everything here; the ObjC bindings
@@ -33,6 +35,23 @@ function MTLRenderPipelineState(dev::MTLDevice, desc::MTLRenderPipelineDescripto
     return state
 end
 
+# A mesh pipeline is created from its OWN descriptor type, not from
+# `MTLRenderPipelineDescriptor` with a mesh function set on it: the object and
+# mesh stages have threadgroup sizes and a payload length that a vertex pipeline
+# has nowhere to put.
+function MTLRenderPipelineState(dev::MTLDevice, desc::MTLMeshRenderPipelineDescriptor)
+    err = Ref{id{NSError}}(nil)
+    state = @objc [dev::id{MTLDevice} newRenderPipelineStateWithMeshDescriptor:desc::id{MTLMeshRenderPipelineDescriptor}
+                   options:MTLPipelineOptionNone::MTLPipelineOption
+                   reflection:C_NULL::Ptr{Nothing}
+                   error:err::Ptr{id{NSError}}]::Union{Nothing,MTLRenderPipelineState}
+    state === nothing && throw_error(err[])
+    return state
+end
+
+MTLMeshRenderPipelineDescriptor() =
+    @objc [MTLMeshRenderPipelineDescriptor new]::MTLMeshRenderPipelineDescriptor
+
 function MTLDepthStencilState(dev::MTLDevice, desc::MTLDepthStencilDescriptor)
     @objc [dev::id{MTLDevice} newDepthStencilStateWithDescriptor:desc::id{MTLDepthStencilDescriptor}]::MTLDepthStencilState
 end
@@ -60,6 +79,24 @@ set_front_facing_winding!(rce::MTLRenderCommandEncoder, w::MTLWinding) =
 
 set_vertex_buffer!(rce::MTLRenderCommandEncoder, buf::MTLBuffer, offset, index) =
     @objc [rce::id{MTLRenderCommandEncoder} setVertexBuffer:buf::id{MTLBuffer}
+                                            offset:offset::NSUInteger
+                                            atIndex:(index-1)::NSUInteger]::Nothing
+
+# The mesh pipeline's buffer slots. Its own family, because a mesh stage's
+# arguments are bound separately from a vertex stage's — the two never coexist,
+# but the selectors are distinct and Metal binds nothing if the wrong one is used.
+set_mesh_buffer!(rce::MTLRenderCommandEncoder, buf::MTLBuffer, offset, index) =
+    @objc [rce::id{MTLRenderCommandEncoder} setMeshBuffer:buf::id{MTLBuffer}
+                                            offset:offset::NSUInteger
+                                            atIndex:(index-1)::NSUInteger]::Nothing
+
+set_mesh_bytes!(rce::MTLRenderCommandEncoder, ptr::Ptr, len::Integer, index::Integer) =
+    @objc [rce::id{MTLRenderCommandEncoder} setMeshBytes:ptr::Ptr{Cvoid}
+                                            length:len::NSUInteger
+                                            atIndex:(index-1)::NSUInteger]::Nothing
+
+set_object_buffer!(rce::MTLRenderCommandEncoder, buf::MTLBuffer, offset, index) =
+    @objc [rce::id{MTLRenderCommandEncoder} setObjectBuffer:buf::id{MTLBuffer}
                                             offset:offset::NSUInteger
                                             atIndex:(index-1)::NSUInteger]::Nothing
 
@@ -94,6 +131,21 @@ function draw_primitives!(rce::MTLRenderCommandEncoder, prim::MTLPrimitiveType,
                                             vertexStart:first::NSUInteger
                                             vertexCount:count::NSUInteger
                                             instanceCount:instances::NSUInteger]::Nothing
+end
+
+# A mesh pipeline's draw. There is no vertex count and no primitive type: the
+# mesh stage WRITES the primitives, and its `MeshConfig` already said what they
+# are, so all the host supplies is how many threadgroups to run and how wide each
+# stage's threadgroup is.
+#
+# `object` is the object stage's threadgroup size and is ignored by a pipeline
+# without one, but Metal still requires a valid size; one thread is the
+# smallest.
+function draw_mesh_threadgroups!(rce::MTLRenderCommandEncoder, groups::MTLSize,
+                                 object::MTLSize, mesh::MTLSize)
+    @objc [rce::id{MTLRenderCommandEncoder} drawMeshThreadgroups:groups::MTLSize
+                                            threadsPerObjectThreadgroup:object::MTLSize
+                                            threadsPerMeshThreadgroup:mesh::MTLSize]::Nothing
 end
 
 # The counterpart to a compute indirect dispatch: the GPU reads the draw

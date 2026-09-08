@@ -34,6 +34,45 @@
 # a fragment stage reading a mesh stage's outputs links by exactly the string it
 # already used, and needs nothing new.
 
+# ── WHERE THIS STOPS, as of the last measurement ─────────────────────────────
+#
+# Everything below EMITS correctly and the driver accepts it:
+#
+#   * a metallib whose `MTLFunction.functionType == MTLFunctionTypeMesh`;
+#   * an `MTLMeshRenderPipelineDescriptor` that creates a pipeline state, which
+#     means Metal validated the mesh stage's outputs against a fragment stage's
+#     inputs ACROSS BOTH PLANES — the `generated(...)` strings match;
+#   * IR that is `define void @entry(ptr addrspace(7))` with every intrinsic call
+#     surviving and `!air.mesh = !{!{ptr @entry, !{}, <args>}}`.
+#
+# And then the mesh stage DOES NOT RUN. A probe store into a bound buffer from
+# the first line of the body never lands, so the entry is not invoked at all;
+# this is not a rasterisation or winding problem.
+#
+# Eliminated, so nobody repeats them:
+#
+#   1. The Metal language version. 3.1, 3.2 and 4.0 behave identically, and the
+#      shipping mesh function is 3.1.
+#   2. `maxTotalThreadsPerMeshThreadgroup` / `maxTotalThreadgroupsPerMeshGrid` /
+#      `requiredThreadsPerMeshThreadgroup` on the descriptor, in every
+#      combination. Setting `maxTotalThreadsPerObjectThreadgroup` on a pipeline
+#      with no object stage is refused outright ("mismatch between shader and
+#      descriptor"), which is worth knowing: the driver DOES compare against a
+#      shader-declared value.
+#   3. A missing thread-index builtin. The shipping function takes
+#      `air.thread_index_in_threadgroup`; adding it changes nothing.
+#   4. The leftover empty `air.kernel` and `julia.kernel` named metadata. Our
+#      WORKING vertex stage carries exactly the same leftovers.
+#   5. A shader-declared threadgroup size. The shipping function declares none
+#      either — no `air.max_work_group_size`, no relevant function attribute.
+#
+# What is left is the one structural difference at the metallib CONTAINER level:
+# the shipping function carries 110069 bytes of `reflection_data` and ours
+# carries none. Vertex and fragment programs run without it, so it is not
+# required in general; a mesh program may need it because the object's layout is
+# not derivable from the AIR alone. That is the next thing to reverse-engineer,
+# and it is a separate binary format rather than more LLVM metadata.
+
 """
     MeshObject{V, P, NV, NP, Topo}
 
@@ -240,4 +279,47 @@ end
                                                           n::Int32) where {T}
     @typed_ccall("air.set_primitive_count_mesh", llvmcall, Nothing,
                  (Core.LLVMPtr{T,7}, Int32), out, n)
+end
+
+# ── The two data planes ──────────────────────────────────────────────────────
+#
+#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32 slot, i32 field, <T>)
+#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32 slot, i32 field, <T>)
+#
+# One call per FIELD, and the suffix is the field's value type — the shipping
+# metallib's module carried .f16 .i16 .i32 .v2f32 .v2i16 .v3f32 .v3f16 .v4f16, so
+# the set is open and driven by what a shader writes rather than fixed.
+#
+# These take exactly the types AIR can represent: a scalar, or an `NTuple` that
+# becomes an LLVM vector. Unwrapping a `Vec4f` is the CALLER's, because the caller
+# has the declaration and knows which field it is writing; a fallback here that
+# reached for `getfield(v, 1)` would silently write a `Vec4f`'s first component
+# as a scalar for any type it did not recognise.
+#
+# `slot` and `field` are both ZERO-based, which is the AIR boundary. One-based is
+# the convention above it and `Mantle`'s overrides subtract.
+
+for (fn, airname) in ((:set_vertex_data_mesh, "air.set_vertex_data_mesh"),
+                      (:set_primitive_data_mesh, "air.set_primitive_data_mesh"))
+    # Scalars.
+    for (T, sfx) in ((Float32, "f32"), (Float16, "f16"), (Int32, "i32"),
+                     (UInt32, "i32"), (Int16, "i16"), (UInt16, "i16"))
+        intr = airname * "." * sfx
+        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, slot::Int32,
+                                                    field::Int32, v::$T) where {O}
+            @typed_ccall($intr, llvmcall, Nothing,
+                         (Core.LLVMPtr{O,7}, Int32, Int32, $T), out, slot, field, v)
+        end
+    end
+    # Vectors, as LLVM `<N x T>`.
+    for N in (2, 3, 4), (T, sc) in ((Float32, "f32"), (Float16, "f16"),
+                                    (Int32, "i32"), (Int16, "i16"))
+        intr = airname * ".v$(N)$(sc)"
+        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, slot::Int32,
+                                                    field::Int32, v::NTuple{$N,$T}) where {O}
+            @typed_ccall($intr, llvmcall, Nothing,
+                         (Core.LLVMPtr{O,7}, Int32, Int32, NTuple{$N,VecElement{$T}}),
+                         out, slot, field, air_vec(v))
+        end
+    end
 end
