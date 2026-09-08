@@ -4,7 +4,7 @@ export use!, set_front_facing_winding!,
        set_pipeline!, set_depth_stencil_state!, set_vertex_buffer!, set_vertex_bytes!,
        set_fragment_buffer!, set_fragment_bytes!, set_fragment_texture!,
        set_fragment_sampler!,
-       set_viewport!, set_cull_mode!, draw_primitives!, draw_primitives_indirect!,
+       set_viewport!, set_scissor!, set_cull_mode!, draw_primitives!, draw_primitives_indirect!,
        draw_indexed_primitives!,
        set_mesh_buffer!, set_mesh_bytes!, set_object_buffer!,
        draw_mesh_threadgroups!
@@ -136,6 +136,9 @@ set_fragment_texture!(rce::MTLRenderCommandEncoder, tex::MTLTexture, index) =
 
 set_viewport!(rce::MTLRenderCommandEncoder, vp::MTLViewport) =
     @objc [rce::id{MTLRenderCommandEncoder} setViewport:vp::MTLViewport]::Nothing
+
+set_scissor!(rce::MTLRenderCommandEncoder, r::MTLScissorRect) =
+    @objc [rce::id{MTLRenderCommandEncoder} setScissorRect:r::MTLScissorRect]::Nothing
 
 set_cull_mode!(rce::MTLRenderCommandEncoder, mode::MTLCullMode) =
     @objc [rce::id{MTLRenderCommandEncoder} setCullMode:mode::MTLCullMode]::Nothing
