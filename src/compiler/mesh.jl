@@ -43,11 +43,21 @@
 #     means Metal validated the mesh stage's outputs against a fragment stage's
 #     inputs ACROSS BOTH PLANES — the `generated(...)` strings match;
 #   * IR that is `define void @entry(ptr addrspace(7))` with every intrinsic call
-#     surviving and `!air.mesh = !{!{ptr @entry, !{}, <args>}}`.
+#     surviving and `!air.mesh = !{!{ptr @entry, !{}, <args>}}`;
+#   * AND THE STAGE RUNS. A probe store from the body's first line lands.
 #
-# And then the mesh stage DOES NOT RUN. A probe store into a bound buffer from
-# the first line of the body never lands, so the entry is not invoked at all;
-# this is not a rasterisation or winding problem.
+# THE OBJECT OCCUPIES BUFFER SLOT 0. That is what made the stage look dead: the
+# probe buffer was bound at Metal slot 0 and overwrote it, so nothing ran and
+# nothing was written. Bound at slot 1 the probe lands. A mesh stage's own buffers
+# start at Metal slot 1, and `set_mesh_buffer!` counts from one, so that is index
+# 2 on Mantle's side.
+#
+# What does NOT work is the output. Positions, indices and the primitive count are
+# written by the calls above and no primitive rasterises. Verified with a
+# fragment stage that returns a CONSTANT colour, so a failed per-primitive write
+# cannot be masking coverage — an earlier round measured "no non-black pixels"
+# while the fragment stage was reading the per-primitive plane, which would read
+# as black either way.
 #
 # Eliminated, so nobody repeats them:
 #
@@ -65,13 +75,21 @@
 #      WORKING vertex stage carries exactly the same leftovers.
 #   5. A shader-declared threadgroup size. The shipping function declares none
 #      either — no `air.max_work_group_size`, no relevant function attribute.
+#   6. The order of `set_primitive_count_mesh` relative to the writes, and the
+#      triangle's winding. Neither changes anything, and cull mode defaults to
+#      none on the encoder anyway.
 #
-# What is left is the one structural difference at the metallib CONTAINER level:
-# the shipping function carries 110069 bytes of `reflection_data` and ours
-# carries none. Vertex and fragment programs run without it, so it is not
-# required in general; a mesh program may need it because the object's layout is
-# not derivable from the AIR alone. That is the next thing to reverse-engineer,
-# and it is a separate binary format rather than more LLVM metadata.
+# So the remaining question is narrow: the calls execute and their effect does not
+# appear. Either the `ptr addrspace(7)` the driver hands the entry is not what
+# these intrinsics expect to receive, or their argument convention differs from
+# the declaration in the shipping module — an extra hidden operand, or slots that
+# are not the zero-based indices they look like.
+#
+# The one structural difference left at the metallib CONTAINER level is that the
+# shipping function carries 110069 bytes of `reflection_data` and ours carries
+# none. Vertex and fragment programs run without it, so it is not required in
+# general; a mesh program may need it because the object's layout is not
+# derivable from the AIR alone.
 
 """
     MeshObject{V, P, NV, NP, Topo}
