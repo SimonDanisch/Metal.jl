@@ -34,64 +34,55 @@
 # a fragment stage reading a mesh stage's outputs links by exactly the string it
 # already used, and needs nothing new.
 
-# ── WHERE THIS STOPS, as of the last measurement ─────────────────────────────
+# ── A mesh stage is a compute stage that rasterises ──────────────────────────
 #
-# Everything below EMITS correctly and the driver accepts it:
+# It has everything a kernel has — `thread_index_in_threadgroup`,
+# `threadgroup_position_in_grid`, threadgroup memory, `threadgroup_barrier` —
+# and its own buffers are numbered from zero exactly like a vertex stage's. The
+# object is a parameter, not a binding, and consumes no slot.
 #
-#   * a metallib whose `MTLFunction.functionType == MTLFunctionTypeMesh`;
-#   * an `MTLMeshRenderPipelineDescriptor` that creates a pipeline state, which
-#     means Metal validated the mesh stage's outputs against a fragment stage's
-#     inputs ACROSS BOTH PLANES — the `generated(...)` strings match;
-#   * `define void @entry(ptr addrspace(7))` with `!air.mesh = !{!{ptr @entry,
-#     !{}, <args>}}` — checked in the module AS PACKED INTO THE METALLIB, not just
-#     in `compile(:llvm, job)` output, so a later pass dropping the calls is ruled
-#     out: all eleven survive with the right operands;
-#   * AND THE STAGE RUNS. A probe store from the body's first line lands.
+# That last sentence cost a day, because two things in `retag_stage!` were wrong
+# and both failed silently:
 #
-# THE OBJECT OCCUPIES BUFFER SLOT 0. That is what made the stage look dead: the
-# probe buffer was bound at Metal slot 0 and overwrote it, so nothing ran and
-# nothing was written. Bound at slot 1 the probe lands. A mesh stage's own buffers
-# start at Metal slot 1, and `set_mesh_buffer!` counts from one, so that is index
-# 2 on Mantle's side.
+#   * GPUCompiler's `air.buffer` description of the object was left in place at
+#     location 0, so the object and the stage's first buffer claimed one slot.
+#     Binding that buffer replaced the object the driver handed the entry, every
+#     `set_*_mesh` call wrote through a pointer to something else, and no
+#     primitive was assembled. No validation error, no warning, an empty frame —
+#     which read as "the writes do not land", an emission bug that was never there.
+#   * The `air.mesh` node was written at an offset computed from the END of the
+#     argument list, which overwrote whichever builtin landed there. With the
+#     compute builtins threaded in that was `air.thread_index_in_threadgroup`,
+#     so every thread read index 0, did the first thread's work, and the stage
+#     behaved like a single-threaded one.
 #
-# What does NOT work is the output. Positions, indices and the primitive count are
-# written by the calls above and no primitive rasterises. Verified with a
-# fragment stage that returns a CONSTANT colour, so a failed per-primitive write
-# cannot be masking coverage — an earlier round measured "no non-black pixels"
-# while the fragment stage was reading the per-primitive plane, which would read
-# as black either way.
+# Both are fixed by putting the object at position 1 — where it is — and moving
+# the buffers behind it down one slot. Measured after, against a reference
+# compiled from MSL at runtime by the system compiler (there is no `xcrun metal`
+# in the CommandLineTools, so the runtime compiler IS the reference):
 #
-# Eliminated, so nobody repeats them:
+#   MSL mesh   + MSL fragment                     4096/4096 covered
+#   Julia mesh + MSL fragment                     4096/4096
+#   Julia mesh + Julia fragment                   4096/4096, whole buffer equal
+#   Julia mesh, own buffer at Metal slot 0        4096/4096, value read back
+#   3 groups x 4 threads                          12 distinct (group, thread) pairs
+#   threadgroup memory + barrier                  4096/4096
 #
-#   1. The Metal language version. 3.1, 3.2 and 4.0 behave identically, and the
-#      shipping mesh function is 3.1.
-#   2. `maxTotalThreadsPerMeshThreadgroup` / `maxTotalThreadgroupsPerMeshGrid` /
-#      `requiredThreadsPerMeshThreadgroup` on the descriptor, in every
-#      combination. Setting `maxTotalThreadsPerObjectThreadgroup` on a pipeline
-#      with no object stage is refused outright ("mismatch between shader and
-#      descriptor"), which is worth knowing: the driver DOES compare against a
-#      shader-declared value.
-#   3. A missing thread-index builtin. The shipping function takes
-#      `air.thread_index_in_threadgroup`; adding it changes nothing.
-#   4. The leftover empty `air.kernel` and `julia.kernel` named metadata. Our
-#      WORKING vertex stage carries exactly the same leftovers.
-#   5. A shader-declared threadgroup size. The shipping function declares none
-#      either — no `air.max_work_group_size`, no relevant function attribute.
-#   6. The order of `set_primitive_count_mesh` relative to the writes, and the
-#      triangle's winding. Neither changes anything, and cull mode defaults to
-#      none on the encoder anyway.
+# `test/graphics.jl` pins all of it.
 #
-# So the remaining question is narrow: the calls execute and their effect does not
-# appear. Either the `ptr addrspace(7)` the driver hands the entry is not what
-# these intrinsics expect to receive, or their argument convention differs from
-# the declaration in the shipping module — an extra hidden operand, or slots that
-# are not the zero-based indices they look like.
+# A mesh threadgroup that emits NOTHING is dropped whole — side effects and all
+# — once the fragment stage reads its planes. A probe store from such a stage
+# does not land, and `set_primitive_count_mesh(out, 0)` drops it just as surely.
+# That is the right behaviour for a geometry body that culls everything, but it
+# means a mesh stage cannot be tested by writing to a buffer and emitting no
+# primitive: the test has to draw.
 #
-# The one structural difference left at the metallib CONTAINER level is that the
-# shipping function carries 110069 bytes of `reflection_data` and ours carries
-# none. Vertex and fragment programs run without it, so it is not required in
-# general; a mesh program may need it because the object's layout is not
-# derivable from the AIR alone.
+# One thing worth keeping from the search that got here: setting
+# `maxTotalThreadsPerObjectThreadgroup` on a pipeline with no object stage is
+# refused outright ("mismatch between shader and descriptor"), so the driver does
+# compare descriptor values against shader-declared ones. And the shipping mesh
+# function carries 110069 bytes of `reflection_data` where ours carries none; it
+# runs without it, so reflection is for tooling.
 
 """
     MeshObject{V, P, NV, NP, Topo}

@@ -371,3 +371,360 @@ end
                              Core.LLVMPtr{GfxOnlyPos,1}}, :vertex, "gfx_tri_vertex"),
         jl_fs))
 end
+
+# ── mesh stages ──────────────────────────────────────────────────────────────
+#
+# A mesh stage writes its primitives through an object handed to it in address
+# space 7, so nothing about it goes through `stage_return!`. Graded against the
+# same triangle emitted by hand-written MSL, exactly as the vertex/fragment pair
+# above is, because "some pixels came out" is not the assertion — "the same
+# pixels the system compiler produces" is.
+#
+# A mesh stage is a compute stage that rasterises: it has the thread and group
+# indices, threadgroup memory and a barrier, and its own buffers numbered from
+# zero. The testsets after the drawing one pin each of those, because the
+# geometry-to-mesh lowering needs all of them and none of them fails loudly —
+# a missing index builtin reads as zero and every thread quietly does the first
+# thread's work.
+
+const MeshV = @NamedTuple{position::NTuple{4,Float32}, uv::NTuple{2,Float32}}
+const MeshP = @NamedTuple{colour::NTuple{4,Float32}}
+const MeshObj = Metal.MeshObject{MeshV, MeshP, 4, 2, :triangle}
+
+# The same fullscreen triangle the MSL reference below emits, vertex for vertex.
+function gfx_mesh_tri(out::Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle})
+    Metal.set_position_mesh(out, Int32(0), (-1f0, -1f0, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(1), ( 3f0, -1f0, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(2), (-1f0,  3f0, 0f0, 1f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+    Metal.set_index_mesh(out, Int32(0), UInt8(0))
+    Metal.set_index_mesh(out, Int32(1), UInt8(1))
+    Metal.set_index_mesh(out, Int32(2), UInt8(2))
+    Metal.set_primitive_data_mesh(out, Int32(0), Int32(0), (0f0, 1f0, 0f0, 1f0))
+    Metal.set_primitive_count_mesh(out, Int32(1))
+    return nothing
+end
+
+# The same, with the triangle's extent read out of a buffer of its own — which is
+# what every real mesh stage does, and the case the slot rule governs.
+function gfx_mesh_scaled(out::Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle},
+                         extent::Core.LLVMPtr{Float32,1})
+    s = unsafe_load(extent, 1)
+    Metal.set_position_mesh(out, Int32(0), (-s, -s, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(1), (3f0 * s, -s, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(2), (-s, 3f0 * s, 0f0, 1f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+    Metal.set_index_mesh(out, Int32(0), UInt8(0))
+    Metal.set_index_mesh(out, Int32(1), UInt8(1))
+    Metal.set_index_mesh(out, Int32(2), UInt8(2))
+    Metal.set_primitive_data_mesh(out, Int32(0), Int32(0), (0f0, 1f0, 0f0, 1f0))
+    Metal.set_primitive_count_mesh(out, Int32(1))
+    return nothing
+end
+
+# Reads BOTH planes: `uv` is per-vertex and interpolated, `colour` is
+# per-primitive. A fragment stage that ignored them would pass even if only one
+# plane linked, and the two are matched by separate metadata.
+function gfx_mesh_fragment(uv::Metal.Varying{:uv, NTuple{2,Float32}},
+                           colour::Metal.Varying{:colour, NTuple{4,Float32}},
+                           out::Core.LLVMPtr{GfxFOut,1})
+    c = colour.value
+    u = uv.value
+    Base.unsafe_store!(out, GfxFOut((u[1] * 0f0, c[2], u[2] * 0f0, 1f0)))
+    return nothing
+end
+
+"""
+Draw one mesh threadgroup into a 64x64 target and count green pixels.
+
+`extent` binds a one-float buffer at `slot` when given, which is how the
+slot-0 rule is measured rather than asserted.
+"""
+function draw_mesh(meshfn, fragfn; extent = nothing, slot::Int = 1,
+                   threads::Int = 1)
+    MTL = Metal.MTL
+    dev = GFX_DEV
+    W = H = 64
+
+    pd = MTL.MTLMeshRenderPipelineDescriptor()
+    pd.meshFunction = meshfn
+    pd.fragmentFunction = fragfn
+    pd.colorAttachments[1].pixelFormat = MTL.MTLPixelFormatRGBA8Unorm
+    pd.maxTotalThreadsPerMeshThreadgroup = threads
+    pipe = MTL.MTLRenderPipelineState(dev, pd)
+
+    td = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, W, H, false)
+    td.usage = MTL.MTLTextureUsageRenderTarget | MTL.MTLTextureUsageShaderRead
+    td.storageMode = MTL.MTLStorageModeShared
+    tex = MTL.MTLTexture(dev, td)
+
+    rp = MTL.MTLRenderPassDescriptor()
+    ca = rp.colorAttachments[1]
+    ca.texture = tex
+    ca.loadAction  = MTL.MTLLoadActionClear
+    ca.storeAction = MTL.MTLStoreActionStore
+    ca.clearColor  = MTL.MTLClearColor(0.0, 0.0, 0.0, 1.0)
+
+    cb  = MTL.MTLCommandBuffer(GFX_QUEUE)
+    enc = MTL.MTLRenderCommandEncoder(cb, rp)
+    MTL.set_pipeline!(enc, pipe)
+    MTL.set_viewport!(enc, MTL.MTLViewport(0, 0, W, H, 0, 1))
+    if extent !== nothing
+        # `GC.@preserve` and a named array, not `pointer(Float32[extent])`: the
+        # temporary is unreachable the moment `pointer` returns and the copy then
+        # reads freed memory. What that produces is a garbage extent, a degenerate
+        # triangle and an empty frame — indistinguishable here from the slot bug
+        # this testset is about.
+        src = Float32[extent]
+        GC.@preserve src begin
+            buf = MTL.MTLBuffer(dev, sizeof(Float32), pointer(src);
+                                storage = Metal.SharedStorage)
+        end
+        MTL.set_mesh_buffer!(enc, buf, 0, slot)
+    end
+    MTL.draw_mesh_threadgroups!(enc, MTL.MTLSize(1, 1, 1),
+                                     MTL.MTLSize(1, 1, 1), MTL.MTLSize(threads, 1, 1))
+    MTL.endEncoding!(enc)
+    MTL.commit!(cb)
+    MTL.wait_completed(cb)
+
+    px = Vector{UInt8}(undef, W * H * 4)
+    GC.@preserve px MTL.getBytes!(pointer(px), tex, W * 4,
+                                  MTL.MTLRegion(MTL.MTLOrigin(0,0,0), MTL.MTLSize(W,H,1)))
+    green = count(i -> px[4i + 2] > 0x80, 0:(W*H - 1))
+    return (green, px)
+end
+
+@testset "a mesh stage drawn by Julia shaders" begin
+    MTL = Metal.MTL
+    dev = Metal.device()
+
+    # Compiled by the system Metal compiler at runtime, so the reference needs no
+    # Xcode toolchain — `xcrun metal` is not in the CommandLineTools.
+    #
+    # A mesh pipeline's fragment stage takes ONE `stage_in` struct nesting both
+    # planes. Spelled as two parameters — `(VO v [[stage_in]], PO p)` — it still
+    # compiles and still builds a pipeline, and `p` is then an unbound buffer that
+    # reads as zeros: a black frame that looks exactly like a mesh stage which
+    # emitted nothing.
+    msl = MTL.MTLLibrary(dev, """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct VO { float4 position [[position]]; float2 uv; };
+    struct PO { float4 colour; };
+    using MeshT = metal::mesh<VO, PO, 4, 2, metal::topology::triangle>;
+    [[mesh]] void ref_mesh(MeshT out) {
+        VO v;
+        v.position = float4(-1, -1, 0, 1); v.uv = float2(0, 0); out.set_vertex(0, v);
+        v.position = float4( 3, -1, 0, 1); v.uv = float2(2, 0); out.set_vertex(1, v);
+        v.position = float4(-1,  3, 0, 1); v.uv = float2(0, 2); out.set_vertex(2, v);
+        out.set_index(0, 0); out.set_index(1, 1); out.set_index(2, 2);
+        PO p; p.colour = float4(0, 1, 0, 1); out.set_primitive(0, p);
+        out.set_primitive_count(1);
+    }
+    struct FSIn { VO v; PO p; };
+    fragment float4 ref_mesh_fs(FSIn in [[stage_in]]) {
+        return float4(in.v.uv.x * 0.0, in.p.colour.g, in.v.uv.y * 0.0, 1.0);
+    }
+    """)
+    ref_ms = MTL.MTLFunction(msl, "ref_mesh")
+    ref_fs = MTL.MTLFunction(msl, "ref_mesh_fs")
+    @test ref_ms.functionType == MTL.MTLFunctionTypeMesh
+
+    jl_ms = stage_function(gfx_mesh_tri, Tuple{Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle}},
+                           :mesh, "gfx_mesh_tri")
+    jl_fs = stage_function(gfx_mesh_fragment,
+                           Tuple{Metal.Varying{:uv, NTuple{2,Float32}},
+                                 Metal.Varying{:colour, NTuple{4,Float32}},
+                                 Core.LLVMPtr{GfxFOut,1}}, :fragment, "gfx_mesh_fragment")
+    # The driver's own word on what it loaded: a mesh program, not a kernel that
+    # happens to be tagged as one.
+    @test jl_ms.functionType == MTL.MTLFunctionTypeMesh
+
+    reference, refpx = draw_mesh(ref_ms, ref_fs)
+    # A fullscreen triangle covers the frame. Blank fails here, and so does a
+    # target that only partly covers because a position went somewhere else.
+    @test reference == 64 * 64
+
+    # Each stage against the reference's other half, then both, so a failure names
+    # which one broke. Equality of the whole buffer: the two are doing the same
+    # arithmetic, and pinning the per-primitive plane needs the exact value.
+    for (label, m, f) in (("Julia mesh", jl_ms, ref_fs),
+                          ("Julia fragment", ref_ms, jl_fs),
+                          ("both", jl_ms, jl_fs))
+        green, px = draw_mesh(m, f)
+        @test (label, green) == (label, reference)
+        @test (label, px == refpx) == (label, true)
+    end
+end
+
+@testset "a mesh stage's buffers are numbered from zero" begin
+    # The object is NOT a buffer and consumes no binding, so a mesh stage's own
+    # buffers start at Metal slot 0 exactly like a vertex stage's. MSL agrees:
+    # `[[mesh]] void f(MeshT out, device uint *p [[buffer(0)]])` binds at 0.
+    #
+    # It read the other way round for a while because `retag_stage!` left
+    # GPUCompiler's `air.buffer` description of the object in place at location 0
+    # and wrote the `air.mesh` node over a different entry. A stage buffer then
+    # collided with the object and the draw silently produced nothing.
+    jl_ms = stage_function(gfx_mesh_scaled,
+                           Tuple{Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle},
+                                 Core.LLVMPtr{Float32,1}}, :mesh, "gfx_mesh_scaled")
+    jl_fs = stage_function(gfx_mesh_fragment,
+                           Tuple{Metal.Varying{:uv, NTuple{2,Float32}},
+                                 Metal.Varying{:colour, NTuple{4,Float32}},
+                                 Core.LLVMPtr{GfxFOut,1}}, :fragment, "gfx_mesh_fragment")
+
+    # Slot 1 here is Metal slot 0, and it is where the stage's first buffer goes.
+    @test first(draw_mesh(jl_ms, jl_fs; extent = 1f0, slot = 1)) == 64 * 64
+    # One past it binds nothing, so the extent reads as whatever is there and the
+    # triangle collapses. Pinned because it is the failure the numbering causes.
+    @test first(draw_mesh(jl_ms, jl_fs; extent = 1f0, slot = 2)) == 0
+
+    # And the buffer is genuinely read rather than the shader having constants
+    # folded in: a smaller extent covers strictly fewer pixels.
+    full    = first(draw_mesh(jl_ms, jl_fs; extent = 1f0,    slot = 1))
+    half    = first(draw_mesh(jl_ms, jl_fs; extent = 0.5f0,  slot = 1))
+    quarter = first(draw_mesh(jl_ms, jl_fs; extent = 0.25f0, slot = 1))
+    @test full > half > quarter > 0
+end
+
+# ── a mesh stage is a compute stage that rasterises ──────────────────────────
+
+const MeshProbeObj = Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle}
+
+"""
+Every thread records its own indices, so a collapsed index cannot hide.
+
+It also emits a triangle, because a mesh stage that emits NOTHING is dropped
+whole once the fragment stage reads its planes — side effects and all. That is
+not a bug to work around; it is why the probe has to be a real drawing stage.
+"""
+function gfx_mesh_indices(out::MeshProbeObj, probe::Core.LLVMPtr{UInt32,1})
+    tid = Metal.thread_index_in_threadgroup()          # 1-based
+    gid = Metal.threadgroup_position_in_grid().x       # 1-based
+    slot = (Int(gid) - 1) * 8 + Int(tid)
+    Base.unsafe_store!(probe, UInt32(gid) * UInt32(100) + UInt32(tid), slot)
+    Base.unsafe_store!(probe, Metal.threads_per_threadgroup().x, 33)
+    if tid == UInt32(1)
+        Metal.set_position_mesh(out, Int32(0), (-1f0, -1f0, 0f0, 1f0))
+        Metal.set_position_mesh(out, Int32(1), ( 3f0, -1f0, 0f0, 1f0))
+        Metal.set_position_mesh(out, Int32(2), (-1f0,  3f0, 0f0, 1f0))
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+        Metal.set_index_mesh(out, Int32(0), UInt8(0))
+        Metal.set_index_mesh(out, Int32(1), UInt8(1))
+        Metal.set_index_mesh(out, Int32(2), UInt8(2))
+        Metal.set_primitive_data_mesh(out, Int32(0), Int32(0), (0f0, 1f0, 0f0, 1f0))
+        Metal.set_primitive_count_mesh(out, Int32(1))
+    end
+    return nothing
+end
+
+"""
+Four threads meet in threadgroup memory: three write a corner, one reads all
+three back and emits the triangle. A barrier that does not hold, or threadgroup
+memory a mesh stage cannot have, gives a degenerate triangle and no coverage.
+"""
+function gfx_mesh_cooperative(out::MeshProbeObj)
+    corners = Metal.MtlThreadGroupArray(NTuple{4,Float32}, 4)
+    tid = Metal.thread_index_in_threadgroup()
+    x = tid == UInt32(1) ? -1f0 : (tid == UInt32(2) ?  3f0 : -1f0)
+    y = tid == UInt32(1) ? -1f0 : (tid == UInt32(2) ? -1f0 :  3f0)
+    tid <= UInt32(3) && (@inbounds corners[tid] = (x, y, 0f0, 1f0))
+    Metal.threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+    if tid == UInt32(1)
+        @inbounds Metal.set_position_mesh(out, Int32(0), corners[1])
+        @inbounds Metal.set_position_mesh(out, Int32(1), corners[2])
+        @inbounds Metal.set_position_mesh(out, Int32(2), corners[3])
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+        Metal.set_index_mesh(out, Int32(0), UInt8(0))
+        Metal.set_index_mesh(out, Int32(1), UInt8(1))
+        Metal.set_index_mesh(out, Int32(2), UInt8(2))
+        Metal.set_primitive_data_mesh(out, Int32(0), Int32(0), (0f0, 1f0, 0f0, 1f0))
+        Metal.set_primitive_count_mesh(out, Int32(1))
+    end
+    return nothing
+end
+
+"""Run `meshfn` over `groups` x `threads` and hand back the probe buffer."""
+function run_mesh_probe(meshfn, fragfn, groups::Int, threads::Int)
+    MTL = Metal.MTL
+    dev = GFX_DEV
+    pd = MTL.MTLMeshRenderPipelineDescriptor()
+    pd.meshFunction = meshfn
+    pd.fragmentFunction = fragfn
+    pd.colorAttachments[1].pixelFormat = MTL.MTLPixelFormatRGBA8Unorm
+    pd.maxTotalThreadsPerMeshThreadgroup = threads
+    pipe = MTL.MTLRenderPipelineState(dev, pd)
+
+    # The probe emits no primitive, so the fragment stage never runs; it is here
+    # because a colour attachment without one is not a pipeline Metal will build.
+    n = 40
+    buf = MTL.MTLBuffer(dev, n * sizeof(UInt32); storage = Metal.SharedStorage)
+    ptr = convert(Ptr{UInt32}, MTL.contents(buf))
+    for i in 1:n
+        Base.unsafe_store!(ptr, typemax(UInt32), i)
+    end
+
+    td = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, 8, 8, false)
+    td.usage = MTL.MTLTextureUsageRenderTarget
+    td.storageMode = MTL.MTLStorageModeShared
+    rp = MTL.MTLRenderPassDescriptor()
+    ca = rp.colorAttachments[1]
+    ca.texture = MTL.MTLTexture(dev, td)
+    ca.loadAction = MTL.MTLLoadActionClear
+    ca.storeAction = MTL.MTLStoreActionStore
+    ca.clearColor = MTL.MTLClearColor(0.0, 0.0, 0.0, 1.0)
+
+    cb  = MTL.MTLCommandBuffer(GFX_QUEUE)
+    enc = MTL.MTLRenderCommandEncoder(cb, rp)
+    MTL.set_pipeline!(enc, pipe)
+    MTL.set_mesh_buffer!(enc, buf, 0, 1)
+    MTL.draw_mesh_threadgroups!(enc, MTL.MTLSize(groups, 1, 1),
+                                     MTL.MTLSize(1, 1, 1), MTL.MTLSize(threads, 1, 1))
+    MTL.endEncoding!(enc)
+    MTL.commit!(cb)
+    MTL.wait_completed(cb)
+    return [Base.unsafe_load(ptr, i) for i in 1:n]
+end
+
+@testset "a mesh stage gets the compute builtins" begin
+    # The geometry-to-mesh lowering runs one thread per input vertex and one
+    # invocation per input primitive, so it needs every thread to know which it
+    # is. When the index builtins are missing they do not fail — they read zero,
+    # every thread does the first thread's work, and the stage behaves like a
+    # single-threaded one that happens to write the same slots repeatedly.
+    jl_ms = stage_function(gfx_mesh_indices,
+                           Tuple{MeshProbeObj, Core.LLVMPtr{UInt32,1}},
+                           :mesh, "gfx_mesh_indices")
+    jl_fs = stage_function(gfx_mesh_fragment,
+                           Tuple{Metal.Varying{:uv, NTuple{2,Float32}},
+                                 Metal.Varying{:colour, NTuple{4,Float32}},
+                                 Core.LLVMPtr{GfxFOut,1}}, :fragment, "gfx_mesh_fragment")
+    r = run_mesh_probe(jl_ms, jl_fs, 3, 4)
+
+    # Twelve invocations, each with its own (group, thread), and gid*100+tid is
+    # unique per pair — so a collapsed index shows up as a missing slot.
+    seen = [(g, t, r[(g - 1) * 8 + t]) for g in 1:3, t in 1:4]
+    @test all(x -> x[3] == UInt32(x[1] * 100 + x[2]), seen)
+    @test length(unique(x[3] for x in seen)) == 12
+    @test r[33] == UInt32(4)      # threads_per_threadgroup, from the descriptor
+end
+
+@testset "a mesh stage gets threadgroup memory and a barrier" begin
+    jl_ms = stage_function(gfx_mesh_cooperative, Tuple{MeshProbeObj},
+                           :mesh, "gfx_mesh_cooperative")
+    jl_fs = stage_function(gfx_mesh_fragment,
+                           Tuple{Metal.Varying{:uv, NTuple{2,Float32}},
+                                 Metal.Varying{:colour, NTuple{4,Float32}},
+                                 Core.LLVMPtr{GfxFOut,1}}, :fragment, "gfx_mesh_fragment")
+    @test first(draw_mesh(jl_ms, jl_fs; threads = 4)) == 64 * 64
+end

@@ -376,21 +376,23 @@ end
 
 # wraps a single function call, keeping its closure body small.
 @autoreleasepool function (kernel::HostKernel)(args...; groups=1, threads=1,
-                                               queue=nothing, submit::Bool=false)
+                                               queue=nothing, submit::Bool=false,
+                                               indirect=nothing)
     # function barrier to avoid capturing the `@autoreleasepool` in the generated code
-    launch_with_queue(kernel, queue, MTLSize(groups), MTLSize(threads), args, submit)
+    launch_with_queue(kernel, queue, MTLSize(groups), MTLSize(threads), args, submit,
+                      indirect)
 end
 
 @inline function launch_with_queue(@nospecialize(kernel::HostKernel), ::Nothing,
                                    gs::MTLSize, ts::MTLSize, @nospecialize(args::Tuple),
-                                   submit::Bool)
-    launch(kernel, gs, ts, global_queue(device()), args, submit)
+                                   submit::Bool, indirect = nothing)
+    launch(kernel, gs, ts, global_queue(device()), args, submit, indirect)
 end
 
 @inline function launch_with_queue(@nospecialize(kernel::HostKernel), queue,
                                    gs::MTLSize, ts::MTLSize, @nospecialize(args::Tuple),
-                                   submit::Bool)
-    launch(kernel, gs, ts, batched_queue(queue), args, submit)
+                                   submit::Bool, indirect = nothing)
+    launch(kernel, gs, ts, batched_queue(queue), args, submit, indirect)
 end
 
 function kernel_operation(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize)
@@ -462,7 +464,8 @@ function launch_logging!(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTL
 end
 
 function launch(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
-                bq::BatchedCommandQueue, @nospecialize(args::Tuple), submit::Bool)
+                bq::BatchedCommandQueue, @nospecialize(args::Tuple), submit::Bool,
+                indirect = nothing)
     precompiling = ccall(:jl_generating_output, Cint, ()) != 0
 
     (gs.width>0 && gs.height>0 && gs.depth>0) ||
@@ -522,7 +525,20 @@ function launch(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
         reloc === nothing || MTL.use!(cce, reloc, MTL.ReadUsage)
 
         encode_arguments_nospec!(cce, kernel, kernel_state, f, args)
-        MTL.append_current_function!(cce, gs, ts)
+        # `indirect` is `(buffer, byte offset)` holding three `UInt32` threadgroup
+        # counts the DEVICE wrote. `gs` is then a bound the caller supplied for its
+        # own bookkeeping and the driver reads the real size at execution — which is
+        # the whole point: nobody on the host ever learns the count, so nobody has to
+        # wait for the kernel that produced it.
+        if indirect === nothing
+            MTL.append_current_function!(cce, gs, ts)
+        else
+            # The buffer is read by the command processor rather than by the shader,
+            # so it is not covered by the argument encoding above and has to be made
+            # resident explicitly.
+            MTL.use!(cce, indirect[1], MTL.ReadUsage)
+            MTL.dispatchThreadgroupsIndirect!(cce, indirect[1], indirect[2], ts)
+        end
     catch
         # The failing launch has not been recorded yet. Keep any earlier
         # operations in this batch, but close encoder state dirtied by the

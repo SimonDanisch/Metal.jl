@@ -740,3 +740,70 @@ end
     Base.invokelatest(launch)
     @test count() == n+2
 end
+
+# ── indirect compute dispatch ────────────────────────────────────────────────
+#
+# The threadgroup count read from device memory instead of from the host. This
+# is what lets a dispatch be sized by a kernel that ran just before it: without
+# it the host has to read the count, which means waiting for that kernel, which
+# means draining the queue in the middle of a frame. Mantle's `DeferredRange`
+# does exactly that wait, and it once cost 97 % of a frame.
+
+function indirect_count_kernel(ind::Core.LLVMPtr{UInt32,1}, src::Core.LLVMPtr{UInt32,1},
+                               tgw::UInt32)
+    n = Base.unsafe_load(src, 1)
+    Base.unsafe_store!(ind, cld(n, tgw), 1)      # MTLDispatchThreadgroupsIndirectArguments
+    Base.unsafe_store!(ind, UInt32(1), 2)
+    Base.unsafe_store!(ind, UInt32(1), 3)
+    return nothing
+end
+
+function indirect_mark_kernel(out::Core.LLVMPtr{UInt32,1}, n::UInt32)
+    i = Metal.thread_position_in_grid().x
+    i <= n && Base.unsafe_store!(out, UInt32(1), Int(i))
+    return nothing
+end
+
+@testset "a dispatch sized on the device" begin
+    N = 4096
+    TGW = UInt32(64)
+    for want in (UInt32(1000), UInt32(64), UInt32(2500))
+        out  = Metal.zeros(UInt32, N)
+        srcn = MtlVector{UInt32}([want])
+        ind  = Metal.zeros(UInt32, 3)
+
+        kc = @metal launch=false indirect_count_kernel(pointer(ind), pointer(srcn), TGW)
+        km = @metal launch=false indirect_mark_kernel(pointer(out), UInt32(N))
+
+        kc(pointer(ind), pointer(srcn), TGW; groups = 1, threads = 1)
+        # No `synchronize` between the two. The count is written by the first
+        # dispatch and read by the command processor for the second; both are on
+        # one queue, which runs them in order, and the host never sees it.
+        km(pointer(out), UInt32(N); threads = Int(TGW),
+           indirect = (pointer(ind).buffer, 0))
+        Metal.synchronize()
+
+        groups = cld(Int(want), Int(TGW))
+        @test Array(ind) == UInt32[groups, 1, 1]
+        # Whole threadgroups, so the thread count is the count rounded up — the
+        # surplus threads are the caller's to bound, exactly as for a direct
+        # dispatch.
+        @test count(==(UInt32(1)), Array(out)) == groups * Int(TGW)
+    end
+end
+
+@testset "an indirect dispatch of zero threadgroups runs nothing" begin
+    # The wavefront case: a queue that emptied. It has to be a no-op rather than
+    # an error, and it has to stay on the device — noticing the zero on the host
+    # would mean reading the count, which is the thing being avoided.
+    out  = Metal.zeros(UInt32, 256)
+    srcn = MtlVector{UInt32}([UInt32(0)])
+    ind  = Metal.zeros(UInt32, 3)
+    kc = @metal launch=false indirect_count_kernel(pointer(ind), pointer(srcn), UInt32(64))
+    km = @metal launch=false indirect_mark_kernel(pointer(out), UInt32(256))
+    kc(pointer(ind), pointer(srcn), UInt32(64); groups = 1, threads = 1)
+    km(pointer(out), UInt32(256); threads = 64, indirect = (pointer(ind).buffer, 0))
+    Metal.synchronize()
+    @test Array(ind) == UInt32[0, 1, 1]
+    @test all(==(UInt32(0)), Array(out))
+end

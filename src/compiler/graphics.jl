@@ -437,6 +437,29 @@ function stage_outputs(stage::Symbol, @nospecialize(T::Type))
 end
 
 """
+    shift_buffer_location(node, by) -> MDNode
+
+`node` with its `air.location_index` moved by `by`, or `node` unchanged if it
+does not carry one.
+
+Only an `air.buffer`/`air.texture` entry has a location; a builtin like
+`air.thread_index_in_threadgroup` is not bound by the host and has none. The
+LEADING operand of the node is the parameter position and is deliberately left
+alone: a parameter does not move because a binding does.
+"""
+function shift_buffer_location(node::LLVM.MDNode, by::Integer)
+    ops = collect(LLVM.operands(node))
+    i = findfirst(o -> o isa LLVM.MDString && string(o) == "air.location_index", ops)
+    i === nothing && return node
+    i < length(ops) ||
+        error("air.location_index is the last operand of an argument node; " *
+              "it must be followed by the index itself")
+    old = convert(Int, LLVM.Value(ops[i + 1]))
+    ops[i + 1] = Metadata(ConstantInt(Int32(old + by)))
+    return MDNode(ops)
+end
+
+"""
     retag_stage!(job, mod, entry, stage, T_out)
 
 Move `entry` from `air.kernel` to the stage's own named metadata, with outputs.
@@ -487,12 +510,28 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     isempty(markers) ||
         stage_input_metadata!(arg_infos, stage_align_markers(markers, length(arg_infos)))
 
-    # The object a mesh stage writes through. GPUCompiler described it as a
-    # buffer, which is what the kernel ABI made it; AIR needs `air.mesh` plus
-    # the whole type of the object, and that type is what bounds the stage.
+    # The object a mesh stage writes through. It is the FIRST parameter, and
+    # GPUCompiler described it as a buffer, which is what the kernel ABI made it;
+    # AIR needs `air.mesh` plus the whole type of the object, and that type is
+    # what bounds the stage.
+    #
+    # Position 1 and not an offset from the end. Computing it from the end
+    # overwrote whichever builtin happened to land there — with the compute
+    # builtins threaded in, that was `air.thread_index_in_threadgroup`, so every
+    # thread in the group read index 0, wrote to the same slots, and the stage
+    # behaved as if it ran once. The object stayed described as a buffer at
+    # location 0 on top of that, which is what made a stage buffer bound at Metal
+    # slot 0 collide with it. Neither is a rule of Apple's: MSL puts a mesh
+    # stage's own buffer at `buffer(0)` and it works.
     if stage === :mesh
-        offset = length(arg_infos) - length(markers)
-        arg_infos[offset + 1] = air_mesh_argument(mesh_object_type(job))
+        arg_infos[1] = air_mesh_argument(mesh_object_type(job))
+        # …and the buffers behind it move down one slot, because the object is
+        # not a buffer and does not consume a binding. So a mesh stage's buffers
+        # are numbered from zero exactly like a vertex stage's, and nothing above
+        # this backend has to know a mesh stage is different.
+        for i in 2:length(arg_infos)
+            arg_infos[i] = shift_buffer_location(arg_infos[i], -1)
+        end
     end
 
     node = MDNode(Metadata[Metadata(entry),

@@ -1,5 +1,6 @@
 export MTLComputeCommandEncoder
 export set_function!, set_buffer!, set_bytes!, dispatchThreadgroups!, endEncoding!
+export dispatchThreadgroupsIndirect!
 export set_acceleration_structure!
 export append_current_function!
 
@@ -32,6 +33,31 @@ end
 
 function dispatchThreadgroups!(cce::MTLComputeCommandEncoder, threadgroupsPerGrid, threadsPerThreadgroup)
     @objc [cce::id{MTLComputeCommandEncoder} dispatchThreadgroups:threadgroupsPerGrid::MTLSize
+                                             threadsPerThreadgroup:threadsPerThreadgroup::MTLSize]::Nothing
+end
+
+"""
+    dispatchThreadgroupsIndirect!(cce, buf, offset, threadsPerThreadgroup)
+
+Dispatch with the threadgroup count read from `buf` on the DEVICE.
+
+`buf` holds three `UInt32` at `offset` — the grid in x, y, z — which is the same
+`MTLDispatchThreadgroupsIndirectArguments` layout Metal documents, and the same
+shape as the indirect draw arguments the render encoder takes.
+
+The point is what does NOT happen: the host never learns the count. A dispatch
+whose size a previous kernel computed otherwise has to be sized on the CPU,
+which means reading device memory, which means waiting for that kernel — a full
+queue drain in the middle of a frame. Here the count stays on the device and the
+two dispatches are just ordered on the queue.
+
+The count is in THREADGROUPS, not threads: whatever writes it has to divide by
+the threadgroup width itself, because this call cannot.
+"""
+function dispatchThreadgroupsIndirect!(cce::MTLComputeCommandEncoder, buf::MTLBuffer,
+                                       offset::Integer, threadsPerThreadgroup::MTLSize)
+    @objc [cce::id{MTLComputeCommandEncoder} dispatchThreadgroupsWithIndirectBuffer:buf::id{MTLBuffer}
+                                             indirectBufferOffset:offset::NSUInteger
                                              threadsPerThreadgroup:threadsPerThreadgroup::MTLSize]::Nothing
 end
 
