@@ -397,8 +397,8 @@ function gfx_mesh_tri(out::Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle})
     Metal.set_position_mesh(out, Int32(1), ( 3f0, -1f0, 0f0, 1f0))
     Metal.set_position_mesh(out, Int32(2), (-1f0,  3f0, 0f0, 1f0))
     Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
-    Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
-    Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(1), (2f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(2), (0f0, 2f0))
     Metal.set_index_mesh(out, Int32(0), UInt8(0))
     Metal.set_index_mesh(out, Int32(1), UInt8(1))
     Metal.set_index_mesh(out, Int32(2), UInt8(2))
@@ -416,8 +416,8 @@ function gfx_mesh_scaled(out::Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle},
     Metal.set_position_mesh(out, Int32(1), (3f0 * s, -s, 0f0, 1f0))
     Metal.set_position_mesh(out, Int32(2), (-s, 3f0 * s, 0f0, 1f0))
     Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
-    Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
-    Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(1), (2f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(2), (0f0, 2f0))
     Metal.set_index_mesh(out, Int32(0), UInt8(0))
     Metal.set_index_mesh(out, Int32(1), UInt8(1))
     Metal.set_index_mesh(out, Int32(2), UInt8(2))
@@ -593,6 +593,120 @@ end
     @test full > half > quarter > 0
 end
 
+# ── the data intrinsics take the FIELD before the SLOT ───────────────────────
+#
+# `air.set_vertex_data_mesh` and `air.set_primitive_data_mesh` were emitted with
+# their two i32 operands the other way round, matching `air.set_position_mesh`,
+# and every test above agreed with the mistake. The two orders OVERLAP: a stage
+# writing field 0 of vertices 0..n calls `(0,0) (1,0) (2,0)`, which read as
+# `(field, slot)` writes field 0 of vertex 0 and then fields 1 and 2 of vertex 0,
+# which do not exist. So the FIRST vertex is right and the rest silently vanish,
+# and a shader that samples one vertex — or reads only the per-primitive plane,
+# which is what every testset above does — cannot tell.
+#
+# This one can: four vertices with four different `uv`s and two triangles with two
+# different per-primitive colours, graded against the same thing in MSL. Under the
+# old order the interpolated `uv` collapsed to a ramp falling away from vertex 0
+# and the second triangle came out black.
+
+function gfx_mesh_quad(out::Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle})
+    Metal.set_position_mesh(out, Int32(0), (-1f0, -1f0, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(1), ( 1f0, -1f0, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(2), (-1f0,  1f0, 0f0, 1f0))
+    Metal.set_position_mesh(out, Int32(3), ( 1f0,  1f0, 0f0, 1f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(1), (1f0, 0f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(2), (0f0, 1f0))
+    Metal.set_vertex_data_mesh(out, Int32(0), Int32(3), (1f0, 1f0))
+    Metal.set_index_mesh(out, Int32(0), UInt8(0))
+    Metal.set_index_mesh(out, Int32(1), UInt8(1))
+    Metal.set_index_mesh(out, Int32(2), UInt8(2))
+    Metal.set_index_mesh(out, Int32(3), UInt8(2))
+    Metal.set_index_mesh(out, Int32(4), UInt8(1))
+    Metal.set_index_mesh(out, Int32(5), UInt8(3))
+    Metal.set_primitive_data_mesh(out, Int32(0), Int32(0), (0f0, 1f0, 0f0, 1f0))
+    Metal.set_primitive_data_mesh(out, Int32(0), Int32(1), (0f0, 1f0, 1f0, 1f0))
+    Metal.set_primitive_count_mesh(out, Int32(2))
+    return nothing
+end
+
+# `uv` in red and green, the per-primitive blue in blue: one fragment stage that
+# shows both planes at once, and shows WHICH vertex and which triangle each value
+# came from.
+function gfx_mesh_quad_fragment(uv::Metal.Varying{:uv, NTuple{2,Float32}},
+                                colour::Metal.Varying{:colour, NTuple{4,Float32}},
+                                out::Core.LLVMPtr{GfxFOut,1})
+    u = uv.value
+    c = colour.value
+    Base.unsafe_store!(out, GfxFOut((u[1], u[2], c[3], 1f0)))
+    return nothing
+end
+
+@testset "a mesh stage's data planes are addressed per field and per slot" begin
+    MTL = Metal.MTL
+    dev = Metal.device()
+
+    msl = MTL.MTLLibrary(dev, """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct VO { float4 position [[position]]; float2 uv; };
+    struct PO { float4 colour; };
+    using MeshT = metal::mesh<VO, PO, 4, 2, metal::topology::triangle>;
+    [[mesh]] void ref_quad(MeshT out) {
+        VO v;
+        v.position = float4(-1, -1, 0, 1); v.uv = float2(0, 0); out.set_vertex(0, v);
+        v.position = float4( 1, -1, 0, 1); v.uv = float2(1, 0); out.set_vertex(1, v);
+        v.position = float4(-1,  1, 0, 1); v.uv = float2(0, 1); out.set_vertex(2, v);
+        v.position = float4( 1,  1, 0, 1); v.uv = float2(1, 1); out.set_vertex(3, v);
+        out.set_index(0, 0); out.set_index(1, 1); out.set_index(2, 2);
+        out.set_index(3, 2); out.set_index(4, 1); out.set_index(5, 3);
+        PO p;
+        p.colour = float4(0, 1, 0, 1); out.set_primitive(0, p);
+        p.colour = float4(0, 1, 1, 1); out.set_primitive(1, p);
+        out.set_primitive_count(2);
+    }
+    struct FSIn { VO v; PO p; };
+    fragment float4 ref_quad_fs(FSIn in [[stage_in]]) {
+        return float4(in.v.uv.x, in.v.uv.y, in.p.colour.b, 1.0);
+    }
+    """)
+    ref_ms = MTL.MTLFunction(msl, "ref_quad")
+    ref_fs = MTL.MTLFunction(msl, "ref_quad_fs")
+
+    jl_ms = stage_function(gfx_mesh_quad,
+                           Tuple{Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle}},
+                           :mesh, "gfx_mesh_quad")
+    jl_fs = stage_function(gfx_mesh_quad_fragment,
+                           Tuple{Metal.Varying{:uv, NTuple{2,Float32}},
+                                 Metal.Varying{:colour, NTuple{4,Float32}},
+                                 Core.LLVMPtr{GfxFOut,1}}, :fragment,
+                           "gfx_mesh_quad_fragment")
+
+    _, refpx = draw_mesh(ref_ms, ref_fs)
+    _, jlpx  = draw_mesh(jl_ms, jl_fs)
+
+    # What the reference itself has to show, so this testset says what it means
+    # even when the two agree on something wrong: `uv` sweeps nearly the whole
+    # range in both directions, and the two triangles differ in blue. Nearly,
+    # because a pixel is sampled at its CENTRE and the outermost centre is half a
+    # pixel inside the quad — the exact extremes are the rasteriser's business and
+    # not what is being pinned.
+    reds   = [refpx[4i + 1] for i in 0:(64 * 64 - 1)]
+    greens = [refpx[4i + 2] for i in 0:(64 * 64 - 1)]
+    blues  = [refpx[4i + 3] for i in 0:(64 * 64 - 1)]
+    @test minimum(reds)   < 0x08 && maximum(reds)   > 0xf0
+    @test minimum(greens) < 0x08 && maximum(greens) > 0xf0
+    @test Set(unique(blues)) == Set([0x00, 0xff])
+    # About half the quad each: the diagonal splits it, and which side the pixels
+    # ON the diagonal land in is a fill rule.
+    @test count(==(0xff), blues) ≈ count(==(0x00), blues) rtol = 0.05
+
+    # …and then the whole frame, byte for byte. Under the old operand order the
+    # reds and greens collapsed and every blue was 0x00.
+    @test jlpx == refpx
+end
+
+
 # ── a mesh stage is a compute stage that rasterises ──────────────────────────
 
 const MeshProbeObj = Metal.MeshPtr{MeshV, MeshP, 4, 2, :triangle}
@@ -615,8 +729,8 @@ function gfx_mesh_indices(out::MeshProbeObj, probe::Core.LLVMPtr{UInt32,1})
         Metal.set_position_mesh(out, Int32(1), ( 3f0, -1f0, 0f0, 1f0))
         Metal.set_position_mesh(out, Int32(2), (-1f0,  3f0, 0f0, 1f0))
         Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
-        Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
-        Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(1), (2f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(2), (0f0, 2f0))
         Metal.set_index_mesh(out, Int32(0), UInt8(0))
         Metal.set_index_mesh(out, Int32(1), UInt8(1))
         Metal.set_index_mesh(out, Int32(2), UInt8(2))
@@ -643,8 +757,8 @@ function gfx_mesh_cooperative(out::MeshProbeObj)
         @inbounds Metal.set_position_mesh(out, Int32(1), corners[2])
         @inbounds Metal.set_position_mesh(out, Int32(2), corners[3])
         Metal.set_vertex_data_mesh(out, Int32(0), Int32(0), (0f0, 0f0))
-        Metal.set_vertex_data_mesh(out, Int32(1), Int32(0), (2f0, 0f0))
-        Metal.set_vertex_data_mesh(out, Int32(2), Int32(0), (0f0, 2f0))
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(1), (2f0, 0f0))
+        Metal.set_vertex_data_mesh(out, Int32(0), Int32(2), (0f0, 2f0))
         Metal.set_index_mesh(out, Int32(0), UInt8(0))
         Metal.set_index_mesh(out, Int32(1), UInt8(1))
         Metal.set_index_mesh(out, Int32(2), UInt8(2))
@@ -727,4 +841,128 @@ end
                                  Metal.Varying{:colour, NTuple{4,Float32}},
                                  Core.LLVMPtr{GfxFOut,1}}, :fragment, "gfx_mesh_fragment")
     @test first(draw_mesh(jl_ms, jl_fs; threads = 4)) == 64 * 64
+end
+
+
+# ── Sampling a bound texture ─────────────────────────────────────────────────
+#
+# The AGX compiler recognises a texture argument by its POINTEE's struct name, and
+# LLVM 22 has no pointee to give it. `compiler/texture.jl` records how it is put
+# back and what the alternative was: handed `{} addrspace(1)*`, the compiler
+# service SEGFAULTS, and `MTLRenderPipelineState` reports it as
+# `XPC_ERROR_CONNECTION_INTERRUPTED` while naming nothing. Both halves are pinned
+# here — the shape of the AIR, and a pipeline actually built from it.
+
+function gfx_tex_fragment(pos::FragCoord, tex::Metal.Texture2DPtr{Float32},
+                          samp::Metal.SamplerPtr, out::Core.LLVMPtr{GfxFOut,1})
+    s = Metal.air_sample_texture_2d(tex, samp, 0.25f0, 0.25f0)
+    Base.unsafe_store!(out, GfxFOut((s.value[1].value, s.value[2].value,
+                                     s.value[3].value, 1f0)))
+    return nothing
+end
+
+const GFX_TEX_TT = Tuple{FragCoord, Metal.Texture2DPtr{Float32}, Metal.SamplerPtr,
+                         Core.LLVMPtr{GfxFOut,1}}
+
+"""The AIR a stage is handed to the driver as, disassembled at bitcode 14."""
+function stage_air_text(f, tt, stage::Symbol, name::String)
+    cfg = compiler_config(Metal.device(); stage, name)
+    job = Metal.GPUCompiler.CompilerJob(Metal.methodinstance(typeof(f), tt), cfg)
+    bytes = Metal.compile_to_metallib(job).metallib
+    fn = only(read(IOBuffer(bytes), Metal.MetalLib).functions)
+    bc, ll = tempname() * ".bc", tempname() * ".ll"
+    write(bc, fn.air_module)
+    run(`$(Metal.LLVMDowngrader_jll.llvm_dis_14()) -o $ll $bc`)
+    return read(ll, String)
+end
+
+@testset "a texture argument reaches AIR as an opaque texture pointer" begin
+    air = stage_air_text(gfx_tex_fragment, GFX_TEX_TT, :fragment, "gfx_tex_fragment")
+
+    # The two handle types, BODYLESS. A struct with a body — `type {}` or
+    # `type { i8 }` — puts the crash straight back; only `opaque` builds.
+    @test occursin("%struct._texture_2d_t = type opaque", air)
+    @test occursin("%struct._sampler_t = type opaque", air)
+
+    entry = only(filter(l -> startswith(l, "define"), split(air, '\n')))
+    @test occursin("%struct._texture_2d_t addrspace(1)*", entry)
+    @test occursin("%struct._sampler_t addrspace(2)*", entry)
+    # …and NOT the downgrader's stand-in for a pointee it could not work out,
+    # which is what the parameters degrade to the moment the `byref` is lost.
+    @test !occursin("{} addrspace(1)*", entry)
+    @test !occursin("{} addrspace(2)*", entry)
+
+    # The argument metadata names them as a texture and a sampler rather than as
+    # the buffers the kernel ABI made them, each with its own location namespace.
+    @test occursin("!\"air.texture\"", air)
+    @test occursin("!\"air.sampler\"", air)
+    @test occursin("texture2d<float, sample>", air)
+end
+
+@testset "a fragment stage samples a bound texture" begin
+    MTL = Metal.MTL
+    dev = GFX_DEV
+    # 2x2, one distinct colour per texel. (0.25, 0.25) is the centre of texel
+    # (0, 0) with nearest filtering, so the whole triangle takes its colour.
+    texels = UInt8[0x00, 0xff, 0x00, 0xff,   0xff, 0x00, 0x00, 0xff,
+                   0x00, 0x00, 0xff, 0xff,   0xff, 0xff, 0x00, 0xff]
+    td = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, 2, 2, false)
+    td.usage = MTL.MTLTextureUsageShaderRead
+    td.storageMode = MTL.MTLStorageModeShared
+    tex = MTL.MTLTexture(dev, td)
+    GC.@preserve texels MTL.replace_region!(
+        tex, MTL.MTLRegion(MTL.MTLOrigin(0, 0, 0), MTL.MTLSize(2, 2, 1)), 0,
+        convert(Ptr{Cvoid}, pointer(texels)), 2 * 4)
+
+    sd = MTL.MTLSamplerDescriptor()
+    sd.minFilter = MTL.MTLSamplerMinMagFilterNearest
+    sd.magFilter = MTL.MTLSamplerMinMagFilterNearest
+    samp = MTL.MTLSamplerState(dev, sd)
+
+    vsf = stage_function(gfx_vertex,
+                         Tuple{Core.LLVMPtr{NTuple{4,Float32},1}, VertexID,
+                               Core.LLVMPtr{GfxVOut,1}}, :vertex, "gfx_vertex")
+    fsf = stage_function(gfx_tex_fragment, GFX_TEX_TT, :fragment, "gfx_tex_fragment")
+
+    # Building the pipeline state is the step that used to kill the compiler
+    # service, so reaching the draw at all is half the assertion.
+    W = H = 64
+    rtd = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, W, H, false)
+    rtd.usage = MTL.MTLTextureUsageRenderTarget | MTL.MTLTextureUsageShaderRead
+    rtd.storageMode = MTL.MTLStorageModeShared
+    target = MTL.MTLTexture(dev, rtd)
+
+    pd = MTL.MTLRenderPipelineDescriptor()
+    pd.vertexFunction = vsf
+    pd.fragmentFunction = fsf
+    pd.colorAttachments[1].pixelFormat = MTL.MTLPixelFormatRGBA8Unorm
+    pipe = MTL.MTLRenderPipelineState(dev, pd)
+
+    rp = MTL.MTLRenderPassDescriptor()
+    ca = rp.colorAttachments[1]
+    ca.texture = target
+    ca.loadAction  = MTL.MTLLoadActionClear
+    ca.storeAction = MTL.MTLStoreActionStore
+    ca.clearColor  = MTL.MTLClearColor(0.0, 0.0, 0.0, 1.0)
+
+    cb  = MTL.MTLCommandBuffer(GFX_QUEUE)
+    enc = MTL.MTLRenderCommandEncoder(cb, rp)
+    MTL.set_pipeline!(enc, pipe)
+    MTL.set_vertex_buffer!(enc, GFX_VBUF, 0, 1)
+    # 1-based, like every other binder here: the wrapper subtracts one.
+    MTL.set_fragment_texture!(enc, tex, 1)
+    MTL.set_fragment_sampler!(enc, samp, 1)
+    MTL.draw_primitives!(enc, MTL.MTLPrimitiveTypeTriangle, 0, 3)
+    MTL.endEncoding!(enc)
+    MTL.commit!(cb)
+    MTL.wait_completed(cb)
+
+    px = Vector{UInt8}(undef, W * H * 4)
+    GC.@preserve px MTL.getBytes!(pointer(px), target, W * 4,
+                                  MTL.MTLRegion(MTL.MTLOrigin(0,0,0), MTL.MTLSize(W,H,1)))
+    # The texel at (0, 0) is green, and the triangle covers the middle of the
+    # target — so a covered pixel carries the SAMPLE and not the clear colour.
+    mid = ((H ÷ 2) * W + (W ÷ 2)) * 4
+    @test px[mid + 1] == 0x00 && px[mid + 2] == 0xff && px[mid + 3] == 0x00
+    @test count(i -> px[4i + 2] > 0x80, 0:(W*H - 1)) > 500
 end

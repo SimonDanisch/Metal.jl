@@ -101,6 +101,8 @@ function BatchedCommandQueue(queue::MTLCommandQueue)
                         Any[], nothing, 0, 0, Any[], PendingCommand[])
 end
 
+
+
 # Properties that aren't our own fields (e.g. `label`) forward to the wrapped
 # queue, so a BatchedCommandQueue is a drop-in for the MTLCommandQueue it batches.
 @inline function Base.getproperty(bq::BatchedCommandQueue, name::Symbol)
@@ -276,6 +278,33 @@ end
 
 function record_operation!(bq::BatchedCommandQueue, roots...; bytes::Integer=0, op=nothing)
     append!(bq.roots, roots)
+    note_recorded!(bq, bytes, op)
+    return
+end
+
+"""
+    record_operation!(bq, f, args::Tuple, op)
+
+The LAUNCH form: two roots, positionally, with no keywords.
+
+TWO entries and not one per argument. Pushing each argument separately also avoids the
+boxing and is WORSE end to end, because `bq.roots` then grows per ARGUMENT and Hikari's
+kernels take many — measured 559584 B and 4.67 ms per sample against 331952 B and
+4.48 ms. This form keeps the growth at two while dropping what the vararg method
+cannot: the slurped `roots` tuple, and the keyword `NamedTuple` that a `Union`-typed
+`op` boxes into. Those two were the largest single site in a 400-launch allocation
+profile of the launch path — 3336 of 8256 sampled bytes.
+"""
+function record_operation!(bq::BatchedCommandQueue, f, args::Tuple, op)
+    roots = getfield(bq, :roots)
+    push!(roots, f)
+    push!(roots, args)
+    note_recorded!(bq, 0, op)
+    return
+end
+
+"""The bookkeeping both `record_operation!` forms share."""
+@inline function note_recorded!(bq::BatchedCommandQueue, bytes::Integer, op)
     op === nothing || note_operation!(bq, op)
     bq.nops += 1
     bq.nbytes += bytes

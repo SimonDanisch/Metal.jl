@@ -68,9 +68,47 @@ derive a command buffer, or for MPS) preserves program order by draining pending
 batches when command buffers are enqueued or committed. Call [`synchronize`](@ref)
 to wait for submitted work to finish. See
 [`BatchedCommandQueue`](@ref) for the full draining semantics.
+
+Two lookups and no allocation on the hit path. It used to be one
+`get!(task_local_storage(), (:BatchedCommandQueue, dev)) do … end`, which allocates
+TWICE per call before it can even look: the `(Symbol, MTLDevice)` key is a tuple that
+has to be boxed to enter the store, and the `do` block is a closure over `dev`. Every
+kernel launch asks this, so a Hikari sample paid for it hundreds of times — 576 of the
+8256 bytes a 400-launch allocation profile attributed to Metal.jl.
+
+The nesting is what removes it: a `Symbol` key is a singleton, so the outer lookup
+boxes nothing, and the inner table is keyed by the device's POINTER.
+
+A pointer and not the device itself, because `MTLDevice` is an isbits immutable — an
+`IdDict{MTLDevice,…}` takes its key as `Any` and so boxes one on every lookup, 16 bytes
+a launch. A `Dict{UInt,…}` hashes the pointer with nothing to box. The device is a
+system singleton that outlives every queue made from it, so its address is a stable
+name for it.
 """
 function global_queue(dev::MTLDevice)
-    get!(task_local_storage(), (:BatchedCommandQueue, dev)) do
+    queues = task_queues()
+    key = UInt(pointer(dev))
+    bq = get(queues, key, nothing)
+    bq === nothing || return bq::BatchedCommandQueue
+    return make_task_queue!(queues, key, dev)
+end
+
+"""This task's device-to-queue table, made on first use."""
+@inline function task_queues()
+    tls = task_local_storage()
+    q = get(tls, :metal_task_queues, nothing)
+    q === nothing || return q::Dict{UInt,Any}
+    fresh = Dict{UInt,Any}()
+    tls[:metal_task_queues] = fresh
+    return fresh
+end
+
+# `Dict{UInt,Any}` and not a value type of `BatchedCommandQueue`: a SIGNATURE is
+# evaluated when the method is defined, and `state.jl` is included before
+# `command_batching.jl`, so naming that type here fails to load the package. Inside a
+# body the same name resolves at call time, which is why the assertions above spell it.
+@noinline function make_task_queue!(queues::Dict{UInt,Any}, key::UInt, dev::MTLDevice)
+    return get!(queues, key) do
         @autoreleasepool begin
             # NOTE: MTLCommandQueue itself is manually reference-counted,
             #       the release pool is for resources used during its construction.
@@ -122,6 +160,21 @@ end
 
 const queue_residency_sets = Dict{UInt,MTLResidencySet}()
 const queue_residency_sets_lock = ReentrantLock()
+
+"""
+What each residency set already holds, as `set pointer => allocation pointers`.
+
+`addAllocation:` is idempotent to Metal but not free: the call and the `commit`
+that has to follow it are driver work, and `make_persistently_resident!` is
+reached from `adapt_storage` — once per baked address per LAUNCH, not once per
+buffer as its docstring assumed. Measured on a still Hikari frame: 1382 calls per
+sample, the largest single source of allocation in the render.
+
+Pointers are safe as keys here because nothing ever removes an allocation from
+these sets: a set holds a strong reference to everything in it, so an address
+inside one cannot be reused by a later buffer while the record still names it.
+"""
+const residency_members = Dict{UInt,Set{UInt}}()
 
 command_queue_key(queue::MTLCommandQueue) = UInt(pointer(queue))
 

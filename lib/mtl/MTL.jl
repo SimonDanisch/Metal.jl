@@ -47,6 +47,8 @@ include("command_enc.jl")
 include("command_enc/blit.jl")
 include("command_enc/compute.jl")
 include("command_enc/render.jl")
+# After the compute encoder: an indirect command buffer is replayed by one.
+include("indirect_command_buffer.jl")
 include("layer.jl")
 # Hardware ray tracing. The ObjC classes come from `libmtl.jl`; these are the
 # methods — descriptors, sizing, and the build/refit encoder.

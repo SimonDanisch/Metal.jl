@@ -96,11 +96,16 @@
 #
 # THE INTRINSICS, all taking the object as their first argument:
 #
-#   air.set_position_mesh          (ptr addrspace(7), i32, <4 x float>)
-#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32, i32, <T>)
-#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32, i32, <T>)
-#   air.set_index_mesh             (ptr addrspace(7), i32, i8)
+#   air.set_position_mesh          (ptr addrspace(7), i32 slot, <4 x float>)
+#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32 field, i32 slot, <T>)
+#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32 field, i32 slot, <T>)
+#   air.set_index_mesh             (ptr addrspace(7), i32 slot, i8)
 #   air.set_primitive_count_mesh   (ptr addrspace(7), i32)
+#
+# FIELD BEFORE SLOT in the two data intrinsics, and the other way round in
+# `set_position_mesh`. That is measured, not read: see `compiler/mesh.jl` for the
+# experiment and why the two orders were indistinguishable until a shader wrote
+# more than one vertex.
 #   air.set_clip_distance_mesh, air.set_render_target_array_index_mesh.i8,
 #   air.set_viewport_array_index_mesh.i8
 #
@@ -510,6 +515,15 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     isempty(markers) ||
         stage_input_metadata!(arg_infos, stage_align_markers(markers, length(arg_infos)))
 
+    # A texture and a sampler are both `ptr addrspace(1)`/`ptr addrspace(2)` to the
+    # kernel ABI, so GPUCompiler described them as buffers. Left that way Metal
+    # binds a buffer where the stage expects a texture, and the pipeline fails to
+    # build with an internal compiler error naming nothing.
+    let (kinds, argtypes) = texture_binding_parameters(job)
+        any(!=(0), kinds) &&
+            texture_argument_metadata!(arg_infos, kinds, argtypes, length(markers))
+    end
+
     # The object a mesh stage writes through. It is the FIRST parameter, and
     # GPUCompiler described it as a buffer, which is what the kernel ABI made it;
     # AIR needs `air.mesh` plus the whole type of the object, and that type is
@@ -567,6 +581,12 @@ function air_output_struct(@nospecialize(T::Type))
     for i in 1:fieldcount(T)
         push!(fields, air_field_type(fieldtype(T, i)))
     end
+    # A single output is still WRAPPED here, though every shipped single-target
+    # fragment returns the vector bare — `TextureCopy` returns `<4 x float>`, and
+    # the packed struct appears only with several fields. The one-field struct is
+    # what this backend has always emitted and what every test draws through, so
+    # it is left alone: returning it bare was tried while chasing the texture
+    # crash in `compiler/texture.jl` and changed nothing.
     return LLVM.StructType(fields; packed = true)
 end
 

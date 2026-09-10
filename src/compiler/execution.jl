@@ -117,8 +117,11 @@ the `adapt_storage` below. Metal's residency set is the only mechanism that
 works then: `useResource` needs an encoder, and by the time one exists nobody
 remembers this buffer.
 
-Committing per call is fine because this path runs when a caller BAKES an
-address (scene setup, building a pointer table), not per launch.
+A buffer already in the set is skipped. This does NOT run only at scene setup, as
+this comment used to claim: every launch that bakes an address arrives here again
+with the same buffers, and the add-and-commit pair is a driver call each time. A
+set never gives an allocation back, so "already added" is permanent and one
+pointer lookup answers it — see `residency_members`.
 """
 function make_persistently_resident!(buf::MTLBuffer)
     dev = buf.device
@@ -126,6 +129,11 @@ function make_persistently_resident!(buf::MTLBuffer)
     bq = global_queue(dev)
     queue = bq isa MTLCommandQueue ? bq : getfield(bq, :queue)
     resset = install_queue_residency!(queue, dev)
+    known = Base.@lock queue_residency_sets_lock begin
+        members = get!(Set{UInt}, residency_members, UInt(pointer(resset)))
+        UInt(pointer(buf)) in members ? true : (push!(members, UInt(pointer(buf))); false)
+    end
+    known && return buf
     MTL.add_allocation!(resset, buf)
     MTL.commit!(resset)
     return buf
@@ -225,12 +233,16 @@ The following keyword arguments are supported:
    versions used during compilation. Value should be a valid version number.
 - `gpufamily`: to override the Apple GPU family (`MTL.MTLGPUFamilyApple<n>`) that the
    generated code may rely on. Defaults to the highest family the device supports.
+- `indirect`: build a pipeline an `MTLIndirectCommandBuffer` command may name. The
+   compiled code is the same and is cached the same; only the pipeline differs, and
+   it is not cached, because a caller who asks for one holds it.
 
 The output of this function is automatically cached, i.e. you can simply call `mtlfunction`
 in a hot path without degrading performance. New code will be generated automatically when
 the function changes, or when different types or keyword arguments are provided.
 """
-function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, kwargs...) where {F,TT}
+function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, indirect::Bool=false,
+                     kwargs...) where {F,TT}
     Base.@lock mtlfunction_lock begin
         dev = device()
         config = compiler_config(dev; name, kwargs...)::MetalCompilerConfig
@@ -241,21 +253,29 @@ function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, kwargs...) where {F,TT}
 
         # Resolve the MTLComputePipelineState for the active device. Linear scan
         # over the session-local cache; almost always n=1, one `===` compare.
+        #
+        # `indirect` skips that cache in both directions: a pipeline built with
+        # `supportIndirectCommandBuffers` is a different object from the one a
+        # `@metal` launch wants, and the cache is keyed by device alone. A caller
+        # asking for one holds it — Mantle's recorder builds it once per dispatch
+        # when a plan compiles — so there is nothing here to cache it for.
         pipeline = Ref{MTLComputePipelineState}()
-        @inbounds for (cached_dev, cached_pipeline) in res.pipelines
-            if cached_dev === dev
-                pipeline[] = cached_pipeline
-                break
+        if !indirect
+            @inbounds for (cached_dev, cached_pipeline) in res.pipelines
+                if cached_dev === dev
+                    pipeline[] = cached_pipeline
+                    break
+                end
             end
         end
         if !isassigned(pipeline)
             pipeline[] = link_pipeline(dev, res.air::Vector{UInt8},
                                      res.metallib::Vector{UInt8},
-                                     res.entry::String)
+                                     res.entry::String; indirect)
             # Don't cache session-local pipeline handles while precompiling: the
             # results struct is serialized into the package image along with its
             # CodeInstance, and ObjectiveC handles would come back dangling.
-            if ccall(:jl_generating_output, Cint, ()) != 1
+            if !indirect && ccall(:jl_generating_output, Cint, ()) != 1
                 push!(res.pipelines, (dev, pipeline[]))
             end
         end
@@ -321,7 +341,11 @@ const kernel_instances = Dict{UInt, Any}()
 
 ## kernel launching and argument encoding
 
-@inline @generated function encode_arguments!(cce, kernel, args::Vararg{Any,N}) where {N}
+# `args::Tuple` and not `Vararg`: splatting one to reach this built a NEW tuple on
+# every launch — 1176 of 8256 sampled bytes in a 400-launch profile, attributed to the
+# splat in `encode_arguments_nospec!`. A generated function reads the field types of a
+# tuple exactly as it reads a vararg's, so nothing about the generated code changes.
+@inline @generated function encode_arguments!(cce, kernel, kernel_state, f, args::Tuple)
     ex = quote end
 
     # the arguments passed into this function have not been `mtlconvert`ed, because we need
@@ -329,9 +353,15 @@ const kernel_instances = Dict{UInt, Any}()
     # such objects to LLVMPtr seems fine, somehow.
     # TODO: can we just convert everything eagerly and support top-level LLVMPtrs?
 
+    # The kernel state and the function come first and by name; everything after them
+    # is read out of the argument TUPLE. Splicing all three into one tuple to iterate
+    # uniformly is what the caller used to do, and building it allocated on every
+    # launch — 2872 of 7432 sampled bytes in a 400-launch profile, the largest site
+    # left. Here nothing is spliced: `kernel_state` and `f` are parameters.
     idx = 1
-    for (argidx, argtyp) in enumerate(args)
-        argex = :(args[$argidx])
+    for (argidx, argtyp) in enumerate((kernel_state, f, fieldtypes(args)...))
+        argex = argidx == 1 ? :(kernel_state) :
+                argidx == 2 ? :(f) : :(args[$(argidx - 2)])
         if argtyp <: MTLBuffer
             # top-level buffers are passed as a pointer-valued argument
             push!(ex.args, :(set_buffer!(cce, $argex, 0, $idx)))
@@ -366,6 +396,12 @@ end
         argtyp = Ptr{Cvoid}
     end
 
+    # A `Ref` and not a scratch buffer owned by the queue. That was tried — a
+    # `Vector{UInt8}` field on `BatchedCommandQueue`, threaded through the generated
+    # encoder — on the theory that this allocates once per ARGUMENT per launch. It does
+    # not: the optimiser already elides a `Ref` that `set_bytes!` only reads, and the
+    # scratch measured 480 bytes a launch against 480 for this — no difference at all,
+    # for a struct field and three signatures of plumbing. Reverted.
     ref = Base.RefValue(arg)
     GC.@preserve ref begin
         ptr = Base.unsafe_convert(Ptr{argtyp}, ref)
@@ -383,25 +419,25 @@ end
                       indirect)
 end
 
-@inline function launch_with_queue(@nospecialize(kernel::HostKernel), ::Nothing,
-                                   gs::MTLSize, ts::MTLSize, @nospecialize(args::Tuple),
+@inline function launch_with_queue(kernel::HostKernel, ::Nothing,
+                                   gs::MTLSize, ts::MTLSize, args::Tuple,
                                    submit::Bool, indirect = nothing)
     launch(kernel, gs, ts, global_queue(device()), args, submit, indirect)
 end
 
-@inline function launch_with_queue(@nospecialize(kernel::HostKernel), queue,
-                                   gs::MTLSize, ts::MTLSize, @nospecialize(args::Tuple),
+@inline function launch_with_queue(kernel::HostKernel, queue,
+                                   gs::MTLSize, ts::MTLSize, args::Tuple,
                                    submit::Bool, indirect = nothing)
     launch(kernel, gs, ts, batched_queue(queue), args, submit, indirect)
 end
 
-function kernel_operation(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize)
+function kernel_operation(kernel::HostKernel, gs::MTLSize, ts::MTLSize)
     (; kind = :kernel, name = string(nameof(kernel.f)),
        threadgroups = gs, threads = ts,
        tgmem = kernel.tgmem, maxthreads = kernel.maxthreads)
 end
 
-function launch_logging!(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
+function launch_logging!(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
                          bq::BatchedCommandQueue, @nospecialize(args::Tuple),
                          kernel_state, buf, exc)
     flush!(bq)
@@ -463,8 +499,8 @@ function launch_logging!(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTL
     return
 end
 
-function launch(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
-                bq::BatchedCommandQueue, @nospecialize(args::Tuple), submit::Bool,
+function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
+                bq::BatchedCommandQueue, args::Tuple, submit::Bool,
                 indirect = nothing)
     precompiling = ccall(:jl_generating_output, Cint, ()) != 0
 
@@ -554,7 +590,7 @@ function launch(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
     # The command buffer retains explicitly encoded buffers, but that doesn't keep other
     # resources alive for which we've encoded the GPU address ourselves.
     op = MTL.profile_metadata[] === nothing ? nothing : kernel_operation(kernel, gs, ts)
-    record_operation!(bq, f, args; op=op)
+    record_operation!(bq, f, args, op)
 
     if precompiling
         cmdbuf = bq.cmdbuf
@@ -567,9 +603,38 @@ function launch(@nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
     return
 end
 
-# force specialization on f and args, but not on the kernel
-@inline encode_arguments_nospec!(cce, @nospecialize(kernel), kernel_state, f, args::Tuple) =
-    encode_arguments!(cce, kernel, kernel_state, f, args...)
+# Force specialization on f, args AND the kernel.
+#
+# This only buys anything if the CALLER has them concretely: `launch` used to declare
+# `@nospecialize(args::Tuple)`, which made every call here a runtime dispatch, and a
+# runtime dispatch BOXES the isbits arguments it passes — `kernel_state` and the
+# varargs. Measured on this exact call: 0 bytes when the tuple's type is known against
+# 128 for one argument and 176 for four, per launch, which is what a still Hikari frame
+# was paying hundreds of times over. `launch` now takes `args::Tuple` unannotated; the
+# kernel stays `@nospecialize`d, which is where the compile-time saving actually is.
+#
+# A/B on one still Hikari frame, 250 warm samples then the best of 5 x 50:
+# `@nospecialize(args)` 5.2 ms and 549200 B per sample, without it 4.4 ms and 536224 B.
+# The specialization is not just cheaper to run, it is cheaper to launch.
+#
+# `launch` and `launch_with_queue` dropped `@nospecialize(kernel::HostKernel)` for the
+# same reason. A `@nospecialize`d struct is read through a dynamic `getfield`, so every
+# `kernel.maxthreads`, `kernel.tgmem` and `kernel.loggingEnabled` in `launch` BOXED its
+# `Int` or `Bool` — several per launch, and they are the sites a 400-launch profile
+# attributed to `launch` itself. `HostKernel{F,TT}` is one type per kernel and the
+# generated encoder already specializes per argument list, so this partitions nothing
+# further than what was already there.
+#
+# The KERNEL is specialized on too, for the same reason. `encode_arguments!` is
+# `@generated`, so it specializes on every argument type INCLUDING the kernel's;
+# reaching it with a `@nospecialize`d kernel made that call dynamic as well, and a
+# dynamic call boxes the isbits `KernelState` and the varargs it passes — measured
+# 176 bytes for a four-argument kernel, per launch, against 0 once the type is
+# known. Nothing is saved by hiding it: `HostKernel{F,TT}` is already one type per
+# kernel, and the generated encoder was going to specialize per argument list
+# anyway, which is the same partition.
+@inline encode_arguments_nospec!(cce, kernel, kernel_state, f, args::Tuple) =
+    encode_arguments!(cce, kernel, kernel_state, f, args)
 
 ## Intra-warp Helpers
 

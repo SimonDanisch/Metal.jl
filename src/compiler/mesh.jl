@@ -222,14 +222,40 @@ end
 # that took only a slot could never be lowered here: in AIR the object is a
 # PARAMETER of the entry, so there is nothing global to reach.
 #
-#   air.set_position_mesh          (ptr addrspace(7), i32, <4 x float>)
-#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32, i32, <T>)
-#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32, i32, <T>)
-#   air.set_index_mesh             (ptr addrspace(7), i32, i8)
+#   air.set_position_mesh          (ptr addrspace(7), i32 slot, <4 x float>)
+#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32 field, i32 slot, <T>)
+#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32 field, i32 slot, <T>)
+#   air.set_index_mesh             (ptr addrspace(7), i32 slot, i8)
 #   air.set_primitive_count_mesh   (ptr addrspace(7), i32)
 #
 # Slots are ZERO-based here — this is the AIR boundary, and one-based is the
 # convention above it. `Mantle`'s overrides subtract.
+#
+# ── The two data intrinsics take the FIELD first, then the slot ──────────────
+#
+# They were declared the other way round, matching `set_position_mesh`, and every
+# test agreed with the mistake because of how the two orders overlap: a stage that
+# writes field 0 of vertices 0..n calls `(0,0) (1,0) (2,0) …`, which read as
+# `(field, slot)` is field 0 of vertex 0, then field 1 of vertex 0, then field 2 —
+# so the FIRST vertex gets the right value and the rest are written to fields that
+# do not exist and vanish. A fragment stage that samples one vertex, or reads only
+# the per-primitive plane, cannot tell the difference; the whole existing mesh
+# suite was exactly that.
+#
+# What showed it was the geometry-to-mesh lowering, whose quad has four vertices
+# with four different `uv`s: instead of a symmetric bowl the interpolated value
+# came out as a ramp falling away from vertex 0 — one corner correct, the rest
+# zero. Measured both ways, with the same shader and one operand pair swapped:
+#
+#   (slot, field)   uv correct at vertex 0, zero at vertices 1..3
+#   (field, slot)   uv correct at all four, and correct with a DYNAMIC slot too
+#
+# and again on the primitive plane, where two triangles given different colours
+# came out as "first one right, second one black" under the old order.
+#
+# So the wrappers below mirror AIR's order rather than hiding it behind a nicer
+# one. A wrapper at the ABI boundary that silently reorders its operands is what
+# made this cost a day.
 
 """The `<T>` suffix AIR gives a mesh data intrinsic for value type `T`."""
 air_mesh_suffix(::Type{Float32}) = "f32"
@@ -294,8 +320,8 @@ end
 
 # ── The two data planes ──────────────────────────────────────────────────────
 #
-#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32 slot, i32 field, <T>)
-#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32 slot, i32 field, <T>)
+#   air.set_vertex_data_mesh.<T>   (ptr addrspace(7), i32 field, i32 slot, <T>)
+#   air.set_primitive_data_mesh.<T>(ptr addrspace(7), i32 field, i32 slot, <T>)
 #
 # One call per FIELD, and the suffix is the field's value type — the shipping
 # metallib's module carried .f16 .i16 .i32 .v2f32 .v2i16 .v3f32 .v3f16 .v4f16, so
@@ -307,7 +333,7 @@ end
 # reached for `getfield(v, 1)` would silently write a `Vec4f`'s first component
 # as a scalar for any type it did not recognise.
 #
-# `slot` and `field` are both ZERO-based, which is the AIR boundary. One-based is
+# `field` and `slot` are both ZERO-based, which is the AIR boundary. One-based is
 # the convention above it and `Mantle`'s overrides subtract.
 
 for (fn, airname) in ((:set_vertex_data_mesh, "air.set_vertex_data_mesh"),
@@ -316,21 +342,21 @@ for (fn, airname) in ((:set_vertex_data_mesh, "air.set_vertex_data_mesh"),
     for (T, sfx) in ((Float32, "f32"), (Float16, "f16"), (Int32, "i32"),
                      (UInt32, "i32"), (Int16, "i16"), (UInt16, "i16"))
         intr = airname * "." * sfx
-        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, slot::Int32,
-                                                    field::Int32, v::$T) where {O}
+        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, field::Int32,
+                                                    slot::Int32, v::$T) where {O}
             @typed_ccall($intr, llvmcall, Nothing,
-                         (Core.LLVMPtr{O,7}, Int32, Int32, $T), out, slot, field, v)
+                         (Core.LLVMPtr{O,7}, Int32, Int32, $T), out, field, slot, v)
         end
     end
     # Vectors, as LLVM `<N x T>`.
     for N in (2, 3, 4), (T, sc) in ((Float32, "f32"), (Float16, "f16"),
                                     (Int32, "i32"), (Int16, "i16"))
         intr = airname * ".v$(N)$(sc)"
-        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, slot::Int32,
-                                                    field::Int32, v::NTuple{$N,$T}) where {O}
+        @eval @device_function @inline function $fn(out::Core.LLVMPtr{O,7}, field::Int32,
+                                                    slot::Int32, v::NTuple{$N,$T}) where {O}
             @typed_ccall($intr, llvmcall, Nothing,
                          (Core.LLVMPtr{O,7}, Int32, Int32, NTuple{$N,VecElement{$T}}),
-                         out, slot, field, air_vec(v))
+                         out, field, slot, air_vec(v))
         end
     end
 end

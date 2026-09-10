@@ -83,6 +83,9 @@ include("compiler/graphics.jl")
 # and the argument-metadata machinery declared there, and only the object it
 # writes through is its own.
 include("compiler/mesh.jl")
+# Texture sampling, after `graphics.jl`: it reuses `air_stage_name` and hooks into
+# the same argument-metadata rewrite the stage inputs do.
+include("compiler/texture.jl")
 include("compiler/exceptions.jl")
 include("compiler/execution.jl")
 include("compiler/reflection.jl")

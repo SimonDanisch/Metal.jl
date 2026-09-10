@@ -196,7 +196,8 @@ that itself calls another (the intersector's own helpers count) overflows it,
 and the failure is a pipeline-creation error rather than anything that names
 the cause. Kept even with inlining allowed, because "allowed" is not "will".
 """
-function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFunction})
+function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFunction};
+                        indirect::Bool = false)
     desc = MTLComputePipelineDescriptor()
     desc.computeFunction = fun
     lf = MTL.MTLLinkedFunctions()
@@ -205,6 +206,23 @@ function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFun
     lf.privateFunctions = NSArray(linked)
     desc.linkedFunctions = lf
     desc.maxCallStackDepth = 4
+    desc.supportIndirectCommandBuffers = indirect
+    return MTLComputePipelineState(dev, desc)
+end
+
+"""
+A pipeline an indirect command buffer may name.
+
+`supportIndirectCommandBuffers` is not a hint: `setComputePipelineState` on an
+indirect command REFUSES a pipeline without it. It is a property of the pipeline
+and not of the compiled code, so this shares the metallib with the ordinary one —
+and skips the binary archive, whose entries are keyed by the metallib and would
+otherwise serve native code compiled without the flag.
+"""
+function indirect_pipeline(dev::MTLDevice, fun::MTLFunction)
+    desc = MTLComputePipelineDescriptor()
+    desc.computeFunction = fun
+    desc.supportIndirectCommandBuffers = true
     return MTLComputePipelineState(dev, desc)
 end
 
@@ -425,6 +443,11 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         # metadata instead.
         stage === :mesh || (entry = stage_return!(job, mod, entry))
         entry = stage_inputs!(job, mod, entry, markers)
+        # Textures last of the signature rewrites: the placeholders a shader body
+        # emits for "the texture at binding N" are replaced with the entry's own
+        # parameters, so the entry has to be the final one. See
+        # `compiler/texture.jl` for why this cannot be an argument the body takes.
+        lower_texture_bindings!(job, mod, entry, length(markers))
         retag_stage!(job, mod, entry, stage, T_out, markers)
         # A stage has no kernel state, so the throw sites GPUCompiler lowered
         # cannot signal through one. Before the cleanup, so the emptied function
@@ -843,7 +866,8 @@ end
 
 # link the metallib into a session-local pipeline state on the given device.
 @autoreleasepool function link_pipeline(dev::MTLDevice, air::Vector{UInt8},
-                                        metallib::Vector{UInt8}, entry::String)
+                                        metallib::Vector{UInt8}, entry::String;
+                                        indirect::Bool = false)
     @signpost_event log=log_compiler() "Link" entry
 
     @signpost_interval log=log_compiler() "Instantiate compute pipeline" begin
@@ -853,7 +877,8 @@ end
             # Linked functions bypass the binary archive — see
             # `register_linked_function!` for why.
             linked = linked_functions_for(dev)
-            isempty(linked) || return linked_pipeline(dev, fun, linked)
+            isempty(linked) || return linked_pipeline(dev, fun, linked; indirect)
+            indirect && return indirect_pipeline(dev, fun)
             return archived_pipeline(dev, fun, metallib, entry)
         catch err
             isa(err, NSError) || rethrow()
