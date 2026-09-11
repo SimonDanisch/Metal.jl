@@ -64,7 +64,8 @@ The open batch is committed ("flushed") when any of the following happens:
   * a command buffer derived from the queue is enqueued or committed;
   * command batching is disabled with the `command_batching = false` preference;
   * the batch reaches `command_batching_ops()` operations or
-    `command_batching_bytes()` of blit traffic;
+    `command_batching_bytes()` of blit traffic — unless a caller has taken the
+    decision over with [`own_flushes!`](@ref);
   * a GPU profiler is attached, in which case batching is disabled (each operation
     gets its own command buffer) so per-operation GPU timing is preserved;
   * an immediate submission is requested via `@metal ... submit=true`, or
@@ -92,13 +93,17 @@ mutable struct BatchedCommandQueue
     nbytes::Int
     pending_ops::Vector{Any}
     cleanups::Vector{PendingCommand}
+    # Whether the thresholds below may commit the open batch on their own. A
+    # caller that decides its own submission boundaries turns this off — see
+    # `own_flushes!`.
+    autoflush::Bool
 end
 
 function BatchedCommandQueue(queue::MTLCommandQueue)
     dev = queue.device
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
     BatchedCommandQueue(queue, dev, nothing, nothing, NoEncoder,
-                        Any[], nothing, 0, 0, Any[], PendingCommand[])
+                        Any[], nothing, 0, 0, Any[], PendingCommand[], true)
 end
 
 
@@ -426,11 +431,40 @@ function flush_batched_queues!(queue=nothing)
     return
 end
 
+"""
+    own_flushes!(bq, own::Bool) -> Bool
+
+Take the flush decision away from this queue, or give it back. Returns what the
+setting was, so a caller can restore it.
+
+The thresholds `maybe_autoflush!` applies — 32 operations, 64 MB of blit traffic
+— are a good default for code that submits work and never thinks about command
+buffers. They are the wrong thing for a caller that knows where its submission
+boundaries are: a render graph executing a frame wants ONE command buffer for
+that frame, committed when the frame ends, not four because the frame happened
+to hold 140 dispatches. Splitting it costs a commit each time and, for a caller
+building a timeline on top, means submissions it did not make and cannot count.
+
+A caller that turns this off is promising to call [`flush!`](@ref) itself. The
+open batch is still committed by `synchronize`, by committing a command buffer
+derived from the queue, and by a profiler — this only removes the two counters.
+"""
+function own_flushes!(bq::BatchedCommandQueue, own::Bool)
+    was = bq.autoflush
+    bq.autoflush = !own
+    return !was
+end
+
+own_flushes!(queue::MTLCommandQueue, own::Bool) = own_flushes!(global_queue(queue.device), own)
+
 function maybe_autoflush!(bq::BatchedCommandQueue)
+    # A profiler still wins: it wants one command buffer per operation so that
+    # per-operation GPU timing survives, and a caller that owns its flushes is
+    # not measuring anything while a profiler is attached.
     if !command_batching() ||
        profiling_command_buffers() ||
-       bq.nops >= command_batching_ops() ||
-       bq.nbytes >= command_batching_bytes()
+       (bq.autoflush && (bq.nops >= command_batching_ops() ||
+                         bq.nbytes >= command_batching_bytes()))
         flush!(bq)
     end
     return

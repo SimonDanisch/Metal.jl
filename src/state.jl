@@ -85,12 +85,49 @@ a launch. A `Dict{UInt,…}` hashes the pointer with nothing to box. The device 
 system singleton that outlives every queue made from it, so its address is a stable
 name for it.
 """
+const adopted_key = Ref(UInt(0))
+const adopted_queue = Ref{Any}(nothing)
+
 function global_queue(dev::MTLDevice)
-    queues = task_queues()
     key = UInt(pointer(dev))
+    # An adopted queue is the device's, not the task's, and answering it first is
+    # the whole point: a caller that owns submission has ONE queue and therefore
+    # one residency set, and a task that happened not to have made a queue yet
+    # must not get a second. One integer compare on the launch path, and `0` is
+    # not a device address, so an un-adopted process never takes the branch.
+    adopted_key[] == key && return adopted_queue[]::BatchedCommandQueue
+    queues = task_queues()
     bq = get(queues, key, nothing)
     bq === nothing || return bq::BatchedCommandQueue
     return make_task_queue!(queues, key, dev)
+end
+
+"""
+    adopt_queue!(dev, bq) -> bq
+
+Make `bq` the queue every task uses for `dev`, instead of one of its own.
+
+`global_queue` hands every task a private `BatchedCommandQueue` so that
+independent tasks never contend for one command buffer. That default is wrong for
+a caller that owns submission itself: a render graph has ONE queue per device, its
+residency set belongs to that queue, and work that lands on a second queue is
+ordered against the first by nothing at all. Silently, at that — a buffer made
+resident on one queue's set and read from another's is not an error; the reads
+come back zero and the writes are dropped.
+
+PROCESS-WIDE and not per task, because the uploads and the replay have to meet:
+a `Buffer(dev, data)` built on one task and a plan run on another are the same
+graph, and adopting per task would put the blit on a queue the replay is ordered
+against by nothing.
+
+The caller taking this over is also taking over the rule the default enforced: a
+`BatchedCommandQueue` is mutated without a lock, so an adopted queue must be
+driven by one task at a time.
+"""
+function adopt_queue!(dev::MTLDevice, bq)
+    adopted_queue[] = bq
+    adopted_key[] = UInt(pointer(dev))
+    return bq
 end
 
 """This task's device-to-queue table, made on first use."""

@@ -123,8 +123,14 @@ with the same buffers, and the add-and-commit pair is a driver call each time. A
 set never gives an allocation back, so "already added" is permanent and one
 pointer lookup answers it — see `residency_members`.
 """
-function make_persistently_resident!(buf::MTLBuffer)
-    dev = buf.device
+make_persistently_resident!(buf::MTLBuffer) = make_persistently_resident!(buf, buf.device)
+
+# Any allocation, not only a buffer. An `MTLIndirectCommandBuffer` is reached by
+# the command processor exactly the way a buffer is reached by a shader — by
+# address, with nothing in the submission naming it — so on a path with no
+# `useResource` (Metal 4) it has to be in the set or the replay faults. It does
+# not carry a `device` property of its own, hence the explicit one.
+function make_persistently_resident!(buf, dev::MTLDevice)
     can_use_residency_sets(dev) || return buf
     bq = global_queue(dev)
     queue = bq isa MTLCommandQueue ? bq : getfield(bq, :queue)
