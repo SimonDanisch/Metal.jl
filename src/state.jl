@@ -125,8 +125,19 @@ The caller taking this over is also taking over the rule the default enforced: a
 driven by one task at a time.
 """
 function adopt_queue!(dev::MTLDevice, bq)
+    key = UInt(pointer(dev))
+    # The steady state: `openrun` asks every frame and the answer has not changed.
+    adopted_key[] == key && adopted_queue[] === bq && return bq
+    # A CHANGE, though, has to drain. Metal orders command buffers only within one
+    # queue, so everything already committed to the queue being left is ordered
+    # against everything the new one will run by nothing at all. The case is not
+    # hypothetical: a `Buffer(dev, data)` built before its device adopted the queue
+    # is a blit on whatever queue the task had, and it landed AFTER the first frame
+    # that read the buffer — one wrong frame, every frame after it right, and
+    # nothing reported. Draining here is the only moment both queues are known.
+    device_synchronize()
     adopted_queue[] = bq
-    adopted_key[] = UInt(pointer(dev))
+    adopted_key[] = key
     return bq
 end
 

@@ -38,6 +38,7 @@ const MTL4_SELS = Dict(
                                     "endCommandBuffer", "useResidencySet:"],
     "MTL4ComputeCommandEncoder" => ["setArgumentTable:", "setComputePipelineState:",
                                     "dispatchThreadgroups:threadsPerThreadgroup:",
+                                    "dispatchThreadgroupsWithIndirectBuffer:threadsPerThreadgroup:",
                                     "executeCommandsInBuffer:withRange:",
                                     "executeCommandsInBuffer:indirectBuffer:"],
     "MTL4ArgumentTable"         => ["setAddress:atIndex:", "setResource:atBufferIndex:"])
@@ -170,6 +171,87 @@ function mtl4_probe!(a::Metal.MtlVector{Float32}, value::Float32, useicb::Bool)
     return nothing
 end
 
+"""
+The same dispatch with its GRID READ FROM MEMORY, through the wrappers.
+
+`dispatchThreadgroupsWithIndirectBuffer:` is the only way an MTL4 encoder runs a
+count that was not known when the command was encoded, and a count of zero has to
+run NOTHING. Both halves matter to a caller building a gate out of it — a driver
+that clamped zero to one would turn "this iteration is discarded" into "this
+iteration runs once more", silently.
+
+Written with the wrappers rather than `objc_msgSend`, unlike `mtl4_probe!` above,
+which predates them and is left raw on purpose: between them the two say that the
+selectors exist AND that the Julia side of them is right.
+"""
+function mtl4_indirect_probe!(a::Metal.MtlVector{Float32}, value::Float32, groups::Integer)
+    dev = Metal.device()
+    kernel = Metal.mtlfunction(mtl4_add!, Tuple{Metal.MtlDeviceVector{Float32,1}, Float32};
+                               name = "mtl4_add_indirectgrid", indirect = false)
+
+    argbuf = MTL.MTLBuffer(dev, 1024; storage = Metal.SharedStorage)
+    base = convert(Ptr{UInt8}, MTL.contents(argbuf))
+    _, maddr = Metal.malloc_buffer_and_gpu_address(dev)
+    _, eaddr = Metal.exception_info_buffer_and_gpu_address(dev)
+    state = Metal.KernelState(UInt32(1),
+        reinterpret(Core.LLVMPtr{UInt8, Metal.AS.Device}, maddr),
+        reinterpret(Core.LLVMPtr{UInt8, Metal.AS.Device}, eaddr),
+        reinterpret(Core.LLVMPtr{UInt64, Metal.AS.Device}, UInt64(0)))
+    function put(x, off)
+        r = Ref(x)
+        GC.@preserve r unsafe_copyto!(base + off,
+            convert(Ptr{UInt8}, Base.unsafe_convert(Ptr{typeof(x)}, r)), sizeof(x))
+    end
+    put(state, 0); put(Metal.mtlconvert(a), 256); put(value, 512)
+
+    # Three `UInt32`, which is what the command processor fetches: a threadgroup
+    # count per dimension. `groups = 0` is the closed gate.
+    gridbuf = MTL.MTLBuffer(dev, 16; storage = Metal.SharedStorage)
+    let p = convert(Ptr{UInt32}, MTL.contents(gridbuf))
+        unsafe_store!(p, UInt32(groups), 1)
+        unsafe_store!(p, UInt32(1), 2)
+        unsafe_store!(p, UInt32(1), 3)
+    end
+
+    legacy = Metal.global_queue(dev)
+    lq = legacy isa MTL.MTLCommandQueue ? legacy : getfield(legacy, :queue)
+    resset = Metal.install_queue_residency!(lq, dev)
+    for r in (argbuf, gridbuf, a.data[])
+        MTL.add_allocation!(resset, r)
+    end
+    MTL.commit!(resset)
+
+    q = MTL.MTL4CommandQueue(dev)
+    MTL.add_residency_set!(q, resset)
+    alloc = MTL.MTL4CommandAllocator(dev)
+    cb = MTL.MTL4CommandBuffer(dev)
+
+    table = MTL.MTL4ArgumentTable(dev; buffers = 4)
+    let gpu = UInt64(argbuf.gpuAddress)
+        for (i, off) in enumerate((0, 256, 512))
+            MTL.set_address!(table, gpu + UInt64(off), i)
+        end
+    end
+
+    MTL.begin_command_buffer!(cb, alloc)
+    enc = MTL.compute_encoder(cb)
+    MTL.use_residency_set!(cb, resset)
+    MTL.set_argument_table!(enc, table)
+    MTL.set_function!(enc, kernel.pipeline)
+    MTL.dispatch_threadgroups_indirect!(enc, gridbuf, 0, Metal.MTLSize(64))
+    MTL.endEncoding!(enc)
+    MTL.end_command_buffer!(cb)
+    MTL.commit!(q, [cb])
+
+    ev = MTL.MTLSharedEvent(dev)
+    MTL.signal_event!(q, ev, UInt64(1))
+    while ev.signaledValue < 1
+        yield()
+    end
+    GC.@preserve kernel argbuf gridbuf table alloc cb nothing
+    return nothing
+end
+
 function mtl4_add!(a, v::Float32)
     i = Metal.thread_position_in_grid_1d()
     @inbounds a[i] += v
@@ -212,6 +294,16 @@ end
             fill!(a, 0f0); Metal.synchronize()
             mtl4_probe!(a, 1.5f0, true)
             @test all(==(1.5f0), Array(a))
+        end
+
+        @testset "a threadgroup count read from memory decides the grid" begin
+            a = Metal.MtlVector{Float32}(undef, 64)
+            fill!(a, 0f0); Metal.synchronize()
+            mtl4_indirect_probe!(a, 3.5f0, 1)
+            @test all(==(3.5f0), Array(a))
+            # And zero runs nothing, which is the half a gate is built on.
+            mtl4_indirect_probe!(a, 3.5f0, 0)
+            @test all(==(3.5f0), Array(a))
         end
     end
 end

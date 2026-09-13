@@ -1,7 +1,8 @@
 export MTL4CommandQueue, MTL4CommandAllocator, MTL4CommandBuffer, MTL4ArgumentTable
 export MTL4Feedback, supports_mtl4, begin_command_buffer!, end_command_buffer!, compute_encoder,
        use_residency_set!, add_residency_set!, signal_event!, wait_for_event!,
-       set_argument_table!, set_address!, barrier!
+       set_argument_table!, set_address!, barrier!,
+       dispatch_threadgroups_indirect!
 
 # Metal 4 submission, which is the model Metal has been moving towards and the one
 # a render graph already wanted.
@@ -63,9 +64,24 @@ Independent of the device's `MTLCommandQueue`s: a device may hold both, and work
 on one is ordered against work on the other only through a shared event.
 """
 function MTL4CommandQueue(dev::MTLDevice)
-    q = @objc [dev::id{MTLDevice} newMTL4CommandQueue]::Union{Nothing,MTL4CommandQueue}
-    q === nothing && throw(ArgumentError(
-        "this device cannot create an MTL4CommandQueue; ask `supports_mtl4` first"))
+    # WITH A DESCRIPTOR, and the reason is the `error:` — `newMTL4CommandQueue`
+    # returns nil and says nothing, so a device that refuses one is a
+    # `MethodError` two calls away from its cause.
+    #
+    # NOT for `supportMTLEvent`, which is what this was first written for. The
+    # descriptor does respond to `setSupportMTLEvent:` on macOS 26.6, but the
+    # property is in neither the 26.5 nor the 27.0 SDK headers, and a fresh
+    # descriptor already reads back `true` — so setting it is an undeclared
+    # selector sent to change nothing, which is one OS release away from an
+    # unrecognised-selector abort. Nor was it the fix it looked like: the timeline
+    # freeze it was blamed for is `executeCommandsInBuffer:`, and the queue keeps
+    # freezing with the property set (`research/mtl4_icb_stall.jl`).
+    desc = @objc [MTL4CommandQueueDescriptor alloc]::id{MTL4CommandQueueDescriptor}
+    desc = @objc [desc::id{MTL4CommandQueueDescriptor} init]::MTL4CommandQueueDescriptor
+    err = Ref{id{NSError}}(nil)
+    q = @objc [dev::id{MTLDevice} newMTL4CommandQueueWithDescriptor:desc::id{MTL4CommandQueueDescriptor}
+                                  error:err::Ptr{id{NSError}}]::Union{Nothing,MTL4CommandQueue}
+    q === nothing && throw_error(err[])
     return q
 end
 
@@ -268,6 +284,24 @@ set_argument_table!(enc::MTL4ComputeCommandEncoder, table::MTL4ArgumentTable) =
 set_function!(enc::MTL4ComputeCommandEncoder, pipeline::MTLComputePipelineState) =
     @objc [enc::id{MTL4ComputeCommandEncoder} setComputePipelineState:pipeline::id{MTLComputePipelineState}]::Nothing
 
+"""
+    dispatch_threadgroups_indirect!(enc, buf, offset, threads)
+
+Dispatch a grid the DEVICE decided: `buf` holds three `UInt32` at `offset`, the
+threadgroup counts, and zero in the first runs nothing.
+
+This is how a gate survives without an indirect command buffer. A recorded plan's
+`repeat!` gate is a zero-LENGTH execution range replayed from one; encoded
+directly it is a zero-COUNT grid instead, written by the same one-thread kernel,
+and the host still never learns whether the iteration ran.
+"""
+function dispatch_threadgroups_indirect!(enc::MTL4ComputeCommandEncoder, buf::MTLBuffer,
+                                         offset::Integer, threads::MTLSize)
+    a = MTLGPUAddress(UInt64(buf.gpuAddress) + UInt64(offset))
+    @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroupsWithIndirectBuffer:a::MTLGPUAddress
+                                              threadsPerThreadgroup:threads::MTLSize]::Nothing
+end
+
 dispatch_threadgroups!(enc::MTL4ComputeCommandEncoder, groups::MTLSize, threads::MTLSize) =
     @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroups:groups::MTLSize
                                               threadsPerThreadgroup:threads::MTLSize]::Nothing
@@ -315,19 +349,25 @@ Replay a range of commands the DEVICE decided — see the legacy method for what
 execution range is and why a recording needs one.
 
 A DIFFERENT selector from the legacy path, and the same name only in this
-wrapper: `executeCommandsInBuffer:indirectBuffer:` takes an `MTL4BufferRange`,
-which is a GPU ADDRESS and a length, where the legacy form takes a buffer and an
-offset. Sending the three-part legacy selector here is an unrecognised-selector
-abort at the moment a gated plan first replays, and nothing earlier warns.
+wrapper: `executeCommandsInBuffer:indirectBuffer:` takes a bare `MTLGPUAddress`,
+where the legacy form takes a buffer and an offset. Sending the three-part legacy
+selector here is an unrecognised-selector abort at the moment a gated plan first
+replays, and nothing earlier warns.
 
-Eight bytes because an `MTLIndirectCommandBufferExecutionRange` is two `UInt32`,
-a location and a length.
+No length goes with the address, unlike everything else MTL4 addresses by
+`MTL4BufferRange`: the command processor reads the two `UInt32` of an
+`MTLIndirectCommandBufferExecutionRange` and that is the whole of it.
+
+Correct, and unusable for what it is for: this call stops completing after about a
+second of cumulative replayed GPU work, with no error and nothing in the system
+log. `research/mtl4_icb_stall.jl` reproduces it and rules the causes out one knob
+at a time; `dispatch_threadgroups_indirect!` is what a device-decided grid has to
+go through instead.
 """
 function execute_commands_indirect!(enc::MTL4ComputeCommandEncoder,
                                     icb::MTLIndirectCommandBuffer,
                                     rangebuf::MTLBuffer, offset::Integer)
-    r = MTL4BufferRange(MTLGPUAddress(UInt64(rangebuf.gpuAddress) + UInt64(offset)),
-                        UInt64(8))
+    a = MTLGPUAddress(UInt64(rangebuf.gpuAddress) + UInt64(offset))
     @objc [enc::id{MTL4ComputeCommandEncoder} executeCommandsInBuffer:icb::id{MTLIndirectCommandBuffer}
-                                              indirectBuffer:r::MTL4BufferRange]::Nothing
+                                              indirectBuffer:a::MTLGPUAddress]::Nothing
 end
