@@ -72,9 +72,10 @@ The open batch is committed ("flushed") when any of the following happens:
     `Metal.flush!` is called explicitly.
 
 Program order is preserved across flushes: command buffers execute in commit order
-and dispatches within an encoder run serially. At most `command_batching_inflight()`
-command buffers are kept in flight; further submissions block until the GPU drains
-one. Obtain the current task's batched queue with [`global_queue`](@ref).
+and dispatches within an encoder run serially. At most `bq.inflight` command
+buffers are kept in flight — `command_batching_inflight()` initially, and settable
+per queue with [`inflight!`](@ref) — and further submissions block until the GPU
+drains one. Obtain the current task's batched queue with [`global_queue`](@ref).
 
 `BatchedCommandQueue`s are task-local and mutated lock-free by their owning task.
 Sharing a raw `MTLCommandQueue` across tasks is unsupported. [`device_synchronize`](@ref)
@@ -97,13 +98,18 @@ mutable struct BatchedCommandQueue
     # caller that decides its own submission boundaries turns this off — see
     # `own_flushes!`.
     autoflush::Bool
+    # How many command buffers this queue keeps in flight before `flush!` blocks
+    # waiting for the oldest to retire. Per queue, not global, for the same reason
+    # `autoflush` is: it is a property of how the CALLER submits. See `inflight!`.
+    inflight::Int
 end
 
 function BatchedCommandQueue(queue::MTLCommandQueue)
     dev = queue.device
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
     BatchedCommandQueue(queue, dev, nothing, nothing, NoEncoder,
-                        Any[], nothing, 0, 0, Any[], PendingCommand[], true)
+                        Any[], nothing, 0, 0, Any[], PendingCommand[], true,
+                        command_batching_inflight())
 end
 
 
@@ -377,9 +383,35 @@ function wait_oldest_cleanup!(bq::BatchedCommandQueue)
     return
 end
 
+"""
+    inflight!(bq, n) -> Int
+
+How many command buffers this queue may have in flight before [`flush!`](@ref)
+blocks. Returns the previous value.
+
+Per queue rather than global, and worth setting, because the default of three is
+a throughput cliff for a caller that submits one command buffer per frame. An
+EMPTY command buffer retires almost immediately so the cap never binds; one that
+runs anything does not, and the fourth `flush!` then waits for the first to
+finish. Measured on an M5, a one-dispatch frame through Mantle:
+
+    inflight     3     4     6     8    16    24    64
+    us/frame  74.9  55.6  28.8  22.4  20.8  16.1  17.2
+
+The knee is at eight and the rest is noise. A caller that owns its submission
+boundaries (see `own_flushes!`) generally owns its pipeline depth too; the cost
+of a deeper pipeline is that more command buffers, and the Julia roots they keep
+alive, are retained before cleanup.
+"""
+function inflight!(bq::BatchedCommandQueue, n::Integer)
+    was = bq.inflight
+    bq.inflight = max(1, Int(n))
+    return was
+end
+
 function limit_inflight!(bq::BatchedCommandQueue)
     drain_cleanups!(bq)
-    while pending_cleanup_count(bq) >= command_batching_inflight()
+    while pending_cleanup_count(bq) >= bq.inflight
         wait_oldest_cleanup!(bq)
     end
     return
