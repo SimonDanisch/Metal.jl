@@ -177,7 +177,9 @@ end
 
 @device_override @inline function KA.SharedMemory(::Type{T}, ::Val{Dims},
                                                   ::Val{Id}) where {T, Dims, Id}
-    ptr = Metal.emit_threadgroup_memory(T, Val(prod(Dims)))
+    # `Val(Id)`: `@localmem` mints an id per call site so that two tiles of the
+    # same type and shape are two tiles, and dropping it here made them one.
+    ptr = Metal.emit_threadgroup_memory(T, Val(prod(Dims)), Val(Id))
     MtlDeviceArray(Dims, ptr)
 end
 

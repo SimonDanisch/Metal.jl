@@ -135,8 +135,8 @@ end
 
 ## shared memory
 
-@device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}) where {T, Dims}
-    ptr = Metal.emit_threadgroup_memory(T, Val(prod(Dims)))
+@device_override @inline function KI.localmemory(::Type{T}, ::Val{Dims}, ::Val{Id}) where {T, Dims, Id}
+    ptr = Metal.emit_threadgroup_memory(T, Val(prod(Dims)), Val(Id))
     MtlDeviceArray(Dims, ptr)
 end
 

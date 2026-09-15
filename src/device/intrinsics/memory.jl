@@ -14,7 +14,8 @@ Create an array local to each threadgroup launched during kernel execution.
 end
 
 # get a pointer to threadgroup memory, with known (static) or zero length (dynamic)
-@generated function emit_threadgroup_memory(::Type{T}, ::Val{len}=Val(0)) where {T,len}
+@generated function emit_threadgroup_memory(::Type{T}, ::Val{len} = Val(0),
+                                            ::Val{id} = Val(0)) where {T, len, id}
     Context() do ctx
         # XXX: as long as LLVMPtr is emitted as i8*, it doesn't make sense to type the GV
         eltyp = convert(LLVMType, LLVM.Int8Type())
@@ -26,7 +27,7 @@ end
         # create the global variable
         mod = LLVM.parent(llvm_f)
         gv_typ = LLVM.ArrayType(eltyp, len * sizeof(T))
-        gv = GlobalVariable(mod, gv_typ, "threadgroup_memory", AS.ThreadGroup)
+        gv = GlobalVariable(mod, gv_typ, "threadgroup_memory_$id", AS.ThreadGroup)
         if len > 0
             linkage!(gv, LLVM.API.LLVMInternalLinkage)
             initializer!(gv, UndefValue(gv_typ))
