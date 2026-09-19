@@ -95,6 +95,26 @@ function use!(cce::MTLComputeCommandEncoder, buf::Vector{MTLBuffer}, mode::MTLRe
                                              usage:mode::MTLResourceUsage]::Nothing
 end
 
+"""
+`useResources:` over an ALREADY-MARSHALLED array of object pointers.
+
+The `Vector{MTLBuffer}` method above converts through `Base.cconvert`, which
+builds a fresh `Vector{id}` and an `idArray` to hold it on EVERY call. A caller
+whose resource list is stable across frames — which is the point of caching such
+a list — therefore still pays that conversion once a frame for an answer that
+cannot have changed. Converting once and passing the result here costs nothing
+per call.
+
+The caller owns the array and owns keeping the objects it points at alive: these
+are bare pointers and nothing here roots them.
+"""
+function use!(cce::MTLComputeCommandEncoder, ids::Vector{id{MTLBuffer}},
+              mode::MTLResourceUsage=ReadWriteUsage)
+    @objc [cce::id{MTLComputeCommandEncoder} useResources:ids::Ptr{id{MTLBuffer}}
+                                             count:length(ids)::Csize_t
+                                             usage:mode::MTLResourceUsage]::Nothing
+end
+
 #### acceleration structures
 
 """

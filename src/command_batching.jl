@@ -94,6 +94,12 @@ mutable struct BatchedCommandQueue
     nbytes::Int
     pending_ops::Vector{Any}
     cleanups::Vector{PendingCommand}
+    # Root vectors waiting to be used again. `flush!` hands the open batch's
+    # roots to its `PendingCommand` and needs a fresh vector for the next one;
+    # `drain_cleanups!` empties that one when the command buffer retires and
+    # drops it. Cycling them instead is two allocations a frame that nothing
+    # ever reads again — see `recycle_roots!`.
+    spare_roots::Vector{Vector{Any}}
     # Whether the thresholds below may commit the open batch on their own. A
     # caller that decides its own submission boundaries turns this off — see
     # `own_flushes!`.
@@ -108,8 +114,8 @@ function BatchedCommandQueue(queue::MTLCommandQueue)
     dev = queue.device
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
     BatchedCommandQueue(queue, dev, nothing, nothing, NoEncoder,
-                        Any[], nothing, 0, 0, Any[], PendingCommand[], true,
-                        command_batching_inflight())
+                        Any[], nothing, 0, 0, Any[], PendingCommand[],
+                        Vector{Any}[], true, command_batching_inflight())
 end
 
 
@@ -351,12 +357,13 @@ function drain_cleanups!(bq::BatchedCommandQueue; force::Bool=false)
     end
     n == 0 && return
 
-    completed = bq.cleanups[1:n]
-    deleteat!(bq.cleanups, 1:n)
-
-    for cleanup in completed
-        empty!(cleanup.roots)
+    # In place, then one `deleteat!`. `bq.cleanups[1:n]` COPIED the prefix into a
+    # fresh vector purely to iterate it, which is an allocation a frame for a
+    # list that is about to be deleted anyway.
+    for i in 1:n
+        recycle_roots!(bq, bq.cleanups[i].roots)
     end
+    deleteat!(bq.cleanups, 1:n)
 
     unregister_queue_if_idle!(bq)
     return
@@ -417,10 +424,28 @@ function limit_inflight!(bq::BatchedCommandQueue)
     return
 end
 
+"""
+Empty `v` and keep it for the next batch, if this queue is not already holding
+enough of them.
+
+Bounded by `inflight` because that is how many batches can be un-retired at
+once: one root vector per command buffer in flight, plus the open one.
+"""
+function recycle_roots!(bq::BatchedCommandQueue, v::Vector{Any})
+    empty!(v)
+    length(bq.spare_roots) <= bq.inflight && push!(bq.spare_roots, v)
+    return nothing
+end
+
 function reset_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
     bq.cmdbuf = nothing
-    bq.roots = Any[]
-    bq.pending_ops = Any[]
+    # Recycled, not fresh: `flush!` has just given the old one away to a
+    # `PendingCommand`, and `drain_cleanups!` hands it back here once the
+    # command buffer retires.
+    bq.roots = isempty(bq.spare_roots) ? Any[] : pop!(bq.spare_roots)
+    # …and this one is never given away at all — `register_operations!` reads it
+    # before the reset and nothing holds it after — so it is emptied in place.
+    empty!(bq.pending_ops)
     bq.nops = 0
     bq.nbytes = 0
     unregister_queue_if_idle!(bq)
@@ -428,6 +453,9 @@ function reset_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
 end
 
 function discard_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
+    # Discarded, so these roots went to no `PendingCommand` and nothing will
+    # hand them back. Straight into the pool.
+    recycle_roots!(bq, bq.roots)
     reset_open_cmdbuf!(bq, cmdbuf)
     release(cmdbuf)
     return
