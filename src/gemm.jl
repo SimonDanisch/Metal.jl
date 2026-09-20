@@ -276,8 +276,8 @@ end
 # compile-time constants. The K-loop trip count is kept dynamic (a runtime `K`, not a `Val`)
 # to avoid crashing Apple's back-end (see the note in `device/intrinsics/tensor.jl`).
 #
-# One threadgroup computes one `C[TM, TN]` output tile, accumulating `A[TM,:] * B[:,TN]` over
-# the K dimension in TK-wide slices.
+# One threadgroup computes one `C[TM, TN]` output tile.  The first K slice overwrites the
+# destination; the remaining slices accumulate, so callers do not need a separate fill.
 function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceArray,
                              M::UInt32, N::UInt32, K::UInt32,
                              ::Val{TM}, ::Val{TN}, ::Val{TK},
@@ -292,15 +292,21 @@ function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceA
 
     mC = view(tC, (m_off + Int32(1), n_off + Int32(1)), (Int32(TM), Int32(TN)))
 
-    op = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
-                                               mode = matmul2d_multiply_accumulate),
-                           Int32(NSIMD)}()
+    initialize = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
+                                                        mode = matmul2d_multiply),
+                                    Int32(NSIMD)}()
+    accumulate = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
+                                                        mode = matmul2d_multiply_accumulate),
+                                    Int32(NSIMD)}()
     nslices = unsafe_trunc(Int32, K ÷ UInt32(TK))
-    for s in Int32(0):(nslices - Int32(1))
+    mA = view(tA, (m_off + Int32(1), Int32(1)), (Int32(TM), Int32(TK)))
+    mB = view(tB, (Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
+    initialize(mA, mB, mC)
+    for s in Int32(1):(nslices - Int32(1))
         k_off = s * Int32(TK)
         mA = view(tA, (m_off + Int32(1), k_off + Int32(1)), (Int32(TM), Int32(TK)))
         mB = view(tB, (k_off + Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
-        op(mA, mB, mC)
+        accumulate(mA, mB, mC)
     end
     return
 end
@@ -369,7 +375,6 @@ function gemm_tensor!(C::MtlMatrix, A::MtlMatrix, B::MtlMatrix,
     @assert tile_m > 0 && tile_n > 0 && tile_k > 0 """
         no usable tensor-ops tile for $((M, N, K)); call `supports_tensor_matmul` first"""
 
-    fill!(C, zero(eltype(C)))   # the kernel accumulates into C
     groups = (M ÷ tile_m, N ÷ tile_n, 1)
     nsimd = GEMM_TENSOR_NSIMD
     @metal threads = nsimd * 32 groups = groups gemm_tensor_kernel!(

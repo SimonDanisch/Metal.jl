@@ -334,7 +334,9 @@ end
                 A = MtlArray(rand(T, M, K)); B = MtlArray(rand(T, K, N))
                 ref = Array(A) * Array(B)
                 @test Metal.supports_tensor_matmul(MtlArray(zeros(T, M, N)), A, B, 'N', 'N', true, false)
-                Ct = MtlArray(zeros(T, M, N))
+                # The first K tile must initialize C itself; a prior fill would be another
+                # full-buffer dispatch for every recorded GEMM.
+                Ct = MtlArray(fill(T(NaN), M, N))
                 @with (Metal.matmul_alg => :tensor) mul!(Ct, A, B)
                 @test isapprox(Array(Ct), ref; rtol=ttol(T))
             end
