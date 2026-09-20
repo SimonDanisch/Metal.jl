@@ -1,20 +1,23 @@
 export MtlThreadGroupArray
 
 """
-    MtlThreadGroupArray(::Type{T}, dims)
+    MtlThreadGroupArray(::Type{T}, dims[, id])
 
 Create an array local to each threadgroup launched during kernel execution.
+`id` distinguishes multiple allocations of the same type and shape in one
+kernel; callers with more than one such allocation should pass distinct `Val`s.
 """
-@inline function MtlThreadGroupArray(::Type{T}, dims) where {T}
+@inline function MtlThreadGroupArray(::Type{T}, dims, id::Val=Val(0)) where {T}
     len = prod(dims)
     # NOTE: this relies on const-prop to forward the literal length to the generator.
     #       maybe we should include the size in the type, like StaticArrays does?
-    ptr = emit_threadgroup_memory(T, Val(len))
+    ptr = emit_threadgroup_memory(T, Val(len), id)
     MtlDeviceArray(dims, ptr)
 end
 
 # get a pointer to threadgroup memory, with known (static) or zero length (dynamic)
-@generated function emit_threadgroup_memory(::Type{T}, ::Val{len}=Val(0)) where {T,len}
+@generated function emit_threadgroup_memory(::Type{T}, ::Val{len}=Val(0),
+                                             ::Val{id}=Val(0)) where {T,len,id}
     Context() do ctx
         # XXX: as long as LLVMPtr is emitted as i8*, it doesn't make sense to type the GV
         eltyp = convert(LLVMType, LLVM.Int8Type())
@@ -26,7 +29,7 @@ end
         # create the global variable
         mod = LLVM.parent(llvm_f)
         gv_typ = LLVM.ArrayType(eltyp, len * sizeof(T))
-        gv = GlobalVariable(mod, gv_typ, "threadgroup_memory", AS.ThreadGroup)
+        gv = GlobalVariable(mod, gv_typ, "threadgroup_memory_$id", AS.ThreadGroup)
         if len > 0
             linkage!(gv, LLVM.API.LLVMInternalLinkage)
             initializer!(gv, UndefValue(gv_typ))
