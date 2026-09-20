@@ -354,6 +354,98 @@ function gemm_tensor_epilogue_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
                       hasbias, Val(true))
 end
 
+# Strided-batched tensor GEMM.  The matrix plane is contiguous and every trailing
+# dimension is flattened into the grid's z axis.  Keeping the transpose in the
+# tensor descriptor avoids materialising attention's `(E,L,H,B) -> (L,E,H,B)`
+# query permutation.
+@inline function gemm_tensor_batched_body!(C::MtlDeviceArray, A::MtlDeviceArray,
+                                           B::MtlDeviceArray, alpha::Float32,
+                                           M::UInt32, N::UInt32, K::UInt32,
+                                           ::Val{TM}, ::Val{TN}, ::Val{TK},
+                                           ::Val{NSIMD}, ::Val{TA}, ::Val{TB},
+                                           ::Val{HASSCALE}) where
+                                          {TM, TN, TK, NSIMD, TA, TB,
+                                           HASSCALE}
+    tgid = threadgroup_position_in_grid_3d()
+    m_off = (unsafe_trunc(Int32, tgid.x) - Int32(1)) * Int32(TM)
+    n_off = (unsafe_trunc(Int32, tgid.y) - Int32(1)) * Int32(TN)
+    batch = unsafe_trunc(Int32, tgid.z) - Int32(1)
+
+    arows = TA ? K : M
+    acols = TA ? M : K
+    brows = TB ? N : K
+    bcols = TB ? K : N
+    A2 = MtlDeviceArray((Int(arows), Int(acols)),
+                        pointer(A, Int(batch) * Int(M) * Int(K) + 1))
+    B2 = MtlDeviceArray((Int(brows), Int(bcols)),
+                        pointer(B, Int(batch) * Int(K) * Int(N) + 1))
+    C2 = MtlDeviceArray((Int(M), Int(N)),
+                        pointer(C, Int(batch) * Int(M) * Int(N) + 1))
+
+    tA = MtlInlineTensor(A2)
+    tB = MtlInlineTensor(B2)
+    tC = MtlInlineTensor(C2)
+    mC = view(tC, (m_off + Int32(1), n_off + Int32(1)),
+              (Int32(TM), Int32(TN)))
+
+    initialize = TensorOpsMatmul2D{
+        matmul2d_descriptor(TM, TN, TK; transpose_left = TA,
+                            transpose_right = TB, mode = matmul2d_multiply),
+        Int32(NSIMD)}()
+    accumulate = TensorOpsMatmul2D{
+        matmul2d_descriptor(TM, TN, TK; transpose_left = TA,
+                            transpose_right = TB,
+                            mode = matmul2d_multiply_accumulate),
+        Int32(NSIMD)}()
+    nslices = unsafe_trunc(Int32, K ÷ UInt32(TK))
+
+    aextent = TA ? (Int32(TK), Int32(TM)) : (Int32(TM), Int32(TK))
+    bextent = TB ? (Int32(TN), Int32(TK)) : (Int32(TK), Int32(TN))
+
+    aorigin = TA ? (Int32(1), m_off + Int32(1)) :
+                   (m_off + Int32(1), Int32(1))
+    borigin = TB ? (n_off + Int32(1), Int32(1)) :
+                   (Int32(1), n_off + Int32(1))
+    mA = view(tA, aorigin, aextent)
+    mB = view(tB, borigin, bextent)
+    initialize(mA, mB, mC)
+    for s in Int32(1):(nslices - Int32(1))
+        k_off = s * Int32(TK)
+        aorigin = TA ? (k_off + Int32(1), m_off + Int32(1)) :
+                       (m_off + Int32(1), k_off + Int32(1))
+        borigin = TB ? (n_off + Int32(1), k_off + Int32(1)) :
+                       (k_off + Int32(1), n_off + Int32(1))
+        mA = view(tA, aorigin, aextent)
+        mB = view(tB, borigin, bextent)
+        accumulate(mA, mB, mC)
+    end
+
+    if HASSCALE
+        threadgroup_barrier(MemoryFlagDevice)
+        tid = Int(thread_index_in_threadgroup()) - 1
+        stride = NSIMD * 32
+        for linear in tid:stride:(TM * TN - 1)
+            mi = linear % TM
+            ni = linear ÷ TM
+            row = Int(m_off) + mi + 1
+            col = Int(n_off) + ni + 1
+            @inbounds value = Float32(C2[row, col])
+            value *= alpha
+            @inbounds C2[row, col] = value
+        end
+    end
+    return
+end
+
+function gemm_tensor_batched_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
+                                     B::MtlDeviceArray, alpha::Float32,
+                                     M::UInt32, N::UInt32, K::UInt32,
+                                     tm::Val, tn::Val, tk::Val, nsimd::Val,
+                                     ta::Val, tb::Val, hasscale::Val)
+    gemm_tensor_batched_body!(C, A, B, alpha, M, N, K,
+                              tm, tn, tk, nsimd, ta, tb, hasscale)
+end
+
 # eltypes the tensor path handles (uniform in/out); these have `__tensorops` run helpers and
 # accumulate to a sensible precision in matmul2d.
 @inline gemm_tensor_eltype(::Type{T}, ::Type{T}, ::Type{T}) where {T <: Union{Float16, Float32, BFloat16}} = true
@@ -433,6 +525,46 @@ function gemm_kernel_config(C, A, B; bias = nothing, epilogue = identity)
     return (; kernel = gemm_simd_kernel!, args,
             ndrange = (groups[1] * threads, groups[2]), group = (threads, 1),
             fused = (; bias = false, epilogue = false))
+end
+
+"""
+    batched_gemm_kernel_config(C, A, B; transpose_a=false, transpose_b=false,
+                               alpha=1)
+
+Describe a recordable Metal tensor-ops strided-batched GEMM.  The first two
+axes hold each matrix and all remaining axes form a contiguous batch.  Returns
+`nothing` when tensor operations or the requested tiled shapes are unavailable.
+"""
+function batched_gemm_kernel_config(C, A, B; transpose_a = false,
+                                    transpose_b = false, alpha = 1)
+    tensor_matmul_capable() || return nothing
+    gemm_tensor_eltype(eltype(A), eltype(B), eltype(C)) || return nothing
+    ndims(A) >= 3 && ndims(B) >= 3 && ndims(C) >= 3 || return nothing
+
+    M = transpose_a ? size(A, 2) : size(A, 1)
+    K = transpose_a ? size(A, 1) : size(A, 2)
+    Kb = transpose_b ? size(B, 2) : size(B, 1)
+    N = transpose_b ? size(B, 1) : size(B, 2)
+    size(C, 1) == M && size(C, 2) == N && Kb == K || return nothing
+    nbatch = prod(size(C)[3:end])
+    prod(size(A)[3:end]) == nbatch || return nothing
+    prod(size(B)[3:end]) == nbatch || return nothing
+    tm = gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES)
+    tn = gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES)
+    tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
+    tm != 0 && tn != 0 && tk != 0 || return nothing
+
+    nsimd = GEMM_TENSOR_NSIMD
+    threads = nsimd * 32
+    groups = (M ÷ tm, N ÷ tn, nbatch)
+    hasscale = !isone(alpha)
+    args = (C, A, B, Float32(alpha),
+            UInt32(M), UInt32(N), UInt32(K),
+            Val(Int32(tm)), Val(Int32(tn)), Val(Int32(tk)), Val(Int32(nsimd)),
+            Val(Bool(transpose_a)), Val(Bool(transpose_b)), Val(hasscale))
+    return (; kernel = gemm_tensor_batched_kernel!, args,
+            ndrange = (groups[1] * threads, groups[2], groups[3]),
+            group = (threads, 1, 1))
 end
 
 # Whether `gemm_tensor!` can compute `C = α·op(A)·op(B) + β·C` for these operands: the kernel

@@ -356,6 +356,36 @@ end
                 Val(Int32(64)), Val(Int32(64)), Val(Int32(32)), Val(Int32(4)), Val(true))
             @test isapprox(Array(Cb), abs.(Array(A) * Array(B) .+ Array(bias)); rtol=1.0f-1)
 
+            # Attention uses a strided batch for q'k.  Cover its transpose
+            # descriptor and fused score scaling.
+            E, L, batch = 16, 16, 2
+            qh = rand(Float16, E, L, batch); kh = rand(Float16, E, L, batch)
+            q = MtlArray(qh); k = MtlArray(kh)
+            scores = MtlArray(fill(Float16(NaN), L, L, batch))
+            Metal.@metal threads=128 groups=(1, 1, batch) Metal.gemm_tensor_batched_kernel!(
+                scores, q, k, 0.125f0, UInt32(L), UInt32(L), UInt32(E),
+                Val(Int32(16)), Val(Int32(16)), Val(Int32(16)), Val(Int32(4)),
+                Val(true), Val(false), Val(true))
+            score_ref = zeros(Float32, L, L, batch)
+            for b in 1:batch
+                score_ref[:, :, b] .= 0.125f0 .* (Float32.(qh[:, :, b])' *
+                                                  Float32.(kh[:, :, b]))
+            end
+            @test isapprox(Array(scores), score_ref; rtol=1.0f-1)
+
+            vh = rand(Float16, E, L, batch); ph = rand(Float16, L, L, batch)
+            v = MtlArray(vh); p = MtlArray(ph)
+            out = MtlArray(fill(Float16(NaN), E, L, batch))
+            Metal.@metal threads=128 groups=(1, 1, batch) Metal.gemm_tensor_batched_kernel!(
+                out, v, p, 1.0f0, UInt32(E), UInt32(L), UInt32(L),
+                Val(Int32(16)), Val(Int32(16)), Val(Int32(16)), Val(Int32(4)),
+                Val(false), Val(true), Val(false))
+            out_ref = zeros(Float32, E, L, batch)
+            for b in 1:batch
+                out_ref[:, :, b] .= Float32.(vh[:, :, b]) * Float32.(ph[:, :, b])'
+            end
+            @test isapprox(Array(out), out_ref; rtol=1.0f-1)
+
             # forcing `:tensor` on operands it can't handle errors (like an unsupported :MPS)
             A = MtlArray(rand(Float32, 64, 64)); B = MtlArray(rand(Float32, 64, 64))
             @test_throws Exception (@with (Metal.matmul_alg => :tensor) mul!(MtlArray(zeros(Float32, 64, 64)), transpose(A), B))  # transpose
