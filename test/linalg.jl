@@ -341,6 +341,21 @@ end
                 @test isapprox(Array(Ct), ref; rtol=ttol(T))
             end
 
+            # Recorded DNN plans fold a row bias into the tensor dispatch.  Exercise the
+            # entry point directly so its post-matmul device-memory barrier and indexing
+            # are covered independently of Mantle.
+            M, N, K = 128, 256, 64
+            A = MtlArray(rand(Float16, M, K)); B = MtlArray(rand(Float16, K, N))
+            bias = MtlArray(rand(Float16, M)); Cb = MtlArray(fill(Float16(NaN), M, N))
+            Metal.@metal threads=128 groups=(2, 4, 1) Metal.gemm_tensor_bias_kernel!(
+                Cb, A, B, bias, UInt32(M), UInt32(N), UInt32(K),
+                Val(Int32(64)), Val(Int32(64)), Val(Int32(32)), Val(Int32(4)))
+            @test isapprox(Array(Cb), Array(A) * Array(B) .+ Array(bias); rtol=1.0f-1)
+            Metal.@metal threads=128 groups=(2, 4, 1) Metal.gemm_tensor_epilogue_kernel!(
+                Cb, A, B, bias, abs, UInt32(M), UInt32(N), UInt32(K),
+                Val(Int32(64)), Val(Int32(64)), Val(Int32(32)), Val(Int32(4)), Val(true))
+            @test isapprox(Array(Cb), abs.(Array(A) * Array(B) .+ Array(bias)); rtol=1.0f-1)
+
             # forcing `:tensor` on operands it can't handle errors (like an unsupported :MPS)
             A = MtlArray(rand(Float32, 64, 64)); B = MtlArray(rand(Float32, 64, 64))
             @test_throws Exception (@with (Metal.matmul_alg => :tensor) mul!(MtlArray(zeros(Float32, 64, 64)), transpose(A), B))  # transpose

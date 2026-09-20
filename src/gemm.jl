@@ -278,10 +278,12 @@ end
 #
 # One threadgroup computes one `C[TM, TN]` output tile.  The first K slice overwrites the
 # destination; the remaining slices accumulate, so callers do not need a separate fill.
-function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceArray,
-                             M::UInt32, N::UInt32, K::UInt32,
-                             ::Val{TM}, ::Val{TN}, ::Val{TK},
-                             ::Val{NSIMD}) where {TM, TN, TK, NSIMD}
+@inline function gemm_tensor_body!(C::MtlDeviceArray, A::MtlDeviceArray,
+                                   B::MtlDeviceArray, bias, epilogue,
+                                   M::UInt32, N::UInt32, K::UInt32,
+                                   ::Val{TM}, ::Val{TN}, ::Val{TK},
+                                   ::Val{NSIMD}, ::Val{HASBIAS}, ::Val{HASEPI}) where
+                                  {TM, TN, TK, NSIMD, HASBIAS, HASEPI}
     tgid  = threadgroup_position_in_grid_3d()
     m_off = (unsafe_trunc(Int32, tgid.x) - Int32(1)) * Int32(TM)
     n_off = (unsafe_trunc(Int32, tgid.y) - Int32(1)) * Int32(TN)
@@ -308,7 +310,48 @@ function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceA
         mB = view(tB, (k_off + Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
         accumulate(mA, mB, mC)
     end
+    if HASBIAS || HASEPI
+        # matmul2d is collective over the threadgroup.  Make its device writes
+        # visible before the same threads apply the row bias in place.
+        threadgroup_barrier(MemoryFlagDevice)
+        tid = Int(thread_index_in_threadgroup()) - 1
+        stride = NSIMD * 32
+        for linear in tid:stride:(TM * TN - 1)
+            mi = linear % TM
+            ni = linear ÷ TM
+            row = Int(m_off) + mi + 1
+            col = Int(n_off) + ni + 1
+            @inbounds value = C[row, col]
+            HASBIAS && (@inbounds value += bias[row])
+            HASEPI && (value = epilogue(value))
+            @inbounds C[row, col] = value
+        end
+    end
     return
+end
+
+function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceArray,
+                             M::UInt32, N::UInt32, K::UInt32,
+                             tm::Val, tn::Val, tk::Val, nsimd::Val)
+    gemm_tensor_body!(C, A, B, nothing, identity, M, N, K, tm, tn, tk, nsimd,
+                      Val(false), Val(false))
+end
+
+function gemm_tensor_bias_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
+                                  B::MtlDeviceArray, bias::MtlDeviceArray,
+                                  M::UInt32, N::UInt32, K::UInt32,
+                                  tm::Val, tn::Val, tk::Val, nsimd::Val)
+    gemm_tensor_body!(C, A, B, bias, identity, M, N, K, tm, tn, tk, nsimd,
+                      Val(true), Val(false))
+end
+
+function gemm_tensor_epilogue_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
+                                      B::MtlDeviceArray, bias, epilogue,
+                                      M::UInt32, N::UInt32, K::UInt32,
+                                      tm::Val, tn::Val, tk::Val, nsimd::Val,
+                                      hasbias::Val)
+    gemm_tensor_body!(C, A, B, bias, epilogue, M, N, K, tm, tn, tk, nsimd,
+                      hasbias, Val(true))
 end
 
 # eltypes the tensor path handles (uniform in/out); these have `__tensorops` run helpers and
@@ -337,6 +380,59 @@ const GEMM_TENSOR_NSIMD    = 4
         d % t == 0 && return t
     end
     return 0
+end
+
+"""
+    gemm_kernel_config(C, A, B; bias=nothing, epilogue=identity)
+
+Describe Metal's fastest command-buffer-recordable kernel for `C = A*B`, including its
+launch geometry and any fused row bias or elementwise epilogue.  This keeps tensor-family
+checks, tile selection, and SIMD tuning in Metal.jl; graph runtimes only need to record the
+returned dispatch.
+"""
+function gemm_kernel_config(C, A, B; bias = nothing, epilogue = identity)
+    gemm_simd_eltype(eltype(A), eltype(B), eltype(C)) || return nothing
+    M, N, K = size(C, 1), size(C, 2), size(A, 2)
+    if tensor_matmul_capable() && gemm_tensor_eltype(eltype(A), eltype(B), eltype(C))
+        tm = gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES)
+        tn = gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES)
+        tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
+        if tm != 0 && tn != 0 && tk != 0
+            nsimd = GEMM_TENSOR_NSIMD
+            threads = nsimd * 32
+            groups = (M ÷ tm, N ÷ tn)
+            fusebias = bias !== nothing && length(bias) == M
+            fuseepi = epilogue !== identity
+            shape_args = (UInt32(M), UInt32(N), UInt32(K),
+                          Val(Int32(tm)), Val(Int32(tn)), Val(Int32(tk)),
+                          Val(Int32(nsimd)))
+            kernel, args = if fuseepi
+                gemm_tensor_epilogue_kernel!,
+                (C, A, B, fusebias ? bias : nothing, epilogue,
+                 shape_args..., Val(fusebias))
+            elseif fusebias
+                gemm_tensor_bias_kernel!, (C, A, B, bias, shape_args...)
+            else
+                gemm_tensor_kernel!, (C, A, B, shape_args...)
+            end
+            return (; kernel, args, ndrange = (groups[1] * threads, groups[2]),
+                    group = (threads, 1), fused = (; bias = fusebias,
+                                                    epilogue = fuseepi))
+        end
+    end
+
+    WM, WN = GEMM_SIMD_WM, GEMM_SIMD_WN
+    TM, TN, KB = GEMM_SIMD_TM, GEMM_SIMD_TN, GEMM_SIMD_KB
+    BM, BN = 8 * TM * WM, 8 * TN * WN
+    threads = WM * WN * 32
+    groups = (cld(M, BM), cld(N, BN))
+    edge = !(M % BM == 0 && N % BN == 0)
+    args = (C, A, B, 1.0f0, 0.0f0, M, N, K,
+            Val('N'), Val('N'), Val(WM), Val(WN), Val(TM), Val(TN), Val(KB),
+            Val(edge), Val(true), Val(true))
+    return (; kernel = gemm_simd_kernel!, args,
+            ndrange = (groups[1] * threads, groups[2]), group = (threads, 1),
+            fused = (; bias = false, epilogue = false))
 end
 
 # Whether `gemm_tensor!` can compute `C = α·op(A)·op(B) + β·C` for these operands: the kernel
