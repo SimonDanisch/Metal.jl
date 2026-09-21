@@ -32,18 +32,29 @@ into the grid's y — `Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, b
 """
 @inline function attn_flash_tensor_body!(O::MtlDeviceArray, Q::MtlDeviceArray,
                                         K::MtlDeviceArray, V::MtlDeviceArray,
+                                        olay::NTuple{4, Int32}, qlay::NTuple{4, Int32},
+                                        klay::NTuple{4, Int32}, vlay::NTuple{4, Int32},
+                                        H::UInt32,
                                         scale::Float32, Lq::UInt32, Lk::UInt32,
                                         ::Val{E}, ::Val{BQ}, ::Val{BK},
                                         ::Val{NSIMD}) where {E, BQ, BK, NSIMD}
     tgid = threadgroup_position_in_grid_3d()
     qb = (unsafe_trunc(Int32, tgid.x) - Int32(1)) * Int32(BQ)
     hb = unsafe_trunc(Int32, tgid.y) - Int32(1)
-
-    Qp = MtlDeviceArray((E, Int(Lq)), pointer(Q, Int(hb) * E * Int(Lq) + 1))
-    Kp = MtlDeviceArray((E, Int(Lk)), pointer(K, Int(hb) * E * Int(Lk) + 1))
-    Vp = MtlDeviceArray((E, Int(Lk)), pointer(V, Int(hb) * E * Int(Lk) + 1))
-    Op = MtlDeviceArray((E, Int(Lq)), pointer(O, Int(hb) * E * Int(Lq) + 1))
-    tQ = MtlInlineTensor(Qp); tK = MtlInlineTensor(Kp); tV = MtlInlineTensor(Vp)
+    # Each operand is `(offset, lda, head stride, batch stride)` in elements, so a PERMUTED
+    # view is read where it lies instead of being copied first. SAM 2.1's qkv projection
+    # leaves q/k/v as `(E, H, L, B)` and attention wants `(E, L, H, B)`: dense, that is three
+    # 4.7 MiB transposes per op before the op can start. The dense case is this same code with
+    # the packed strides, so there is one path, not two.
+    hh = hb % unsafe_trunc(Int32, H)
+    bb = hb ÷ unsafe_trunc(Int32, H)
+    @inline plane(A, lay, L) = MtlDeviceArray(
+        (E, Int(L)), pointer(A, Int(lay[1] + hh * lay[3] + bb * lay[4]) + 1))
+    Qp = plane(Q, qlay, Lq)
+    tK = MtlInlineTensor(plane(K, klay, Lk), (E, Int(Lk)), (1, Int(klay[2])))
+    tV = MtlInlineTensor(plane(V, vlay, Lk), (E, Int(Lk)), (1, Int(vlay[2])))
+    Op = plane(O, olay, Lq)
+    olda = Int(olay[2])
 
     # The score tile in Float32 and the probabilities in the operand type, because the
     # apply product's right operand has to match `V`'s element type.
@@ -53,10 +64,17 @@ into the grid's y — `Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, b
     mv = MtlThreadGroupArray(Float32, (BQ,), Val(3))   # running row max
     lv = MtlThreadGroupArray(Float32, (BQ,), Val(4))   # running row sum
     cv = MtlThreadGroupArray(Float32, (BQ,), Val(5))   # this tile's rescale factor
+    # The query tile, staged ONCE. The score product is inside the key loop, so a device-memory
+    # q tile is re-read `Lk/BK` times — 32 times at 4096 keys — and through a permuted view
+    # those reads are `BQ` scattered runs rather than one block. Staged, the layout is paid
+    # once: measured on SAM 2.1's encoder this is what keeps reading q/k/v where they lie
+    # cheaper than transposing them first.
+    Qs = MtlThreadGroupArray(eltype(Q), (E, BQ), Val(6))
 
     mSf = view(MtlInlineTensor(Sf), (Int32(1), Int32(1)), (Int32(BQ), Int32(BK)))
     mPh = view(MtlInlineTensor(Ph), (Int32(1), Int32(1)), (Int32(BQ), Int32(BK)))
     mOa = view(MtlInlineTensor(Oa), (Int32(1), Int32(1)), (Int32(E), Int32(BQ)))
+    mQs = view(MtlInlineTensor(Qs), (Int32(1), Int32(1)), (Int32(E), Int32(BQ)))
 
     # `S = Qᵀ K` for this tile, and `O += V Pᵀ`. The contraction lengths are the tile's own
     # (E and BK), so both descriptors are fully static.
@@ -79,6 +97,10 @@ into the grid's y — `Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, b
         @inbounds mv[r] = -Inf32
         @inbounds lv[r] = 0.0f0
     end
+    for lin in tid:nthr:(E * BQ - 1)
+        i = lin % E; j = lin ÷ E
+        @inbounds Qs[i + 1, j + 1] = Qp[i + 1 + Int(qlay[2]) * (Int(qb) + j)]
+    end
     threadgroup_barrier(MemoryFlagThreadGroup)
 
     # Dynamic trip count: a compile-time constant one crashes Apple's back-end (see
@@ -86,8 +108,7 @@ into the grid's y — `Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, b
     ntiles = unsafe_trunc(Int32, Lk ÷ UInt32(BK))
     for t in Int32(0):(ntiles - Int32(1))
         koff = t * Int32(BK)
-        score(view(tQ, (Int32(1), qb + Int32(1)), (Int32(E), Int32(BQ))),
-              view(tK, (Int32(1), koff + Int32(1)), (Int32(E), Int32(BK))), mSf)
+        score(mQs, view(tK, (Int32(1), koff + Int32(1)), (Int32(E), Int32(BK))), mSf)
         threadgroup_barrier(MemoryFlagThreadGroup)
         # One thread per query row: the max over this tile, then the exponentials against
         # the running max. Splitting a row across threads was tried and is not faster — the
@@ -123,16 +144,21 @@ into the grid's y — `Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, b
 
     for lin in tid:nthr:(E * BQ - 1)
         i = lin % E; j = lin ÷ E
-        @inbounds Op[i + 1, Int(qb) + j + 1] = eltype(O)(Oa[i + 1, j + 1] / lv[j + 1])
+        # `Op` carries its own leading dimension too, so the result can land straight in a
+        # permuted destination.
+        @inbounds Op[i + 1 + olda * (Int(qb) + j)] = eltype(O)(Oa[i + 1, j + 1] / lv[j + 1])
     end
     return
 end
 
 function attn_flash_tensor_kernel!(O::MtlDeviceArray, Q::MtlDeviceArray,
                                    K::MtlDeviceArray, V::MtlDeviceArray,
-                                   scale::Float32, Lq::UInt32, Lk::UInt32,
+                                   olay::NTuple{4, Int32}, qlay::NTuple{4, Int32},
+                                   klay::NTuple{4, Int32}, vlay::NTuple{4, Int32},
+                                   H::UInt32, scale::Float32, Lq::UInt32, Lk::UInt32,
                                    e::Val, bq::Val, bk::Val, nsimd::Val)
-    attn_flash_tensor_body!(O, Q, K, V, scale, Lq, Lk, e, bq, bk, nsimd)
+    attn_flash_tensor_body!(O, Q, K, V, olay, qlay, klay, vlay, H, scale, Lq, Lk,
+                            e, bq, bk, nsimd)
 end
 
 # The measured tiling, and the fallbacks for a sequence it does not divide. `BQ = 16`,
@@ -144,29 +170,62 @@ const ATTN_FLASH_BK = (128, 64, 32)
 const ATTN_FLASH_NSIMD = 4
 
 """
+    attn_layout(x) -> (resource, dims, (offset, lda, head stride, batch stride)) or nothing
+
+One attention operand, dense or strided.
+
+`x` is either an array — packed, offset zero — or a `(; res, dims, strides, offset)` view of
+one, which is how a permuted operand arrives. Four dimensions `(E, L, H, B)` or three
+`(E, L, HB)`, and `E` must be the contiguous axis: `matmul2d` reads the plane through a
+tensor descriptor, which carries a leading dimension but not a gap between elements.
+"""
+function attn_layout(x)
+    if x isa NamedTuple
+        dims = x.dims; st = x.strides
+        length(dims) == length(st) || return nothing
+        first(st) == 1 || return nothing
+        length(dims) == 3 && return (x.res, dims, (Int(x.offset), Int(st[2]), Int(st[3]), 0))
+        length(dims) == 4 &&
+            return (x.res, dims, (Int(x.offset), Int(st[2]), Int(st[3]), Int(st[4])))
+        return nothing
+    end
+    d = size(x)
+    length(d) == 3 && return (x, d, (0, d[1], d[1] * d[2], 0))
+    length(d) == 4 && return (x, d, (0, d[1], d[1] * d[2], d[1] * d[2] * d[3]))
+    return nothing
+end
+
+"""
     attention_kernel_config(O, Q, K, V; scale) -> config or nothing
 
 Describe Metal's fused attention kernel for `O = softmax(scale · QᵀK) V`, one matrix per
 trailing-axis batch entry, or `nothing` when this device or these operands are not covered.
 
-`Q`/`O` are `(E, Lq, batch...)` and `K`/`V` are `(E, Lk, batch...)`, all with the same
-element type; the answer is written in `O`'s. The head width `E` is a compile-time
-parameter of the kernel — it sizes the accumulator — so a new `E` compiles a new kernel.
+`Q`/`O` are `(E, Lq, H, B)` and `K`/`V` are `(E, Lk, H, B)` — or three-dimensional with the
+heads and the batch already flattened — all with the same element type; the answer is written
+in `O`'s. Any operand may instead be a strided view (see [`attn_layout`](@ref)), which the
+kernel reads where it lies. The head width `E` is a compile-time parameter of the kernel — it
+sizes the accumulator — so a new `E` compiles a new kernel.
 """
 function attention_kernel_config(O, Q, K, V; scale)
     tensor_matmul_capable() || return nothing
-    T = eltype(Q)
-    (eltype(K) === T && eltype(V) === T) || return nothing
+    lo = attn_layout(O); lq = attn_layout(Q)
+    lk = attn_layout(K); lv = attn_layout(V)
+    (lo === nothing || lq === nothing || lk === nothing || lv === nothing) && return nothing
+    Ores, Odims, olay = lo; Qres, Qdims, qlay = lq
+    Kres, Kdims, klay = lk; Vres, Vdims, vlay = lv
+    T = eltype(Qres)
+    (eltype(Kres) === T && eltype(Vres) === T) || return nothing
     gemm_tensor_eltype(T, T, T) || return nothing
-    (ndims(Q) >= 3 && ndims(K) >= 3 && ndims(V) >= 3 && ndims(O) >= 3) || return nothing
+    # One batch shape for all four, because one grid index walks all of them.
+    (Odims[3:end] == Qdims[3:end] == Kdims[3:end] == Vdims[3:end]) || return nothing
 
-    E, Lq = size(Q, 1), size(Q, 2)
-    Lk = size(K, 2)
-    (size(K, 1) == E && size(V, 1) == E && size(V, 2) == Lk) || return nothing
-    (size(O, 1) == E && size(O, 2) == Lq) || return nothing
-    nbatch = prod(size(O)[3:end])
-    (prod(size(Q)[3:end]) == nbatch && prod(size(K)[3:end]) == nbatch &&
-     prod(size(V)[3:end]) == nbatch) || return nothing
+    E, Lq = Qdims[1], Qdims[2]
+    Lk = Kdims[2]
+    (Kdims[1] == E && Vdims[1] == E && Vdims[2] == Lk) || return nothing
+    (Odims[1] == E && Odims[2] == Lq) || return nothing
+    nheads = Qdims[3]
+    nbatch = prod(Qdims[3:end])
     # `matmul2d` tiles in eights on every axis, and `E` is one of its contraction lengths.
     E % GEMM_TENSOR_MN_MULT == 0 || return nothing
 
@@ -181,7 +240,7 @@ function attention_kernel_config(O, Q, K, V; scale)
     (bq == 0 || bk == 0) && return nothing
     # Sf + Ph + Oa + the three row vectors, against what a threadgroup gets.
     tgmem = bq * bk * sizeof(Float32) + bq * bk * sizeof(T) +
-            E * bq * sizeof(Float32) + 3 * bq * sizeof(Float32)
+            E * bq * sizeof(Float32) + 3 * bq * sizeof(Float32) + E * bq * sizeof(T)
     tgmem <= GEMM_TENSOR_TGMEM || return nothing
 
     # 128 threads, which is under every Metal device's threadgroup limit.
@@ -189,7 +248,9 @@ function attention_kernel_config(O, Q, K, V; scale)
     # `Int` tile parameters, not `Int32`: the body builds `(E, Int(Lq))` shape tuples and a
     # mixed `Tuple{Int32, Int64}` matches no `MtlDeviceArray` constructor — which reaches
     # Mantle's access walk as "every path through it throws" rather than as a method error.
-    args = (O, Q, K, V, Float32(scale), UInt32(Lq), UInt32(Lk),
+    args = (Ores, Qres, Kres, Vres,
+            map(Int32, olay), map(Int32, qlay), map(Int32, klay), map(Int32, vlay),
+            UInt32(nheads), Float32(scale), UInt32(Lq), UInt32(Lk),
             Val(Int(E)), Val(Int(bq)), Val(Int(bk)), Val(Int(ATTN_FLASH_NSIMD)))
     return (; kernel = attn_flash_tensor_kernel!, args,
             ndrange = ((Lq ÷ bq) * threads, nbatch, 1), group = (threads, 1, 1))

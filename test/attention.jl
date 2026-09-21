@@ -73,6 +73,38 @@ end
             @test maximum(abs, Float64.(got) .- ref) / maximum(abs, ref) < 3e-3
         end
 
+        # A PERMUTED operand read where it lies. SAM 2.1's projection leaves q/k/v as
+        # `(E, H, L, B)` and attention wants `(E, L, H, B)`; dense, that is a 4.7 MiB
+        # transpose per operand per op before the op can start. The answer has to be the
+        # same to the bit as the one from the transposed copy, which is what this compares.
+        @testset "a strided operand is read where it lies" begin
+            Lq = Lk = 128; H = 3; B = 2
+            raw = Float16.(reshape(0.4 .* sin.(range(0, 9, E*H*Lq*B)), E, H, Lq, B))
+            qperm = permutedims(raw, (1, 3, 2, 4))          # (E, L, H, B), materialised
+            kh = Float16.(reshape(0.4 .* cos.(range(0, 7, E*Lk*H*B)), E, Lk, H, B))
+            vh = Float16.(reshape(0.4 .* sin.(range(0, 5, E*Lk*H*B)), E, Lk, H, B))
+            dense = fused_attention(qperm, kh, vh, scale)
+            @test dense !== nothing
+
+            q = MtlArray(raw); k = MtlArray(kh); v = MtlArray(vh)
+            o = MtlArray(fill(Float16(NaN), E, Lq, H, B))
+            view_q = (; res = q, dims = (E, Lq, H, B),
+                      strides = (1, E * H, E, E * H * Lq), offset = 0)
+            cfg = Metal.attention_kernel_config(o, view_q, k, v; scale)
+            @test cfg !== nothing
+            groups = (cfg.ndrange[1] ÷ cfg.group[1], cfg.ndrange[2], cfg.ndrange[3])
+            Metal.@metal threads=cfg.group groups=groups cfg.kernel(cfg.args...)
+            Metal.synchronize()
+            @test all(isfinite, Array(o))
+            @test Array(o) == dense
+
+            # …and a view whose innermost axis is NOT contiguous is refused, because a tensor
+            # descriptor carries a leading dimension and not a gap between elements.
+            @test Metal.attention_kernel_config(o, (; res = q, dims = (E, Lq, H, B),
+                                                    strides = (2, E * H, E, E * H * Lq),
+                                                    offset = 0), k, v; scale) === nothing
+        end
+
         @testset "which operands the config admits" begin
             mk(T, dims) = MtlArray(fill(T(0), dims...))
             ok = Metal.attention_kernel_config(mk(Float16, (E, 256, 2, 1)),
