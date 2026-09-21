@@ -348,6 +348,36 @@ end
     end
 end
 
+# The VALUE is converted to the array's element type before any kernel sees it.
+#
+# `GPUArrays`' generic `fill!` passes it straight through as a kernel argument, so
+# `fill!(a::MtlArray{Float32}, 0.0)` handed a `Float64` to a device that has no
+# `double`. It did not fill wrongly -- it failed to COMPILE, with an
+# `InvalidIRError` naming `float.jl` rather than `fill!`, and the identical call
+# works on any backend whose hardware has doubles. A literal `0.0` or `NaN` beside
+# an fp32 array is the obvious way to write it, and `fill!(::Array{Float32}, 0.0)`
+# converts, so this is Metal agreeing with Base.
+@testset "fill! converts the value it is given" begin
+    for (T, v) in ((Float32, 0.0), (Float32, NaN), (Float32, 2), (Float32, 1 // 2),
+                   (Float16, 1.5), (Float16, 0.0), (Int32, 3), (Int32, Int8(4)))
+        A = MtlArray{T}(undef, 4, 5)
+        fill!(A, v)
+        h = Array(A)
+        @test eltype(h) === T
+        @test all(x -> (v isa AbstractFloat && isnan(v) && isnan(x)) || x == T(v), h)
+    end
+
+    # The `fillbuffer` fast path for byte-wide types is more specific and still wins.
+    let B = MtlArray{UInt8}(undef, 8)
+        fill!(B, 7)
+        @test all(==(0x07), Array(B))
+    end
+
+    # A value the element type cannot hold is a HOST error naming the conversion,
+    # rather than whatever a kernel would have done with it.
+    @test_throws InexactError fill!(MtlArray{Int32}(undef, 4), 1.5)
+end
+
 # https://github.com/JuliaGPU/CUDA.jl/issues/2191
 @testset "preserving storage mode" begin
     a = mtl([1]; storage=Metal.SharedStorage)

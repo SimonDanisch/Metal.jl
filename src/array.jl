@@ -523,10 +523,31 @@ fill(v::T, dims::Base.Dims{N}; storage=DefaultStorageMode) where {T,N} = fill!(M
 fill(v::T, dims...; storage=DefaultStorageMode) where T = fill!(MtlArray{T,length(dims),storage}(undef, dims), v)
 
 # optimized implementation of `fill!` for types that are directly supported by fillbuffer
-function Base.fill!(A::MtlArray{T}, val) where T <: Union{UInt8,Int8}
+#
+# `val::Number` and not `val`: with the converting method below taking `::Number`,
+# an unconstrained `val` here is neither more nor less specific and every
+# `fill!(::MtlArray{UInt8}, 7)` is an ambiguity. Narrowing this one keeps the fast
+# path for every value that can name a byte.
+function Base.fill!(A::MtlArray{T}, val::Number) where T <: Union{UInt8,Int8}
     B = convert(T, val)
     unsafe_fill!(device(A), pointer(A), B, length(A))
     A
+end
+
+# The VALUE converted before any kernel sees it.
+#
+# `GPUArrays`' generic `fill!` passes `x` straight through as a kernel argument, so
+# `fill!(a::MtlArray{Float32}, 0.0)` hands a `Float64` to a device that has no
+# `double`. It does not fill wrongly -- it fails to COMPILE, with an
+# `InvalidIRError` naming `float.jl` rather than `fill!`, and the same call works on
+# every backend whose hardware has doubles. A literal `0.0` or `NaN` beside an fp32
+# array is the obvious way to write it, and `Base.fill!(::Array{Float32}, 0.0)`
+# converts, so this is Metal agreeing with Base rather than a special case.
+#
+# `@invoke` to the generic method, not a recursive `fill!`: converting first and
+# then dispatching again would find this method a second time.
+function Base.fill!(A::MtlArray{T}, val::Number) where {T}
+    @invoke fill!(A::GPUArrays.AnyGPUArray{T}, convert(T, val)::Any)
 end
 
 
