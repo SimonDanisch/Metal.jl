@@ -49,6 +49,7 @@ include("operations.jl")
 include("random.jl")
 
 include("matmul.jl")
+include("attention.jl")
 include("fft.jl")
 include("nn.jl")
 include("sort.jl")

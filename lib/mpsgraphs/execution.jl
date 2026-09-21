@@ -54,3 +54,55 @@ function serialize(graphExe::MPSGraphExecutable, url::NSURL, descriptor=MPSGraph
     @objc [graphExe::id{MPSGraphExecutable} serializeToMPSGraphPackageAtURL:url::id{NSURL}
                               descriptor:descriptor::id{MPSGraphExecutableSerializationDescriptor}]::Nothing
 end
+
+"""
+    encode_batched!(graph, feeds, results, roots...)
+
+Encode `graph` into the command buffer the current queue is already BATCHING into,
+rather than committing one of its own.
+
+Every other entry point here builds an `MPSCommandBuffer` off the queue and commits
+it. That is right in isolation and wrong in company: command buffers execute in
+COMMIT order, so an MPS op that commits its own while a batch of kernel launches is
+still open runs BEFORE them. Joining the open buffer makes the op ordered by encoder
+order instead — the same rule the launches already rely on — and costs no extra
+submission.
+
+`roots` are kept alive until that command buffer retires. An `MPSGraphTensorData`
+holds the `MTLBuffer` but nothing tells Julia the `MtlArray` is still in use.
+"""
+function encode_batched!(graph::MPSGraph, feeds, results, roots...)
+    bq = Metal.global_queue(Metal.device())
+    # The open encoder has to END first: a command buffer may have only one encoder
+    # at a time and MPS makes its own. Ending is not committing — the buffer stays
+    # open and the next launch gets a fresh encoder in it.
+    Metal.end_encoder!(bq)
+    cmdbuf = Metal.ensure_cmdbuf!(bq)
+    mps = MPSCommandBuffer(cmdbuf)
+    encode!(mps, graph, NSDictionary(feeds), NSDictionary(results), nil,
+            default_exec_desc())
+    # MPS may have `commitAndContinue`d: committed the buffer it was given and moved
+    # to one of its own, which it does on its own schedule — once in 161 encodes of
+    # SAM 2.1's encoder frame. The batch adopts the continuation rather than being
+    # left holding a committed buffer. A no-op in the usual case.
+    Metal.adopt_continued!(bq, cmdbuf, mps.commandBuffer)
+    Metal.record_operation!(bq, roots...)
+    return nothing
+end
+
+"""
+    tensordata(arr::MtlArray) -> MPSGraphTensorData
+
+An array's bytes as MPS sees them, HONOURING its offset.
+
+`MPSGraphTensorData(::MtlArray)` binds `arr.data[]` — the whole buffer — and the
+offset is silently dropped, which is correct only for an array that starts one. A
+suballocated array (every transient of a render graph is a slice of a 64 MiB block)
+reads and writes the wrong bytes. `MPSNDArray` takes the offset, so the route
+through it is the one that works for both.
+"""
+# The buffer form where it is correct, which is every array that starts one: it
+# takes any shape, while `MPSNDArray` refuses an innermost extent that is not a
+# multiple of sixteen bytes. The offset route is for the arrays that need it.
+tensordata(arr::Metal.MtlArray) =
+    arr.offset == 0 ? MPSGraphTensorData(arr) : MPSGraphTensorData(MPS.MPSNDArray(arr))

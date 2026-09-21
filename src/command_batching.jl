@@ -461,6 +461,47 @@ function discard_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
     return
 end
 
+"""
+    adopt_continued!(bq, old, new)
+
+Take over from a library that COMMITTED the open batch and carried on in a command
+buffer of its own.
+
+That is what `MPSCommandBuffer`'s `commitAndContinue` does, and it is how MPS bounds
+how much it has encoded into one buffer. Its own callers never notice, because the
+`MPSCommandBuffer` wrapper hides which buffer is underneath. A batch does notice: the
+buffer it believes is open has been submitted, and everything encoded after that would
+go into a committed buffer — which Metal reports as API misuse and drops.
+
+So the batch adopts the continuation instead. The committed buffer is accounted for
+exactly as [`flush!`](@ref) would have — its roots are held until it retires and it
+counts against `inflight` — and ORDER is unaffected, because the two buffers were
+committed in that order on the same queue.
+
+Measured on SAM 2.1's encoder, 161 MPSGraph encodes in one frame: MPS did this once.
+Rare, and not something a caller can predict or turn off, so the batch has to be able
+to survive it rather than check for it.
+"""
+function adopt_continued!(bq::BatchedCommandQueue, old, new)
+    pointer(old) == pointer(new) && return
+    bq.encoder === nothing || error(
+        "adopt_continued!: an encoder is still open on a command buffer the library " *
+        "has committed. End it before handing the buffer over.")
+    register_operations!(bq, old)
+    roots = bq.roots
+    # Already committed, by the library. Only the bookkeeping the commit would have
+    # done is missing: the pending list `synchronize` waits on, and the profiler.
+    MTL.record_committed!(old, pointer(bq.queue))
+    hook = MTL.profile_hook[]
+    hook === nothing || hook(old)
+    defer_cleanup!(bq, old, roots)
+    reset_open_cmdbuf!(bq, old)
+    limit_inflight!(bq)
+    bq.cmdbuf = new
+    register_queue!(bq)
+    return
+end
+
 function flush!(bq::BatchedCommandQueue)
     cmdbuf = bq.cmdbuf
     cmdbuf === nothing && return
