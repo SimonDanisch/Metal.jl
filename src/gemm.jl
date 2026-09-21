@@ -276,23 +276,31 @@ end
 # compile-time constants. The K-loop trip count is kept dynamic (a runtime `K`, not a `Val`)
 # to avoid crashing Apple's back-end (see the note in `device/intrinsics/tensor.jl`).
 #
-# One threadgroup computes one `C[TM, TN]` output tile.
+# One threadgroup computes one `C[TM, TN]` output tile, in ONE `matmul2d` over the whole
+# contraction.
 #
-# **The K accumulator is a THREADGROUP tile in Float32, not the destination in device
-# memory.** `matmul2d` takes its destination in whichever address space the tensor names, and
-# pointing it at `C` makes every one of the `K/TK` slices a read-modify-write of the output
-# tile through device memory — at the destination's OWN precision, so an fp16 `C` rounds the
-# running sum 72 times over SAM 2's `K = 2304`. Accumulating in threadgroup memory instead
-# costs `TM*TN*4` bytes (16 KiB at 64x64, half the 32 KiB budget) and is worth, measured on an
-# M5 at fp16 `576x4096x2304`, 4.12 -> 8.29 TFLOP/s AND a relative error against MPSGraph of
-# 4.8e-3 -> 8.0e-4. The bias and the epilogue then apply on the way out, where the value is
-# already in registers, rather than as a second device round-trip over `C`.
+# **The accumulator is a THREADGROUP tile in Float32, not the destination in device memory.**
+# `matmul2d` takes its destination in whichever address space the tensor names, and pointing
+# it at `C` made this a read-modify-write of the output tile through device memory — at the
+# destination's OWN precision, so an fp16 `C` rounded the running sum once per K slice.
+# Accumulating in threadgroup memory costs `TM*TN*4` bytes and is worth, measured on an M5 at
+# fp16 `576x4096x2304`, 4.12 -> 8.29 TFLOP/s AND a relative error against MPSGraph of
+# 4.8e-3 -> 8.0e-4. The bias and the epilogue apply on the way out, where the value is already
+# in registers, rather than as a second device round-trip over `C`.
+#
+# **And the contraction is ONE call, not a loop over K slices.** Apple's own schedule for the
+# whole contraction beats any slicing this side can write: measured over the 13 distinct GEMM
+# shapes of SAM 2.1's encoder, 263.1 -> 186.2 ms, and it wins on all eight out-of-sample
+# shapes tried as well. It is also EXACT against MPSGraph — bit-identical on every shape here,
+# where the sliced form differed by 8e-4 — which says the two are running the same thing.
+# Two constraints go away with the loop: `K` needs no tile (so no `K % 8`, verified
+# bit-identical at K = 76 and 100), and there is no trip count to keep dynamic.
 @inline function gemm_tensor_body!(C::MtlDeviceArray, A::MtlDeviceArray,
                                    B::MtlDeviceArray, bias, epilogue,
                                    M::UInt32, N::UInt32, K::UInt32,
-                                   ::Val{TM}, ::Val{TN}, ::Val{TK},
+                                   ::Val{TM}, ::Val{TN},
                                    ::Val{NSIMD}, ::Val{HASBIAS}, ::Val{HASEPI}) where
-                                  {TM, TN, TK, NSIMD, HASBIAS, HASEPI}
+                                  {TM, TN, NSIMD, HASBIAS, HASEPI}
     tgid  = threadgroup_position_in_grid_3d()
     m_off = (unsafe_trunc(Int32, tgid.x) - Int32(1)) * Int32(TM)
     n_off = (unsafe_trunc(Int32, tgid.y) - Int32(1)) * Int32(TN)
@@ -303,22 +311,13 @@ end
     acc = MtlThreadGroupArray(Float32, (TM, TN))
     mC = view(MtlInlineTensor(acc), (Int32(1), Int32(1)), (Int32(TM), Int32(TN)))
 
-    initialize = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
-                                                        mode = matmul2d_multiply),
-                                    Int32(NSIMD)}()
-    accumulate = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
-                                                        mode = matmul2d_multiply_accumulate),
-                                    Int32(NSIMD)}()
-    nslices = unsafe_trunc(Int32, K ÷ UInt32(TK))
-    mA = view(tA, (m_off + Int32(1), Int32(1)), (Int32(TM), Int32(TK)))
-    mB = view(tB, (Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
-    initialize(mA, mB, mC)
-    for s in Int32(1):(nslices - Int32(1))
-        k_off = s * Int32(TK)
-        mA = view(tA, (m_off + Int32(1), k_off + Int32(1)), (Int32(TM), Int32(TK)))
-        mB = view(tB, (k_off + Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
-        accumulate(mA, mB, mC)
-    end
+    # `k = -1`: the contraction length comes from the operand views at run time.
+    product = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, -1;
+                                                    mode = matmul2d_multiply),
+                                Int32(NSIMD)}()
+    Kc = unsafe_trunc(Int32, K)
+    product(view(tA, (m_off + Int32(1), Int32(1)), (Int32(TM), Kc)),
+            view(tB, (Int32(1), n_off + Int32(1)), (Kc, Int32(TN))), mC)
     # matmul2d is collective over the threadgroup, so the accumulator is only complete for
     # every thread after a barrier — and it is a THREADGROUP barrier now, matching where the
     # tile lives.
@@ -340,25 +339,25 @@ end
 
 function gemm_tensor_kernel!(C::MtlDeviceArray, A::MtlDeviceArray, B::MtlDeviceArray,
                              M::UInt32, N::UInt32, K::UInt32,
-                             tm::Val, tn::Val, tk::Val, nsimd::Val)
-    gemm_tensor_body!(C, A, B, nothing, identity, M, N, K, tm, tn, tk, nsimd,
+                             tm::Val, tn::Val, nsimd::Val)
+    gemm_tensor_body!(C, A, B, nothing, identity, M, N, K, tm, tn, nsimd,
                       Val(false), Val(false))
 end
 
 function gemm_tensor_bias_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
                                   B::MtlDeviceArray, bias::MtlDeviceArray,
                                   M::UInt32, N::UInt32, K::UInt32,
-                                  tm::Val, tn::Val, tk::Val, nsimd::Val)
-    gemm_tensor_body!(C, A, B, bias, identity, M, N, K, tm, tn, tk, nsimd,
+                                  tm::Val, tn::Val, nsimd::Val)
+    gemm_tensor_body!(C, A, B, bias, identity, M, N, K, tm, tn, nsimd,
                       Val(true), Val(false))
 end
 
 function gemm_tensor_epilogue_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
                                       B::MtlDeviceArray, bias, epilogue,
                                       M::UInt32, N::UInt32, K::UInt32,
-                                      tm::Val, tn::Val, tk::Val, nsimd::Val,
+                                      tm::Val, tn::Val, nsimd::Val,
                                       hasbias::Val)
-    gemm_tensor_body!(C, A, B, bias, epilogue, M, N, K, tm, tn, tk, nsimd,
+    gemm_tensor_body!(C, A, B, bias, epilogue, M, N, K, tm, tn, nsimd,
                       hasbias, Val(true))
 end
 
@@ -486,22 +485,21 @@ const GEMM_TENSOR_K_TILES  = (32, 16, 8)
     return 0
 end
 
-# Which tile and how many simdgroups run it, as a function of the contraction DEPTH.
+# Which tile runs the one-shot DENSE product, and how many simdgroups run it.
 #
-# Not "the largest tile that divides", which is what this was: the best tile is a property of
-# the shape, and the two regimes differ by up to 1.6x on the same kernel. Measured on an M5,
-# fp16, over the 13 distinct GEMM shapes of SAM 2.1's encoder plus seven out-of-sample shapes:
-#
-#   deep    (K >= 1024)  64x64 tile, 2 simdgroups   576x4096x2304   8.29 TFLOP/s
-#   shallow (K <  1024)  32x32 tile, 1 simdgroup   2304x4096x576    6.93 TFLOP/s
-#
-# Picking the other branch's tile costs 1.19x on the first shape and 1.30x on the second, and
-# the rule agrees with the measured winner on all seven out-of-sample shapes. A deep
-# contraction amortises the wider tile's loads over more slices; a shallow one has too few
-# slices to pay for them and wants the smaller tile's occupancy instead. Weighted over the
-# encoder, the rule lands within 2% of choosing each shape's best tile by hand.
-#
-# `GEMM_TENSOR_*` above is what a caller may still pass explicitly to `gemm_tensor!`.
+# `64 x 32` with ONE simdgroup, flat. Measured on an M5, fp16, over the 13 distinct GEMM
+# shapes of SAM 2.1's encoder: 186.2 ms against 181.4 for picking each shape's best tile by
+# hand, so a per-shape rule there is worth 2.6% and not worth having. (The same sweep over the
+# SLICED kernel this replaced came to 263.1 ms at ITS best fixed tile.) `64 x 64` costs 4%,
+# `64 x 16` 13%, and two simdgroups 4%.
+const GEMM_TENSOR_M_DENSE = (64, 32, 16, 8)
+const GEMM_TENSOR_N_DENSE = (32, 16, 8)
+const GEMM_TENSOR_NSIMD_DENSE = 1
+
+# …and for the strided-BATCHED product, which keeps its K loop, the tile depends on the
+# contraction DEPTH. One `matmul2d` over the whole contraction is 2.2 TFLOP/s there against
+# the sliced form's 5.2 — the reverse of the dense case — and attention's two products, which
+# are what that path runs, both read an operand transposed.
 const GEMM_TENSOR_KDEEP = 1024
 const GEMM_TENSOR_MN_TILES_SHALLOW = (32, 16, 8)
 const GEMM_TENSOR_NSIMD_DEEP = 2
@@ -537,7 +535,43 @@ const GEMM_TENSOR_MN_POW2MIN = 16
     return 0
 end
 
+"""Shrink the output tile until its Float32 accumulator fits threadgroup memory."""
+@inline function gemm_tensor_fit(M::Integer, N::Integer, tm::Int, tn::Int)
+    # Each step strictly shrinks one side, so this terminates at a fit or at "no usable tile"
+    # — better than launching a kernel the driver would reject.
+    while tm != 0 && tn != 0 && tm * tn * sizeof(Float32) > GEMM_TENSOR_TGMEM
+        if tn >= tm
+            tn = gemm_tensor_tile_mult(N, tn)
+        else
+            tm = gemm_tensor_tile_mult(M, tm)
+        end
+    end
+    return (tm, tn)
+end
+
+"""
+    gemm_tensor_tiles(M, N, K) -> (tm, tn, nsimd)
+
+The output tile and execution width for the one-shot dense product; zeros mean no usable tile
+and the caller falls back to the simdgroup kernel. `K` takes no tile — the contraction is one
+`matmul2d` call whatever its length — so a `K` of any size or divisibility is covered.
+"""
 @inline function gemm_tensor_tiles(M::Integer, N::Integer, K::Integer)
+    tm = gemm_tensor_tile(M, GEMM_TENSOR_M_DENSE)
+    tn = gemm_tensor_tile(N, GEMM_TENSOR_N_DENSE)
+    tm < GEMM_TENSOR_MN_POW2MIN && (tm = max(tm, gemm_tensor_tile_mult(M)))
+    tn < GEMM_TENSOR_MN_POW2MIN && (tn = max(tn, gemm_tensor_tile_mult(N)))
+    tm, tn = gemm_tensor_fit(M, N, tm, tn)
+    (tm == 0 || tn == 0) && return (0, 0, 0)
+    return (tm, tn, GEMM_TENSOR_NSIMD_DENSE)
+end
+
+"""
+    gemm_tensor_batched_tiles(M, N, K) -> (tm, tn, tk, nsimd)
+
+The same for the strided-batched product, which slices `K`.
+"""
+@inline function gemm_tensor_batched_tiles(M::Integer, N::Integer, K::Integer)
     deep = K >= GEMM_TENSOR_KDEEP
     mn = deep ? GEMM_TENSOR_MN_TILES : GEMM_TENSOR_MN_TILES_SHALLOW
     tm = gemm_tensor_tile(M, mn)
@@ -546,19 +580,10 @@ end
     tn < GEMM_TENSOR_MN_POW2MIN && (tn = max(tn, gemm_tensor_tile_mult(N)))
     # The contraction takes the same fallback, and for the same reason: attention's scores
     # contract over E = 72, where the 8-slice loop runs nine times to the 72-slice's one.
-    # Measured on the same 4096-token block, `4096x4096x72` over 8 heads: 12.17 -> 10.38 ms.
+    # Measured on the 4096-token block, `4096x4096x72` over 8 heads: 12.17 -> 10.38 ms.
     tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
     tk < GEMM_TENSOR_MN_POW2MIN && (tk = max(tk, gemm_tensor_tile_mult(K)))
-    # The accumulator is `tm*tn` Float32s of threadgroup memory. Shrink the larger tile until
-    # it fits rather than launching a kernel the driver would reject; each step strictly
-    # shrinks one side, so this terminates at a fit or at "no usable tile".
-    while tm != 0 && tn != 0 && tm * tn * sizeof(Float32) > GEMM_TENSOR_TGMEM
-        if tn >= tm
-            tn = gemm_tensor_tile_mult(N, tn)
-        else
-            tm = gemm_tensor_tile_mult(M, tm)
-        end
-    end
+    tm, tn = gemm_tensor_fit(M, N, tm, tn)
     (tm == 0 || tn == 0 || tk == 0) && return (0, 0, 0, 0)
     return (tm, tn, tk, deep ? GEMM_TENSOR_NSIMD_DEEP : GEMM_TENSOR_NSIMD_SHALLOW)
 end
@@ -575,15 +600,14 @@ function gemm_kernel_config(C, A, B; bias = nothing, epilogue = identity)
     gemm_simd_eltype(eltype(A), eltype(B), eltype(C)) || return nothing
     M, N, K = size(C, 1), size(C, 2), size(A, 2)
     if tensor_matmul_capable() && gemm_tensor_eltype(eltype(A), eltype(B), eltype(C))
-        tm, tn, tk, nsimd = gemm_tensor_tiles(M, N, K)
-        if tm != 0 && tn != 0 && tk != 0
+        tm, tn, nsimd = gemm_tensor_tiles(M, N, K)
+        if tm != 0 && tn != 0
             threads = nsimd * 32
             groups = (M ÷ tm, N ÷ tn)
             fusebias = bias !== nothing && length(bias) == M
             fuseepi = epilogue !== identity
             shape_args = (UInt32(M), UInt32(N), UInt32(K),
-                          Val(Int32(tm)), Val(Int32(tn)), Val(Int32(tk)),
-                          Val(Int32(nsimd)))
+                          Val(Int32(tm)), Val(Int32(tn)), Val(Int32(nsimd)))
             kernel, args = if fuseepi
                 gemm_tensor_epilogue_kernel!,
                 (C, A, B, fusebias ? bias : nothing, epilogue,
@@ -638,7 +662,7 @@ function batched_gemm_kernel_config(C, A, B; transpose_a = false,
     nbatch = prod(size(C)[3:end])
     prod(size(A)[3:end]) == nbatch || return nothing
     prod(size(B)[3:end]) == nbatch || return nothing
-    tm, tn, tk, nsimd = gemm_tensor_tiles(M, N, K)
+    tm, tn, tk, nsimd = gemm_tensor_batched_tiles(M, N, K)
     tm != 0 && tn != 0 && tk != 0 || return nothing
 
     threads = nsimd * 32
@@ -667,34 +691,33 @@ function supports_tensor_matmul(C::MtlMatrix, A::MtlMatrix, B::MtlMatrix,
     (cA === 'N' && cB === 'N') || return false
     (isone(alpha) && iszero(beta)) || return false
     M = size(A, 1); K = size(A, 2); N = size(B, 2)
-    tm, tn, tk, _ = gemm_tensor_tiles(M, N, K)
-    tm != 0 && tn != 0 && tk != 0
+    tm, tn, _ = gemm_tensor_tiles(M, N, K)
+    tm != 0 && tn != 0
 end
 
 """
-    Metal.gemm_tensor!(C, A, B, α=true, β=false, cA='N', cB='N'; tile_m=0, tile_n=0, tile_k=0)
+    Metal.gemm_tensor!(C, A, B, α=true, β=false, cA='N', cB='N'; tile_m=0, tile_n=0)
 
-Compute `C = A*B` via `tensor_ops::matmul2d` with a tile decomposition (Metal 4 only).
+Compute `C = A*B` via `tensor_ops::matmul2d`, one call per output tile (Metal 4 only).
 Only the plain product is realized (`cA=cB='N'`, `α=1`, `β=0`); callers must check
-[`Metal.supports_tensor_matmul`](@ref) first. `tile_*=0` selects the largest validated tile
-that divides the corresponding dimension; pass explicit tiles to tune.
+[`Metal.supports_tensor_matmul`](@ref) first. `tile_*=0` takes the measured tile for the
+shape; pass explicit tiles to tune. There is no `K` tile — the contraction is one call.
 """
 function gemm_tensor!(C::MtlMatrix, A::MtlMatrix, B::MtlMatrix,
                       alpha::Number = true, beta::Number = false,
                       cA::Char = 'N', cB::Char = 'N';
-                      tile_m::Integer = 0, tile_n::Integer = 0, tile_k::Integer = 0)
+                      tile_m::Integer = 0, tile_n::Integer = 0)
     M = size(A, 1); K = size(A, 2); N = size(B, 2)
-    pm, pn, pk, nsimd = gemm_tensor_tiles(M, N, K)
+    pm, pn, nsimd = gemm_tensor_tiles(M, N, K)
     tile_m = tile_m == 0 ? pm : tile_m
     tile_n = tile_n == 0 ? pn : tile_n
-    tile_k = tile_k == 0 ? pk : tile_k
-    @assert tile_m > 0 && tile_n > 0 && tile_k > 0 """
+    @assert tile_m > 0 && tile_n > 0 """
         no usable tensor-ops tile for $((M, N, K)); call `supports_tensor_matmul` first"""
 
     groups = (M ÷ tile_m, N ÷ tile_n, 1)
     @metal threads = nsimd * 32 groups = groups gemm_tensor_kernel!(
         C, A, B, UInt32(M), UInt32(N), UInt32(K),
-        Val(Int32(tile_m)), Val(Int32(tile_n)), Val(Int32(tile_k)), Val(Int32(nsimd)))
+        Val(Int32(tile_m)), Val(Int32(tile_n)), Val(Int32(nsimd)))
     return C
 end
 

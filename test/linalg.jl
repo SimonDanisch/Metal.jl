@@ -349,11 +349,11 @@ end
             bias = MtlArray(rand(Float16, M)); Cb = MtlArray(fill(Float16(NaN), M, N))
             Metal.@metal threads=128 groups=(2, 4, 1) Metal.gemm_tensor_bias_kernel!(
                 Cb, A, B, bias, UInt32(M), UInt32(N), UInt32(K),
-                Val(Int32(64)), Val(Int32(64)), Val(Int32(32)), Val(Int32(4)))
+                Val(Int32(64)), Val(Int32(64)), Val(Int32(4)))
             @test isapprox(Array(Cb), Array(A) * Array(B) .+ Array(bias); rtol=1.0f-1)
             Metal.@metal threads=128 groups=(2, 4, 1) Metal.gemm_tensor_epilogue_kernel!(
                 Cb, A, B, bias, abs, UInt32(M), UInt32(N), UInt32(K),
-                Val(Int32(64)), Val(Int32(64)), Val(Int32(32)), Val(Int32(4)), Val(true))
+                Val(Int32(64)), Val(Int32(64)), Val(Int32(4)), Val(true))
             @test isapprox(Array(Cb), abs.(Array(A) * Array(B) .+ Array(bias)); rtol=1.0f-1)
 
             # Attention uses a strided batch for q'k.  Cover its transpose
@@ -417,18 +417,35 @@ end
             @test maximum(abs, Array(Cd) .- refd) / maximum(abs, refd) < 2.0f-3
 
             # A dimension no power-of-two tile divides still gets a tile: attention's head
-            # width E = 72 covered in ONE tile rather than nine of eight rows.
+            # width E = 72 covered in ONE tile rather than nine of eight rows. On the batched
+            # chooser that applies to the sliced contraction too.
             @test Metal.gemm_tensor_tiles(72, 4096, 4096)[1] == 72
-            @test Metal.gemm_tensor_tiles(4096, 4096, 72)[3] == 72
+            @test Metal.gemm_tensor_batched_tiles(4096, 4096, 72)[3] == 72
             @test Metal.gemm_tensor_tiles(24, 256, 256)[1] == 24
-            # …and one that is not a multiple of eight gets none, so the caller falls back.
-            @test Metal.gemm_tensor_tiles(65, 47, 33) == (0, 0, 0, 0)
-            # Every tile the chooser returns fits the accumulator in threadgroup memory.
+            # …and one whose OUTPUT axes are not multiples of eight gets none, so the caller
+            # falls back. `K` is no longer among them: the dense contraction is one call, so
+            # a `K` of 33 is covered where the sliced form needed `K % 8 == 0`.
+            @test Metal.gemm_tensor_tiles(65, 47, 33) == (0, 0, 0)
+            @test Metal.gemm_tensor_tiles(64, 64, 33)[1] == 64
+            @test Metal.gemm_tensor_batched_tiles(65, 47, 33) == (0, 0, 0, 0)
+            # Every tile either chooser returns fits the accumulator in threadgroup memory.
             @testset "accumulator fits" for M in (72, 128, 512, 1152, 4096, 65536),
                                             N in (64, 72, 1024, 65536),
                                             K in (72, 288, 576, 2304)
-                tm, tn, _, _ = Metal.gemm_tensor_tiles(M, N, K)
+                tm, tn, _ = Metal.gemm_tensor_tiles(M, N, K)
                 @test tm * tn * sizeof(Float32) <= 32768
+                bm, bn, _, _ = Metal.gemm_tensor_batched_tiles(M, N, K)
+                @test bm * bn * sizeof(Float32) <= 32768
+            end
+            # A contraction no tile divides is exact, which is what dropping the K tile buys.
+            @testset "any contraction length — K=$Kodd" for Kodd in (33, 76, 100, 1)
+                Ao = rand(Float16, 64, Kodd); Bo = rand(Float16, Kodd, 64)
+                Co = MtlArray(fill(Float16(NaN), 64, 64))
+                @test Metal.supports_tensor_matmul(Co, MtlArray(Ao), MtlArray(Bo),
+                                                   'N', 'N', true, false)
+                @with (Metal.matmul_alg => :tensor) mul!(Co, MtlArray(Ao), MtlArray(Bo))
+                ref = Float32.(Ao) * Float32.(Bo)
+                @test maximum(abs, Array(Co) .- ref) / maximum(abs, ref) < 2.0f-3
             end
 
             # forcing `:tensor` on operands it can't handle errors (like an unsupported :MPS)
