@@ -89,6 +89,21 @@ function sliceTensor(graph::MPSGraph, tensor::MPSGraphTensor, dimension, start, 
                                       name:name::id{NSString}]::MPSGraphTensor
 end
 
+function reLUWithTensor(graph::MPSGraph, tensor::MPSGraphTensor, name = "relu")
+    @objc [graph::id{MPSGraph} reLUWithTensor:tensor::id{MPSGraphTensor}
+                                        name:name::id{NSString}]::MPSGraphTensor
+end
+
+function erfWithTensor(graph::MPSGraph, tensor::MPSGraphTensor, name = "erf")
+    @objc [graph::id{MPSGraph} erfWithTensor:tensor::id{MPSGraphTensor}
+                                       name:name::id{NSString}]::MPSGraphTensor
+end
+
+function tanhWithTensor(graph::MPSGraph, tensor::MPSGraphTensor, name = "tanh")
+    @objc [graph::id{MPSGraph} tanhWithTensor:tensor::id{MPSGraphTensor}
+                                        name:name::id{NSString}]::MPSGraphTensor
+end
+
 function shapeOfTensor(graph::MPSGraph, tensor::MPSGraphTensor, name = "shapeOfTensor")
     @objc [graph::id{MPSGraph} shapeOfTensor:tensor::id{MPSGraphTensor}
                                         name:name::id{NSString}]::MPSGraphTensor

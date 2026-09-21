@@ -115,9 +115,61 @@ end
         @test Array(C) ≈ Ah * Bh .+ bh
     end
 
+    # `matmul2d` accumulates in Float32 and stores once, which is why a caller may
+    # ask for a Float32 destination from Float16 operands and get the accumulator it
+    # wanted. MPSGraph's product has no compute type — its output dtype follows its
+    # inputs — so the same ask is a HALF product cast afterwards. Taking it moved SAM
+    # 2.1's encoder `add_129` from 0.48 to 1.12, past the band the Vulkan reference
+    # sits in, and nothing about the result looked wrong.
+    @testset "a destination wider than the operands is refused" begin
+        half(dims...) = MtlArray(zeros(Float16, dims...))
+        wide(dims...) = MtlArray(zeros(Float32, dims...))
+        @test BTG.gemm_shape_supported(half(64, 64), half(64, 64), half(64, 64), nothing)
+        @test !BTG.gemm_shape_supported(wide(64, 64), half(64, 64), half(64, 64), nothing)
+        @test BTG.gemm_shape_supported(wide(64, 64), wide(64, 64), wide(64, 64), nothing)
+    end
+
+    @testset "the activation on the store" begin
+        # A&S 7.1.26, in Float64 where its 1.5e-7 is far below what fp16 can show.
+        function erf_ref(x::Float64)
+            a = abs(x)
+            t = 1.0 / (1.0 + 0.3275911a)
+            y = 1.0 - (((((1.061405429t - 1.453152027)t + 1.421413741)t -
+                         0.284496736)t + 0.254829592)t) * exp(-a * a)
+            x < 0 ? -y : y
+        end
+        gelu_ref(x) = 0.5x * (1 + erf_ref(x / sqrt(2.0)))
+        gelutanh_ref(x) = 0.5x * (1 + tanh(0.7978845608028654 * (x + 0.044715x^3)))
+        # The product is `xs[i]` in every column, so the activation is exercised over
+        # the whole range — including below -2, where `1 + erf` cancels and a half
+        # evaluation of it keeps a couple of significant bits.
+        Mw, Nw, Kw = 512, 8, 16
+        Ah = zeros(Float16, Mw, Kw); Bh = zeros(Float16, Kw, Nw)
+        xs = Float32.(range(-8, 8; length = Mw))
+        Ah[:, 1] .= Float16.(xs); Bh[1, :] .= Float16(1)
+        A, B = MtlArray(Ah), MtlArray(Bh)
+        for (act, ref) in ((:identity, identity), (:relu, x -> max(x, 0.0)),
+                           (:gelu, gelu_ref), (:gelu_tanh, gelutanh_ref))
+            C = MtlArray(fill(Float16(NaN), Mw, Nw))
+            BTG.gemm_batched!(C, A, B, nothing, act)
+            Metal.synchronize()
+            got = Float64.(Array(C)[:, 1])
+            want = ref.(Float64.(xs))
+            @test all(isfinite, got)
+            # Half's own rounding at this scale, and nothing more: an activation
+            # evaluated in half rather than single is an order of magnitude worse.
+            @test maximum(abs, got .- want) / maximum(abs, want) < 1e-3
+        end
+        @test_throws ArgumentError BTG.gemm_batched!(
+            MtlArray(zeros(Float16, Mw, Nw)), A, B, nothing, :softplus)
+    end
+
     @testset "which operands the product admits" begin
         ok(dims...) = MtlArray(zeros(Float32, dims...))
         @test BTG.gemm_shape_supported(ok(8, 8), ok(8, 8), ok(8, 8), nothing)
+        # An activation the graph has no node for is not a shape it admits.
+        @test !BTG.gemm_shape_supported(ok(8, 8), ok(8, 8), ok(8, 8), nothing, :softplus)
+        @test BTG.gemm_shape_supported(ok(8, 8), ok(8, 8), ok(8, 8), nothing, :gelu)
         # A shape no `MPSNDArray` can describe: 3 Float32 is 12 bytes.
         @test !BTG.gemm_shape_supported(ok(3, 8), ok(3, 8), ok(8, 8), nothing)
         # Rank, and a contraction length that does not match.

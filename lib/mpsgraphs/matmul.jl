@@ -178,6 +178,48 @@ end
 # its submission boundaries are, and it cannot fold a bias. Both are the same graph
 # with a different epilogue and a different place to put it.
 
+"""Which activations this graph can put on a product's store."""
+const GEMM_ACTIVATIONS = (:identity, :relu, :gelu, :gelu_tanh)
+
+"""
+    activation(graph, t, kind) -> MPSGraphTensor
+
+One named activation as graph nodes, evaluated in `t`'s type.
+
+`:gelu` is the erf formulation — torch's default — and `:gelu_tanh` its `approximate
+= "tanh"` variant. Apple's `erf` is a real one, so this is not bit-identical to a
+hand-written Abramowitz-Stegun approximation of the same expression; it is closer to
+the reference the models are checked against, which is the comparison that matters.
+"""
+function activation(graph::MPSGraph, t::MPSGraphTensor, kind::Symbol, T::DataType)
+    kind === :identity && return t
+    kind === :relu && return reLUWithTensor(graph, t)
+    half(v) = constantWithScalar(graph, v, T)
+    if kind === :gelu
+        # 0.5x (1 + erf(x / sqrt 2))
+        inner = erfWithTensor(graph, multiplicationWithPrimaryTensor(
+            graph, t, half(0.7071067811865476), "gelu_scale"), "gelu_erf")
+        s = additionWithPrimaryTensor(graph, inner, half(1.0), "gelu_one")
+        return multiplicationWithPrimaryTensor(
+            graph, multiplicationWithPrimaryTensor(graph, t, half(0.5), "gelu_halfx"),
+            s, "gelu")
+    end
+    if kind === :gelu_tanh
+        # 0.5x (1 + tanh(sqrt(2/pi) (x + 0.044715 x³)))
+        x2 = multiplicationWithPrimaryTensor(graph, t, t, "gelu_x2")
+        x3 = multiplicationWithPrimaryTensor(graph, x2, t, "gelu_x3")
+        inner = additionWithPrimaryTensor(graph, t, multiplicationWithPrimaryTensor(
+            graph, x3, half(0.044715), "gelu_c3"), "gelu_inner")
+        th = tanhWithTensor(graph, multiplicationWithPrimaryTensor(
+            graph, inner, half(0.7978845608028654), "gelu_sqrt2pi"), "gelu_tanh")
+        s = additionWithPrimaryTensor(graph, th, half(1.0), "gelu_one")
+        return multiplicationWithPrimaryTensor(
+            graph, multiplicationWithPrimaryTensor(graph, t, half(0.5), "gelu_halfx"),
+            s, "gelu")
+    end
+    throw(ArgumentError("gemm_batched!: no node for activation :$kind"))
+end
+
 """What makes two `gemm_batched!` graphs the same graph."""
 struct GemmGraphKey
     size_a::Tuple{Int,Int}
@@ -187,6 +229,7 @@ struct GemmGraphKey
     # `nothing` for a product with no bias, otherwise the bias element type: the
     # bias is a placeholder of its own and its cast is part of the graph.
     Tbias::Union{DataType,Nothing}
+    act::Symbol
 end
 
 """One built product graph and the tensors a call binds."""
@@ -208,16 +251,25 @@ function CachedGemmGraph(key::GemmGraphKey)
     # `(N, K) * (K, M) = (N, M)`, which is Julia's `(M, N)`. Same swap `_matmul!`
     # makes, for the same reason.
     prod = matrixMultiplicationWithPrimaryTensor(graph, placeB, placeA)
+    # The EPILOGUE in Float32 where there is an activation, and in the operand type
+    # where there is not. `gelu` of a value rounded to half loses accuracy twice —
+    # inside `erf`, and again at the `1 + erf` that follows, where an argument below
+    # -2 cancels to a couple of significant bits — which is why torch evaluates it in
+    # `opmath_type` and why the kernel this replaces accumulates in Float32 and
+    # rounds once. Not applied to a plain product, whose structure is measured.
+    wide = key.act !== :identity && key.Tab !== Float32
+    epi = wide ? castTensor(graph, prod, Float32, "wide") : prod
+    Te = wide ? Float32 : key.Tab
     placeBias = nothing
     if key.Tbias !== nothing
         placeBias = placeholderTensor(graph, (M,), key.Tbias, "bias")
         # A length-`M` bias against MPS's `(N, M)`: the trailing axis matches and
         # MPS broadcasts the leading one, which is Julia's "one value per ROW".
-        b = key.Tbias === key.Tab ? placeBias :
-            castTensor(graph, placeBias, key.Tab, "castbias")
-        prod = additionWithPrimaryTensor(graph, prod, b)
+        b = key.Tbias === Te ? placeBias : castTensor(graph, placeBias, Te, "castbias")
+        epi = additionWithPrimaryTensor(graph, epi, b)
     end
-    result = key.Tc === key.Tab ? prod : castTensor(graph, prod, key.Tc, "castC")
+    epi = activation(graph, epi, key.act, Te)
+    result = key.Tc === Te ? epi : castTensor(graph, epi, key.Tc, "castC")
     return CachedGemmGraph(graph, placeA, placeB, placeBias, result)
 end
 
@@ -227,21 +279,21 @@ const _gemm_graph_cache_lock = ReentrantLock()
 """
     gemm_batched!(C, A, B, bias = nothing) -> C
 
-`C = A * B` (plus one value per row of `C`), encoded into the command buffer the
-current queue is batching into rather than one of its own.
+`C = act.(A * B .+ bias)`, encoded into the command buffer the current queue is
+batching into rather than one of its own. `act` is one of `GEMM_ACTIVATIONS`.
 
 Operands may be suballocated — they go through `tensordata`, which carries the
 offset. The graph is built once per (shape, type, bias) and kept.
 """
 function gemm_batched!(C::Metal.MtlMatrix, A::Metal.MtlMatrix, B::Metal.MtlMatrix,
-                       bias = nothing)
+                       bias = nothing, act::Symbol = :identity)
     size(A, 2) == size(B, 1) && size(C) == (size(A, 1), size(B, 2)) ||
         throw(DimensionMismatch("gemm_batched!: $(size(A)) * $(size(B)) into $(size(C))"))
     bias === nothing || length(bias) == size(C, 1) ||
         throw(DimensionMismatch("gemm_batched!: bias of $(length(bias)) for " *
                                 "$(size(C, 1)) rows"))
     key = GemmGraphKey(size(A), size(B), eltype(A), eltype(C),
-                       bias === nothing ? nothing : eltype(bias))
+                       bias === nothing ? nothing : eltype(bias), act)
     cached = @lock _gemm_graph_cache_lock get!(_gemm_graph_cache, key) do
         CachedGemmGraph(key)
     end
@@ -266,7 +318,8 @@ Whether `gemm_batched!` covers these operands as they lie. Rank two throughout, 
 input element type, and an innermost extent whose byte size is a multiple of sixteen
 — `MPSNDArray` refuses anything else.
 """
-function gemm_shape_supported(C, A, B, bias)
+function gemm_shape_supported(C, A, B, bias, act::Symbol = :identity)
+    act in GEMM_ACTIVATIONS || return false
     # Asked of GRAPH RESOURCES as often as of arrays — a backend answers this while
     # declaring, before anything is placed — so nothing here is more specific than
     # `eltype`, `ndims` and `size`.
@@ -275,6 +328,17 @@ function gemm_shape_supported(C, A, B, bias)
     Tab = eltype(A)
     eltype(B) === Tab || return false
     (Tab, eltype(C)) in MPSGRAPH_VALID_MATMUL_TYPES || return false
+    # A destination WIDER than the operands is refused, and this is the one that
+    # matters rather than a tidiness rule. `matrixMultiplicationWithPrimaryTensor`
+    # has no compute type: its output dtype follows its inputs, so a half product
+    # asked for in single is a half product cast afterwards, and the accumulator
+    # the caller wanted is gone. A convolution's im2col GEMM asks for exactly that —
+    # `(Float16, Float16) -> Float32`, on the grounds that the native kernel
+    # accumulates directly into single — and taking it here moved SAM 2.1's encoder
+    # `add_129` from 0.48 to 1.12, past the band the Vulkan reference sits in. The
+    # only way to give MPSGraph a wide accumulator is to widen its operands, which
+    # is four times the traffic for a product the caller already has a kernel for.
+    eltype(C) === Tab || return false
     size(A, 2) == size(B, 1) && size(C) == (size(A, 1), size(B, 2)) || return false
     for x in (C, A, B)
         size(x, 1) * sizeof(eltype(x)) % 16 == 0 || return false
