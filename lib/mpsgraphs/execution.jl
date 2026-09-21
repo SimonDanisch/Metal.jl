@@ -72,12 +72,10 @@ submission.
 holds the `MTLBuffer` but nothing tells Julia the `MtlArray` is still in use.
 """
 function encode_batched!(graph::MPSGraph, feeds, results, roots...)
+    # `batchbuffer` ends the open encoder and holds the operands; see its docstring for
+    # why a command buffer of this call's own would be wrong.
     bq = Metal.global_queue(Metal.device())
-    # The open encoder has to END first: a command buffer may have only one encoder
-    # at a time and MPS makes its own. Ending is not committing — the buffer stays
-    # open and the next launch gets a fresh encoder in it.
-    Metal.end_encoder!(bq)
-    cmdbuf = Metal.ensure_cmdbuf!(bq)
+    cmdbuf = Metal.batchbuffer(roots...)
     mps = MPSCommandBuffer(cmdbuf)
     encode!(mps, graph, NSDictionary(feeds), NSDictionary(results), nil,
             default_exec_desc())
@@ -86,7 +84,6 @@ function encode_batched!(graph::MPSGraph, feeds, results, roots...)
     # SAM 2.1's encoder frame. The batch adopts the continuation rather than being
     # left holding a committed buffer. A no-op in the usual case.
     Metal.adopt_continued!(bq, cmdbuf, mps.commandBuffer)
-    Metal.record_operation!(bq, roots...)
     return nothing
 end
 

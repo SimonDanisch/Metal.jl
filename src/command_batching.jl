@@ -254,6 +254,59 @@ function end_encoder!(bq::BatchedCommandQueue)
     return
 end
 
+"""
+    batchbuffer(roots...) -> MTLCommandBuffer
+
+The command buffer this task's queue is already BATCHING into, ready for a library to
+encode into — the one a kernel launch or a blit would go into.
+
+Use this instead of `MTLCommandBuffer(global_queue(device()))` for anything that encodes
+and would then commit. Command buffers run in COMMIT order, so a library that commits its
+own while a batch of uploads and launches is still open runs BEFORE them, ordered against
+neither side. `MPS.matmul!` did exactly that, and the symptom was not garbage but
+**exactly zeros**: the product ran on unwritten operands and the batch's `fill!(c, 0)`
+landed on top of it afterwards. Joining the open buffer makes the work ordered by encoder
+order, which is the rule the launches already rely on, and costs no extra submission.
+
+Two things it does that a caller should not have to remember. The open ENCODER is ended,
+because a command buffer may have only one at a time and a library makes its own; that is
+not a commit, so the batch stays open and [`flush!`](@ref) still decides when it goes. And
+`roots` are kept alive until the buffer retires — an `MPSMatrix` wrapper or a kernel object
+that nothing else references once the encoding call returns.
+
+The buffer is NOT committed here. Whoever owns the frame commits it, which is the whole
+point.
+"""
+function batchbuffer(roots...)
+    bq = global_queue(device())
+    end_encoder!(bq)
+    cmdbuf = ensure_cmdbuf!(bq)
+    record_operation!(bq, roots...)
+    return cmdbuf
+end
+
+"""
+    orderedqueue(dev = device()) -> BatchedCommandQueue
+
+This task's queue, with the open batch COMMITTED, for an operation that must own its
+command buffer.
+
+Some library operations cannot join the batch: MPS's decompositions and solves chain
+several kernels through `commitAndContinue!`, which commits partway through, so they need
+a buffer of their own. A buffer taken from a queue is ordered only by WHEN IT IS
+COMMITTED — so taken while a batch of uploads is still open, it runs BEFORE them. Flushing
+here is what puts the two in order.
+
+[`batchbuffer`](@ref) is the cheaper answer and the right one wherever the operation only
+encodes: it costs no extra submission. Reach for this one only when the operation commits
+on its own.
+"""
+function orderedqueue(dev::MTLDevice = device())
+    q = global_queue(dev)
+    flush!(q)
+    return q
+end
+
 function compute_encoder(bq::BatchedCommandQueue)
     if bq.kind == ComputeEncoder
         return bq.encoder::MTLComputeCommandEncoder

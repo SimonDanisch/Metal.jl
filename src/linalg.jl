@@ -245,7 +245,9 @@ LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
                                            check::Bool = true) where {T <: MtlFloat}
     M, N = size(A)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = orderedqueue(dev)
 
     At = MtlMatrix{T, PrivateStorage}(undef, (N, M))
     mps_a = MPSMatrix(A)
@@ -303,7 +305,9 @@ end
                                             allowsingular::Bool = false) where {T <: MtlFloat}
     M, N = size(A)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = orderedqueue(dev)
 
     At = MtlMatrix{T, PrivateStorage}(undef, (N, M))
     mps_a = MPSMatrix(A)
@@ -348,7 +352,9 @@ end
 
     M, N = size(A)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = orderedqueue(dev)
     cmdbuf = MTLCommandBuffer(queue)
 
     mps_a = MPSMatrix(A)

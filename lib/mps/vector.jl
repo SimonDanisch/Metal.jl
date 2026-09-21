@@ -104,10 +104,10 @@ function matvecmul!(c::MtlVector, a::MtlMatrix, b::MtlVector, alpha::Number=true
                                                       rows_c, cols_a,
                                                       alpha, beta)
 
-    # Encode and commit matmul kernel
-    cmdbuf = MTLCommandBuffer(global_queue(device()))
+    # The batch's buffer, for the reason `Metal.batchbuffer` gives: a private command
+    # buffer commits ahead of the uploads that fill the operands.
+    cmdbuf = Metal.batchbuffer(matvec_mul_kernel, mps_a, mps_b, mps_c, a, b, c)
     encode!(cmdbuf, matvec_mul_kernel, mps_a, mps_b, mps_c)
-    commit!(cmdbuf)
 
     return c
 end

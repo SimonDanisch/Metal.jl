@@ -112,11 +112,14 @@ end
 function exportToMtlArray!(arr::MtlArray{T}, ndarr::MPSNDArrayLike; async=false) where T
     dev = device(arr)
 
-    cmdBuf = MTLCommandBuffer(global_queue(dev)) do cmdBuf
-        exportDataWithCommandBuffer(ndarr, cmdBuf, arr.data[], T, arr.offset)
-    end
+    # Into the batch rather than a command buffer of its own: an export committed on its
+    # own runs BEFORE whatever is still open that produced `ndarr`. See
+    # `Metal.batchbuffer`. `async` then means what it says — the work sits in the batch and
+    # goes with it — where before it meant one extra submission.
+    exportDataWithCommandBuffer(ndarr, Metal.batchbuffer(ndarr, arr),
+                                arr.data[], T, arr.offset)
 
-    async || synchronize(cmdBuf)
+    async || synchronize(global_queue(dev))
     return arr
 end
 

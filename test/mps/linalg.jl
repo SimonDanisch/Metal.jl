@@ -213,28 +213,37 @@ end
             return perm, y
         end
     end
+    # WHICH index a tie resolves to is not part of the contract, and `rand(Float16, 20,
+    # 30)` has a tie inside its top five about half the time — eleven mantissa bits over
+    # twenty draws — so comparing indices to `partialsortperm`'s choice failed roughly
+    # every other run, on an unseeded input, for no reason to do with the kernel. What IS
+    # well defined is the values (a tie does not change the multiset) and that each index
+    # points at the value beside it. Both are checked; the index comparison is kept for the
+    # data where it means something.
     @testset "$ftype" for ftype in (Float16, Float32)
         # Normal operation
         for (shp,k) in [((3,1), 2), ((20,30), 5)]
             cpu_a = rand(ftype, shp...)
-
-            #topk
             cpu_i, cpu_v = cpu_topk(cpu_a, k)
-
+            # A tie anywhere inside the top `k` of a column makes the indices ambiguous.
+            decidable = all(1:shp[2]) do c
+                col = sort(cpu_a[:, c]; rev = true)
+                all(col[j] != col[j+1] for j in 1:min(k, length(col) - 1))
+            end
             a = MtlMatrix(cpu_a)
-            i, v = MPS.topk(a, k)
 
-            @test Array(i) == cpu_i
-            @test Array(v) == cpu_v
-
-            #topk!
-            i = MtlMatrix{UInt32}(undef, (k, shp[2]))
-            v = MtlMatrix{ftype}(undef, (k, shp[2]))
-
-            i, v = MPS.topk!(a, i, v, k)
-
-            @test Array(i) == cpu_i
-            @test Array(v) == cpu_v
+            for (i, v) in (MPS.topk(a, k),
+                           #topk!
+                           MPS.topk!(a, MtlMatrix{UInt32}(undef, (k, shp[2])),
+                                     MtlMatrix{ftype}(undef, (k, shp[2])), k))
+                hi, hv = Array(i), Array(v)
+                @test hv == cpu_v
+                # Every index names the value returned with it, which is the contract a
+                # tie cannot make ambiguous.
+                @test all(cpu_a[hi[j, c], c] == hv[j, c]
+                          for j in 1:k, c in 1:shp[2])
+                decidable && @test hi == cpu_i
+            end
         end
         shp = (20,30)
         k = 17
@@ -255,8 +264,12 @@ end
 
 using .MPS: MPSMatrixSoftMax, MPSMatrixLogSoftMax
 @testset "MPSMatrixSoftMax" begin
-    cols = rand(Int)
-    rows = rand(Int)
+    # NOT `rand(Int)`: `sourceColumns` is an `NSUInteger`, and a negative `Int64` assigned
+    # to it throws `InexactError` — which `rand(Int)` produces about half the time, on an
+    # unseeded draw, so this testset errored out roughly every other run. A row or column
+    # count is non-negative by construction; the point is that the property round-trips.
+    cols = rand(1:typemax(Int32))
+    rows = rand(1:typemax(Int32))
 
     skern = MPSMatrixSoftMax(device())
     skern.sourceColumns = cols

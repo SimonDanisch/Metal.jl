@@ -141,7 +141,9 @@ end
                                    check::Bool=true) where {T<:MtlFloat}
     n, nrhs = check_square_rhs(A, B)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     At = MtlMatrix{T, PrivateStorage}(undef, (n, n))
     Bt = rhs_scratch(T, n, nrhs)
@@ -192,7 +194,9 @@ end
     nrhs = rhs_count(B)
 
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     LUt = MtlMatrix{T, PrivateStorage}(undef, (n, n))
     Bt = rhs_scratch(T, n, nrhs)
@@ -229,7 +233,9 @@ end
                                               uplo::Union{Symbol,AbstractChar}='U') where {T<:MtlFloat}
     n = LinearAlgebra.checksquare(A)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
     status = status_buffer()
 
     cmdbuf = MPSCommandBuffer(queue)
@@ -258,7 +264,9 @@ end
     nrhs = rhs_count(B)
 
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     Bt = rhs_scratch(T, n, nrhs)
     Xt = rhs_scratch(T, n, nrhs)
@@ -291,7 +299,9 @@ end
                                          check::Bool=true) where {T<:MtlFloat}
     n, nrhs = check_square_rhs(A, B)
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     F = copy(A)
     Bt = rhs_scratch(T, n, nrhs)
@@ -345,7 +355,9 @@ end
     check_rhs_out(B, out)
 
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     Bt = rhs_scratch(T, n, nrhs)
     Xt = rhs_scratch(T, n, nrhs)
@@ -383,7 +395,9 @@ function solve_triangular_right(A::MtlMatrix{T}, B::MtlMatrix{T};
     check_rhs_out(B, out)
 
     dev = device()
-    queue = global_queue(dev)
+    # Its own command buffer, so the batch has to be committed first — see
+    # `Metal.orderedqueue`. These chain kernels through `commitAndContinue!`.
+    queue = Metal.orderedqueue(dev)
 
     Bt = MtlMatrix{T, PrivateStorage}(undef, (n, nrhs))
     mps_b = MPSMatrix(B)
