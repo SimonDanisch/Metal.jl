@@ -52,6 +52,9 @@ include("matmul.jl")
 include("attention.jl")
 include("fft.jl")
 include("nn.jl")
+# After `nn.jl`, whose descriptors it builds, and after `matmul.jl`, whose
+# `activation` it puts on the store.
+include("conv.jl")
 include("sort.jl")
 include("scan.jl")
 include("reductions.jl")

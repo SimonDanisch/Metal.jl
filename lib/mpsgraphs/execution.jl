@@ -101,8 +101,43 @@ suballocated array (every transient of a render graph is a slice of a 64 MiB blo
 reads and writes the wrong bytes. `MPSNDArray` takes the offset, so the route
 through it is the one that works for both.
 """
-# The buffer form where it is correct, which is every array that starts one: it
-# takes any shape, while `MPSNDArray` refuses an innermost extent that is not a
-# multiple of sixteen bytes. The offset route is for the arrays that need it.
-tensordata(arr::Metal.MtlArray) =
-    arr.offset == 0 ? MPSGraphTensorData(arr) : MPSGraphTensorData(MPS.MPSNDArray(arr))
+# The buffer form where it is correct, which is every array that starts one: it takes
+# any shape, while `MPSNDArray` pads the innermost row to sixteen bytes. The offset
+# route is for the arrays that need it.
+#
+# `shape` is what MPS is TOLD, which need not be the array's own — see `bindshape`: an
+# operand whose innermost extent is not a multiple of sixteen bytes is bound flat and
+# reshaped in the graph, which is the only way to hand MPS a `7x7x3x96` half weight at
+# a nonzero offset at all.
+function tensordata(arr::Metal.MtlArray, shape::Tuple = size(arr))
+    arr.offset == 0 && return MPSGraphTensorData(arr.data[],
+        convert(MPSShape, reverse(shape)), eltype(arr))
+    desc = MPS.MPSNDArrayDescriptor(eltype(arr), collect(shape))
+    return MPSGraphTensorData(MPS.MPSNDArray(arr.data[], UInt(arr.offset), desc))
+end
+
+"""
+    bindshape(dims, T) -> Tuple or nothing
+
+The shape to hand MPS for a DENSE operand whose logical shape is `dims`.
+
+`MPSNDArray` created over a buffer pads the innermost row to sixteen bytes and then
+refuses a buffer that is not big enough for the padded layout — a `(7, 7, 3, 8)` half
+array is 2352 bytes and it asks for 2688. A convolution weight is never 16-byte wide
+in its kernel extent, so such an operand is bound FLAT and reshaped in the graph,
+which is free and always aligned when the whole array is.
+
+`nothing` when neither shape works, which is how a caller learns to keep its own
+kernel.
+"""
+function bindshape(dims::Tuple, T::DataType)
+    first(dims) * sizeof(T) % 16 == 0 && return dims
+    n = prod(dims)
+    n * sizeof(T) % 16 == 0 && return (n,)
+    return nothing
+end
+
+"""Bind a placeholder built on `bindshape` back to the logical shape."""
+reshapebound(graph::MPSGraph, t::MPSGraphTensor, bound::Tuple, dims::Tuple, name) =
+    bound === dims ? t :
+    reshapeTensor(graph, t, convert(MPSShape, reverse(dims)), name)
