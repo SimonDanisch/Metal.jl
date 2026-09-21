@@ -73,6 +73,22 @@ function transposeTensor(graph::MPSGraph, tensor::MPSGraphTensor, dimension, wit
                                            name:name::id{NSString}]::MPSGraphTensor
 end
 
+"""
+    sliceTensor(graph, tensor, dimension, start, length) -> MPSGraphTensor
+
+`length` entries of `dimension` starting at `start`. `dimension` is an MPSGraph axis
+(outermost first, zero-based) — see [`mps_axis`](@ref) for the Julia one. The sliced
+axis is KEPT, with the length given, so axis numbers after this do not move.
+"""
+function sliceTensor(graph::MPSGraph, tensor::MPSGraphTensor, dimension, start, len,
+                     name = "slice")
+    @objc [graph::id{MPSGraph} sliceTensor:tensor::id{MPSGraphTensor}
+                                 dimension:dimension::NSUInteger
+                                     start:start::NSInteger
+                                    length:len::NSInteger
+                                      name:name::id{NSString}]::MPSGraphTensor
+end
+
 function shapeOfTensor(graph::MPSGraph, tensor::MPSGraphTensor, name = "shapeOfTensor")
     @objc [graph::id{MPSGraph} shapeOfTensor:tensor::id{MPSGraphTensor}
                                         name:name::id{NSString}]::MPSGraphTensor
