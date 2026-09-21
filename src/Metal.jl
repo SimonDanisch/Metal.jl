@@ -98,6 +98,7 @@ export MPSGraphs
 
 # LinearAlgebra
 include("gemm.jl")
+include("attention.jl")
 include("linalg.jl")
 
 # array implementation
