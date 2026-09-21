@@ -276,8 +276,17 @@ end
 # compile-time constants. The K-loop trip count is kept dynamic (a runtime `K`, not a `Val`)
 # to avoid crashing Apple's back-end (see the note in `device/intrinsics/tensor.jl`).
 #
-# One threadgroup computes one `C[TM, TN]` output tile.  The first K slice overwrites the
-# destination; the remaining slices accumulate, so callers do not need a separate fill.
+# One threadgroup computes one `C[TM, TN]` output tile.
+#
+# **The K accumulator is a THREADGROUP tile in Float32, not the destination in device
+# memory.** `matmul2d` takes its destination in whichever address space the tensor names, and
+# pointing it at `C` makes every one of the `K/TK` slices a read-modify-write of the output
+# tile through device memory — at the destination's OWN precision, so an fp16 `C` rounds the
+# running sum 72 times over SAM 2's `K = 2304`. Accumulating in threadgroup memory instead
+# costs `TM*TN*4` bytes (16 KiB at 64x64, half the 32 KiB budget) and is worth, measured on an
+# M5 at fp16 `576x4096x2304`, 4.12 -> 8.29 TFLOP/s AND a relative error against MPSGraph of
+# 4.8e-3 -> 8.0e-4. The bias and the epilogue then apply on the way out, where the value is
+# already in registers, rather than as a second device round-trip over `C`.
 @inline function gemm_tensor_body!(C::MtlDeviceArray, A::MtlDeviceArray,
                                    B::MtlDeviceArray, bias, epilogue,
                                    M::UInt32, N::UInt32, K::UInt32,
@@ -290,9 +299,9 @@ end
 
     tA = MtlInlineTensor(A, (M, K))
     tB = MtlInlineTensor(B, (K, N))
-    tC = MtlInlineTensor(C, (M, N))
 
-    mC = view(tC, (m_off + Int32(1), n_off + Int32(1)), (Int32(TM), Int32(TN)))
+    acc = MtlThreadGroupArray(Float32, (TM, TN))
+    mC = view(MtlInlineTensor(acc), (Int32(1), Int32(1)), (Int32(TM), Int32(TN)))
 
     initialize = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK;
                                                         mode = matmul2d_multiply),
@@ -310,22 +319,21 @@ end
         mB = view(tB, (k_off + Int32(1), n_off + Int32(1)), (Int32(TK), Int32(TN)))
         accumulate(mA, mB, mC)
     end
-    if HASBIAS || HASEPI
-        # matmul2d is collective over the threadgroup.  Make its device writes
-        # visible before the same threads apply the row bias in place.
-        threadgroup_barrier(MemoryFlagDevice)
-        tid = Int(thread_index_in_threadgroup()) - 1
-        stride = NSIMD * 32
-        for linear in tid:stride:(TM * TN - 1)
-            mi = linear % TM
-            ni = linear ÷ TM
-            row = Int(m_off) + mi + 1
-            col = Int(n_off) + ni + 1
-            @inbounds value = C[row, col]
-            HASBIAS && (@inbounds value += bias[row])
-            HASEPI && (value = epilogue(value))
-            @inbounds C[row, col] = value
-        end
+    # matmul2d is collective over the threadgroup, so the accumulator is only complete for
+    # every thread after a barrier — and it is a THREADGROUP barrier now, matching where the
+    # tile lives.
+    threadgroup_barrier(MemoryFlagThreadGroup)
+    tid = Int(thread_index_in_threadgroup()) - 1
+    stride = NSIMD * 32
+    for linear in tid:stride:(TM * TN - 1)
+        mi = linear % TM
+        ni = linear ÷ TM
+        row = Int(m_off) + mi + 1
+        col = Int(n_off) + ni + 1
+        @inbounds value = acc[mi + 1, ni + 1]
+        HASBIAS && (@inbounds value += Float32(bias[row]))
+        HASEPI && (value = epilogue(value))
+        @inbounds C[row, col] = value
     end
     return
 end
@@ -359,13 +367,13 @@ end
 # tensor descriptor avoids materialising attention's `(E,L,H,B) -> (L,E,H,B)`
 # query permutation.
 @inline function gemm_tensor_batched_body!(C::MtlDeviceArray, A::MtlDeviceArray,
-                                           B::MtlDeviceArray, alpha::Float32,
+                                           B::MtlDeviceArray, coldiv, alpha::Float32,
                                            M::UInt32, N::UInt32, K::UInt32,
                                            ::Val{TM}, ::Val{TN}, ::Val{TK},
                                            ::Val{NSIMD}, ::Val{TA}, ::Val{TB},
-                                           ::Val{HASSCALE}) where
+                                           ::Val{HASSCALE}, ::Val{HASDIV}) where
                                           {TM, TN, TK, NSIMD, TA, TB,
-                                           HASSCALE}
+                                           HASSCALE, HASDIV}
     tgid = threadgroup_position_in_grid_3d()
     m_off = (unsafe_trunc(Int32, tgid.x) - Int32(1)) * Int32(TM)
     n_off = (unsafe_trunc(Int32, tgid.y) - Int32(1)) * Int32(TN)
@@ -384,9 +392,12 @@ end
 
     tA = MtlInlineTensor(A2)
     tB = MtlInlineTensor(B2)
-    tC = MtlInlineTensor(C2)
-    mC = view(tC, (m_off + Int32(1), n_off + Int32(1)),
-              (Int32(TM), Int32(TN)))
+    # Threadgroup Float32 accumulator, for the reason spelled out above
+    # `gemm_tensor_body!`: a device-memory destination turns each of the `K/TK` slices into a
+    # read-modify-write of the output tile at the destination's own precision. `alpha` folds
+    # into the write-out below, so a scaled product costs no second pass over `C` either.
+    acc = MtlThreadGroupArray(Float32, (TM, TN))
+    mC = view(MtlInlineTensor(acc), (Int32(1), Int32(1)), (Int32(TM), Int32(TN)))
 
     initialize = TensorOpsMatmul2D{
         matmul2d_descriptor(TM, TN, TK; transpose_left = TA,
@@ -420,30 +431,32 @@ end
         accumulate(mA, mB, mC)
     end
 
-    if HASSCALE
-        threadgroup_barrier(MemoryFlagDevice)
-        tid = Int(thread_index_in_threadgroup()) - 1
-        stride = NSIMD * 32
-        for linear in tid:stride:(TM * TN - 1)
-            mi = linear % TM
-            ni = linear ÷ TM
-            row = Int(m_off) + mi + 1
-            col = Int(n_off) + ni + 1
-            @inbounds value = Float32(C2[row, col])
-            value *= alpha
-            @inbounds C2[row, col] = value
-        end
+    threadgroup_barrier(MemoryFlagThreadGroup)
+    tid = Int(thread_index_in_threadgroup()) - 1
+    stride = NSIMD * 32
+    for linear in tid:stride:(TM * TN - 1)
+        mi = linear % TM
+        ni = linear ÷ TM
+        row = Int(m_off) + mi + 1
+        col = Int(n_off) + ni + 1
+        @inbounds value = acc[mi + 1, ni + 1]
+        HASSCALE && (value *= alpha)
+        # One divisor per output COLUMN, laid out `(N, batch...)` — attention's unnormalized
+        # softmax leaves its row sums for the apply product to divide by, and doing it here
+        # saves a second pass over an output this kernel already holds in registers.
+        HASDIV && (@inbounds value /= Float32(coldiv[Int(batch) * Int(N) + col]))
+        @inbounds C2[row, col] = value
     end
     return
 end
 
 function gemm_tensor_batched_kernel!(C::MtlDeviceArray, A::MtlDeviceArray,
-                                     B::MtlDeviceArray, alpha::Float32,
+                                     B::MtlDeviceArray, coldiv, alpha::Float32,
                                      M::UInt32, N::UInt32, K::UInt32,
                                      tm::Val, tn::Val, tk::Val, nsimd::Val,
-                                     ta::Val, tb::Val, hasscale::Val)
-    gemm_tensor_batched_body!(C, A, B, alpha, M, N, K,
-                              tm, tn, tk, nsimd, ta, tb, hasscale)
+                                     ta::Val, tb::Val, hasscale::Val, hasdiv::Val)
+    gemm_tensor_batched_body!(C, A, B, coldiv, alpha, M, N, K,
+                              tm, tn, tk, nsimd, ta, tb, hasscale, hasdiv)
 end
 
 # eltypes the tensor path handles (uniform in/out); these have `__tensorops` run helpers and
@@ -465,13 +478,89 @@ end
 # divides the dimension; 0 means "no usable tile" (dimension not a multiple of the smallest).
 const GEMM_TENSOR_MN_TILES = (64, 32, 16, 8)
 const GEMM_TENSOR_K_TILES  = (32, 16, 8)
-const GEMM_TENSOR_NSIMD    = 4
 
 @inline function gemm_tensor_tile(d::Integer, cands)
     for t in cands
         d % t == 0 && return t
     end
     return 0
+end
+
+# Which tile and how many simdgroups run it, as a function of the contraction DEPTH.
+#
+# Not "the largest tile that divides", which is what this was: the best tile is a property of
+# the shape, and the two regimes differ by up to 1.6x on the same kernel. Measured on an M5,
+# fp16, over the 13 distinct GEMM shapes of SAM 2.1's encoder plus seven out-of-sample shapes:
+#
+#   deep    (K >= 1024)  64x64 tile, 2 simdgroups   576x4096x2304   8.29 TFLOP/s
+#   shallow (K <  1024)  32x32 tile, 1 simdgroup   2304x4096x576    6.93 TFLOP/s
+#
+# Picking the other branch's tile costs 1.19x on the first shape and 1.30x on the second, and
+# the rule agrees with the measured winner on all seven out-of-sample shapes. A deep
+# contraction amortises the wider tile's loads over more slices; a shallow one has too few
+# slices to pay for them and wants the smaller tile's occupancy instead. Weighted over the
+# encoder, the rule lands within 2% of choosing each shape's best tile by hand.
+#
+# `GEMM_TENSOR_*` above is what a caller may still pass explicitly to `gemm_tensor!`.
+const GEMM_TENSOR_KDEEP = 1024
+const GEMM_TENSOR_MN_TILES_SHALLOW = (32, 16, 8)
+const GEMM_TENSOR_NSIMD_DEEP = 2
+const GEMM_TENSOR_NSIMD_SHALLOW = 1
+
+# What the accumulator may take of the 32 KiB a threadgroup gets.
+const GEMM_TENSOR_TGMEM = 32768
+
+# A dimension NO tile of sixteen or more divides takes the largest MULTIPLE OF EIGHT instead.
+#
+# `matmul2d` accepts any multiple of eight, verified bit-exact against the 8-row tile for
+# every one of 8/16/24/32/36/40/48/56/64/72/96/128 on an M5. The power-of-two list above is
+# still what a dimension divisible by 16 uses, because that list is the one measured against
+# this workload's `addmm` shapes and a LARGER tile is not automatically better there (M=1152
+# at fp16 `1152x4096x1152`: the 64-tile is 6.59 TFLOP/s, the 128-tile 3.41). The fallback is
+# for a dimension like attention's head width E = 72, where the power-of-two rule lands on 8
+# and the other operand is then read M/8 times over. Covering E in ONE tile reads it once:
+# measured on SAM 2.1's 4096-token global block, fp16, `72x4096x4096` batched over 8 heads,
+# 7.72 -> 2.89 ms (2.51 -> 6.70 TFLOP/s).
+const GEMM_TENSOR_MN_MULT = 8
+const GEMM_TENSOR_MN_MAX  = 128
+const GEMM_TENSOR_MN_POW2MIN = 16
+
+"""The largest multiple of eight that divides `d` and is strictly below `below`, or 0."""
+@inline function gemm_tensor_tile_mult(d::Integer,
+                                       below::Integer = GEMM_TENSOR_MN_MAX + GEMM_TENSOR_MN_MULT)
+    t = min(Int(d), GEMM_TENSOR_MN_MAX, Int(below) - GEMM_TENSOR_MN_MULT)
+    t -= t % GEMM_TENSOR_MN_MULT
+    while t >= GEMM_TENSOR_MN_MULT
+        d % t == 0 && return t
+        t -= GEMM_TENSOR_MN_MULT
+    end
+    return 0
+end
+
+@inline function gemm_tensor_tiles(M::Integer, N::Integer, K::Integer)
+    deep = K >= GEMM_TENSOR_KDEEP
+    mn = deep ? GEMM_TENSOR_MN_TILES : GEMM_TENSOR_MN_TILES_SHALLOW
+    tm = gemm_tensor_tile(M, mn)
+    tn = gemm_tensor_tile(N, mn)
+    tm < GEMM_TENSOR_MN_POW2MIN && (tm = max(tm, gemm_tensor_tile_mult(M)))
+    tn < GEMM_TENSOR_MN_POW2MIN && (tn = max(tn, gemm_tensor_tile_mult(N)))
+    # The contraction takes the same fallback, and for the same reason: attention's scores
+    # contract over E = 72, where the 8-slice loop runs nine times to the 72-slice's one.
+    # Measured on the same 4096-token block, `4096x4096x72` over 8 heads: 12.17 -> 10.38 ms.
+    tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
+    tk < GEMM_TENSOR_MN_POW2MIN && (tk = max(tk, gemm_tensor_tile_mult(K)))
+    # The accumulator is `tm*tn` Float32s of threadgroup memory. Shrink the larger tile until
+    # it fits rather than launching a kernel the driver would reject; each step strictly
+    # shrinks one side, so this terminates at a fit or at "no usable tile".
+    while tm != 0 && tn != 0 && tm * tn * sizeof(Float32) > GEMM_TENSOR_TGMEM
+        if tn >= tm
+            tn = gemm_tensor_tile_mult(N, tn)
+        else
+            tm = gemm_tensor_tile_mult(M, tm)
+        end
+    end
+    (tm == 0 || tn == 0 || tk == 0) && return (0, 0, 0, 0)
+    return (tm, tn, tk, deep ? GEMM_TENSOR_NSIMD_DEEP : GEMM_TENSOR_NSIMD_SHALLOW)
 end
 
 """
@@ -486,11 +575,8 @@ function gemm_kernel_config(C, A, B; bias = nothing, epilogue = identity)
     gemm_simd_eltype(eltype(A), eltype(B), eltype(C)) || return nothing
     M, N, K = size(C, 1), size(C, 2), size(A, 2)
     if tensor_matmul_capable() && gemm_tensor_eltype(eltype(A), eltype(B), eltype(C))
-        tm = gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES)
-        tn = gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES)
-        tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
+        tm, tn, tk, nsimd = gemm_tensor_tiles(M, N, K)
         if tm != 0 && tn != 0 && tk != 0
-            nsimd = GEMM_TENSOR_NSIMD
             threads = nsimd * 32
             groups = (M ÷ tm, N ÷ tn)
             fusebias = bias !== nothing && length(bias) == M
@@ -529,14 +615,17 @@ end
 
 """
     batched_gemm_kernel_config(C, A, B; transpose_a=false, transpose_b=false,
-                               alpha=1)
+                               alpha=1, coldiv=nothing)
 
 Describe a recordable Metal tensor-ops strided-batched GEMM.  The first two
 axes hold each matrix and all remaining axes form a contiguous batch.  Returns
 `nothing` when tensor operations or the requested tiled shapes are unavailable.
+
+`coldiv` fuses a per-output-column divisor, laid out `(N, batch...)`, into the store.
 """
 function batched_gemm_kernel_config(C, A, B; transpose_a = false,
-                                    transpose_b = false, alpha = 1)
+                                    transpose_b = false, alpha = 1,
+                                    coldiv = nothing)
     tensor_matmul_capable() || return nothing
     gemm_tensor_eltype(eltype(A), eltype(B), eltype(C)) || return nothing
     ndims(A) >= 3 && ndims(B) >= 3 && ndims(C) >= 3 || return nothing
@@ -549,19 +638,18 @@ function batched_gemm_kernel_config(C, A, B; transpose_a = false,
     nbatch = prod(size(C)[3:end])
     prod(size(A)[3:end]) == nbatch || return nothing
     prod(size(B)[3:end]) == nbatch || return nothing
-    tm = gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES)
-    tn = gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES)
-    tk = gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)
+    tm, tn, tk, nsimd = gemm_tensor_tiles(M, N, K)
     tm != 0 && tn != 0 && tk != 0 || return nothing
 
-    nsimd = GEMM_TENSOR_NSIMD
     threads = nsimd * 32
     groups = (M ÷ tm, N ÷ tn, nbatch)
     hasscale = !isone(alpha)
-    args = (C, A, B, Float32(alpha),
+    hasdiv = coldiv !== nothing
+    hasdiv && (length(coldiv) == N * nbatch || return nothing)
+    args = (C, A, B, hasdiv ? coldiv : nothing, Float32(alpha),
             UInt32(M), UInt32(N), UInt32(K),
             Val(Int32(tm)), Val(Int32(tn)), Val(Int32(tk)), Val(Int32(nsimd)),
-            Val(Bool(transpose_a)), Val(Bool(transpose_b)), Val(hasscale))
+            Val(Bool(transpose_a)), Val(Bool(transpose_b)), Val(hasscale), Val(hasdiv))
     return (; kernel = gemm_tensor_batched_kernel!, args,
             ndrange = (groups[1] * threads, groups[2], groups[3]),
             group = (threads, 1, 1))
@@ -579,9 +667,8 @@ function supports_tensor_matmul(C::MtlMatrix, A::MtlMatrix, B::MtlMatrix,
     (cA === 'N' && cB === 'N') || return false
     (isone(alpha) && iszero(beta)) || return false
     M = size(A, 1); K = size(A, 2); N = size(B, 2)
-    gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES) != 0 &&
-        gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES) != 0 &&
-        gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)  != 0
+    tm, tn, tk, _ = gemm_tensor_tiles(M, N, K)
+    tm != 0 && tn != 0 && tk != 0
 end
 
 """
@@ -597,14 +684,14 @@ function gemm_tensor!(C::MtlMatrix, A::MtlMatrix, B::MtlMatrix,
                       cA::Char = 'N', cB::Char = 'N';
                       tile_m::Integer = 0, tile_n::Integer = 0, tile_k::Integer = 0)
     M = size(A, 1); K = size(A, 2); N = size(B, 2)
-    tile_m = tile_m == 0 ? gemm_tensor_tile(M, GEMM_TENSOR_MN_TILES) : tile_m
-    tile_n = tile_n == 0 ? gemm_tensor_tile(N, GEMM_TENSOR_MN_TILES) : tile_n
-    tile_k = tile_k == 0 ? gemm_tensor_tile(K, GEMM_TENSOR_K_TILES)  : tile_k
+    pm, pn, pk, nsimd = gemm_tensor_tiles(M, N, K)
+    tile_m = tile_m == 0 ? pm : tile_m
+    tile_n = tile_n == 0 ? pn : tile_n
+    tile_k = tile_k == 0 ? pk : tile_k
     @assert tile_m > 0 && tile_n > 0 && tile_k > 0 """
         no usable tensor-ops tile for $((M, N, K)); call `supports_tensor_matmul` first"""
 
     groups = (M ÷ tile_m, N ÷ tile_n, 1)
-    nsimd = GEMM_TENSOR_NSIMD
     @metal threads = nsimd * 32 groups = groups gemm_tensor_kernel!(
         C, A, B, UInt32(M), UInt32(N), UInt32(K),
         Val(Int32(tile_m)), Val(Int32(tile_n)), Val(Int32(tile_k)), Val(Int32(nsimd)))

@@ -363,9 +363,9 @@ end
             q = MtlArray(qh); k = MtlArray(kh)
             scores = MtlArray(fill(Float16(NaN), L, L, batch))
             Metal.@metal threads=128 groups=(1, 1, batch) Metal.gemm_tensor_batched_kernel!(
-                scores, q, k, 0.125f0, UInt32(L), UInt32(L), UInt32(E),
+                scores, q, k, nothing, 0.125f0, UInt32(L), UInt32(L), UInt32(E),
                 Val(Int32(16)), Val(Int32(16)), Val(Int32(16)), Val(Int32(4)),
-                Val(true), Val(false), Val(true))
+                Val(true), Val(false), Val(true), Val(false))
             score_ref = zeros(Float32, L, L, batch)
             for b in 1:batch
                 score_ref[:, :, b] .= 0.125f0 .* (Float32.(qh[:, :, b])' *
@@ -377,14 +377,59 @@ end
             v = MtlArray(vh); p = MtlArray(ph)
             out = MtlArray(fill(Float16(NaN), E, L, batch))
             Metal.@metal threads=128 groups=(1, 1, batch) Metal.gemm_tensor_batched_kernel!(
-                out, v, p, 1.0f0, UInt32(E), UInt32(L), UInt32(L),
+                out, v, p, nothing, 1.0f0, UInt32(E), UInt32(L), UInt32(L),
                 Val(Int32(16)), Val(Int32(16)), Val(Int32(16)), Val(Int32(4)),
-                Val(false), Val(true), Val(false))
+                Val(false), Val(true), Val(false), Val(false))
             out_ref = zeros(Float32, E, L, batch)
             for b in 1:batch
                 out_ref[:, :, b] .= Float32.(vh[:, :, b]) * Float32.(ph[:, :, b])'
             end
             @test isapprox(Array(out), out_ref; rtol=1.0f-1)
+
+            # …and the `coldiv` epilogue on the same product: one divisor per output
+            # COLUMN, laid out `(N, batch...)`, which is what an unnormalized softmax
+            # leaves for the apply product to divide by.
+            dh = rand(Float32, L, batch) .+ 1.0f0
+            outd = MtlArray(fill(Float16(NaN), E, L, batch))
+            Metal.@metal threads=128 groups=(1, 1, batch) Metal.gemm_tensor_batched_kernel!(
+                outd, v, p, MtlArray(dh), 1.0f0, UInt32(E), UInt32(L), UInt32(L),
+                Val(Int32(16)), Val(Int32(16)), Val(Int32(16)), Val(Int32(4)),
+                Val(false), Val(true), Val(false), Val(true))
+            @test isapprox(Array(outd), out_ref ./ reshape(dh, 1, L, batch); rtol=1.0f-1)
+            # …and that the config asks for it by name, and refuses a mis-sized divisor.
+            cfg = Metal.batched_gemm_kernel_config(out, v, p; transpose_b = true,
+                                                   coldiv = MtlArray(dh))
+            @test cfg !== nothing
+            @test Metal.batched_gemm_kernel_config(out, v, p; transpose_b = true,
+                                                   coldiv = MtlArray(dh[:, 1])) === nothing
+
+            # The K loop accumulates in a THREADGROUP Float32 tile, not in `C`.  Pinned by
+            # accuracy, because that is what the bug was: pointing `matmul2d` at the
+            # destination rounded the running sum to `C`'s own precision once per K slice, so
+            # a 2304-deep fp16 contraction came out at 4.8e-3 relative against a Float32
+            # reference where the storage floor is 8e-4.  The bound below sits between them
+            # and fails on a destination-accumulating kernel.
+            Md, Nd, Kd = 128, 128, 2304
+            Ad = rand(Float16, Md, Kd); Bd = rand(Float16, Kd, Nd)
+            Cd = MtlArray(fill(Float16(NaN), Md, Nd))
+            @with (Metal.matmul_alg => :tensor) mul!(Cd, MtlArray(Ad), MtlArray(Bd))
+            refd = Float32.(Ad) * Float32.(Bd)
+            @test maximum(abs, Array(Cd) .- refd) / maximum(abs, refd) < 2.0f-3
+
+            # A dimension no power-of-two tile divides still gets a tile: attention's head
+            # width E = 72 covered in ONE tile rather than nine of eight rows.
+            @test Metal.gemm_tensor_tiles(72, 4096, 4096)[1] == 72
+            @test Metal.gemm_tensor_tiles(4096, 4096, 72)[3] == 72
+            @test Metal.gemm_tensor_tiles(24, 256, 256)[1] == 24
+            # …and one that is not a multiple of eight gets none, so the caller falls back.
+            @test Metal.gemm_tensor_tiles(65, 47, 33) == (0, 0, 0, 0)
+            # Every tile the chooser returns fits the accumulator in threadgroup memory.
+            @testset "accumulator fits" for M in (72, 128, 512, 1152, 4096, 65536),
+                                            N in (64, 72, 1024, 65536),
+                                            K in (72, 288, 576, 2304)
+                tm, tn, _, _ = Metal.gemm_tensor_tiles(M, N, K)
+                @test tm * tn * sizeof(Float32) <= 32768
+            end
 
             # forcing `:tensor` on operands it can't handle errors (like an unsupported :MPS)
             A = MtlArray(rand(Float32, 64, 64)); B = MtlArray(rand(Float32, 64, 64))
