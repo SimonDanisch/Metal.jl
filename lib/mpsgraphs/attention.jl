@@ -158,13 +158,34 @@ end
 
 # ── The op ───────────────────────────────────────────────────────────────────
 
-"""What makes two SDPA graphs the same graph: the operand layouts, the type and the
-scale. No array, and no address."""
+"""What makes two SDPA graphs the same graph: the operand layouts, the two types and
+the scale. No array, and no address.
+
+`eltyp` is what q, k and v are; `outtyp` is what the caller asked the answer to be.
+They differ where a graph projects in fp16 and declares an fp32 result, which is what
+Qwen-Image 2.1 exports.
+
+Worth being exact about what the wider destination is and is not, because the
+matmul gate refuses the same pair for a reason that sounds like it applies here.
+`scaledDotProductAttentionWithQueryTensor` has no compute type either: its result
+dtype follows its INPUTS, so fp16 operands give an fp16-accurate answer and the cast
+below widens it rather than accumulating in single. Measured against a Float64
+reference at `(128, 256/384, 4, 1)`: fp16 operands read 7.06e-4 into an fp32
+destination and 7.06e-4 into an fp16 one — the same number — where fp32 operands
+read 9.08e-7.
+
+It is admitted anyway, which `gemm_shape_supported`'s pair is not, because of what
+the caller does when it is refused. A refused product falls back to a kernel that
+accumulates in single, so refusing keeps an accumulator. A refused ATTENTION falls
+back to `DNNKernels`' `threepass!`, whose score matrix is `eltype(q)` — fp16, the
+same precision this gives — so refusing keeps nothing and costs the whole op.
+"""
 struct SDPAGraphKey
     q::Any
     k::Any
     v::Any
     eltyp::DataType
+    outtyp::DataType
     scale::Float32
 end
 
@@ -189,6 +210,7 @@ function CachedSDPAGraph(key::SDPAGraphKey)
         packedplaceholder(graph, key.k, kph, "k"),
         packedplaceholder(graph, key.v, vph, "v"),
         key.scale)
+    key.outtyp === T || (out = castTensor(graph, out, key.outtyp, "castout"))
     return CachedSDPAGraph(graph, qph, kph, vph, out)
 end
 
@@ -202,8 +224,9 @@ Whether Apple's SDPA covers these operands as they lie, and if so everything abo
 them a graph is built from: one layout key and one array per operand.
 
 Rank four throughout with the key and value runs agreeing, one element type across
-all four, a destination that is an array rather than a view, and operands MPS can
-bind. `nothing` is how a caller learns to keep its own kernel.
+q, k and v, a result that is fp16 or fp32 and need not match them, a destination that
+is an array rather than a view, and operands MPS can bind. `nothing` is how a caller
+learns to keep its own kernel.
 """
 function sdpa_operands(o, q, k, v)
     po = packoperand(o)
@@ -213,9 +236,17 @@ function sdpa_operands(o, q, k, v)
     ps = map(packoperand, (q, k, v))
     any(isnothing, ps) && return nothing
     all(packedbindable, ps) || return nothing
-    T = eltype(o)
-    (T === Float16 || T === Float32) || return nothing
-    all(p -> eltype(p.res) === T, ps) || return nothing
+    # The OPERAND type and the RESULT type are asked separately. They agree in most
+    # graphs and the cast costs nothing there; where they do not, requiring them to
+    # agree is what sent an fp16 attention with an fp32 result to the three-pass
+    # path. The wider destination does NOT buy a wider accumulator — see
+    # `SDPAGraphKey` for the measurement, and for why that is worth taking here and
+    # not in `gemm_shape_supported`.
+    Te = eltype(first(ps).res)
+    To = eltype(o)
+    (Te === Float16 || Te === Float32) || return nothing
+    (To === Float16 || To === Float32) || return nothing
+    all(p -> eltype(p.res) === Te, ps) || return nothing
     pq, pk, pv = ps
     length(po.dims) == length(pq.dims) == length(pk.dims) == length(pv.dims) == 4 ||
         return nothing
@@ -223,7 +254,7 @@ function sdpa_operands(o, q, k, v)
     po.dims == pq.dims || return nothing
     pq.dims[1] == pk.dims[1] || return nothing                     # the head width
     pq.dims[3] == pk.dims[3] && pq.dims[4] == pk.dims[4] || return nothing
-    po.dims[1] * sizeof(T) % 16 == 0 || return nothing
+    po.dims[1] * sizeof(To) % 16 == 0 || return nothing
     return (; keys = map(packedkey, ps), res = map(p -> p.res, ps))
 end
 
@@ -240,7 +271,7 @@ built once per (layout, type, scale) and kept.
 """
 function sdpa_batched!(o::MtlArray, qres::MtlArray, kres::MtlArray, vres::MtlArray,
                        qkey, kkey, vkey, scale::Real)
-    key = SDPAGraphKey(qkey, kkey, vkey, eltype(o), Float32(scale))
+    key = SDPAGraphKey(qkey, kkey, vkey, eltype(qres), eltype(o), Float32(scale))
     cached = @lock _sdpa_graph_cache_lock get!(_sdpa_graph_cache, key) do
         CachedSDPAGraph(key)
     end

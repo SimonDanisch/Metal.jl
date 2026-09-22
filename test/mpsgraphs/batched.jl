@@ -209,6 +209,61 @@ end
                                     mk(Float16, (72, 8, 1, 1))) === nothing
         end
 
+        # The RESULT type is asked separately from the operand type. A graph that
+        # projects in fp16 and declares an fp32 result is an ordinary export -- it is
+        # what Qwen-Image 2.1 does -- and requiring all four to agree declined 32 of
+        # its attention ops into the three-pass path, ~85 s of a 144 s step.
+        #
+        # The wider destination is a WIDENED fp16 answer and not an fp32 accumulator:
+        # the op's result dtype follows its inputs. That is pinned below, because it
+        # is the one thing about this gate somebody will assume the other way round,
+        # and because it is exactly the property that makes the matmul gate refuse
+        # the same pair. What must NOT be admitted is q, k and v disagreeing with
+        # EACH OTHER, which the testset above pins.
+        @testset "the result type need not be the operand type" begin
+            E, Lq, Lk, H, B = 72, 64, 96, 2, 2
+            scale = Float32(inv(sqrt(E)))
+            qh = Float16.(reshape(0.4 .* sin.(range(0, 9, E*Lq*H*B)), E, Lq, H, B))
+            kh = Float16.(reshape(0.4 .* cos.(range(0, 7, E*Lk*H*B)), E, Lk, H, B))
+            vh = Float16.(reshape(0.4 .* sin.(range(0, 5, E*Lk*H*B)), E, Lk, H, B))
+            q, k, v = MtlArray(qh), MtlArray(kh), MtlArray(vh)
+            ref = bt_attn_ref(qh, kh, vh, Float64(scale))
+
+            # NaN rather than zeros: a plane the op skipped reads as an answer
+            # otherwise, which is how a read-before-write hides.
+            o32 = MtlArray(fill(Float32(NaN), E, Lq, H, B))
+            @test bt_sdpa!(o32, q, k, v, scale) !== nothing
+            o16 = MtlArray(fill(Float16(NaN), E, Lq, H, B))
+            @test bt_sdpa!(o16, q, k, v, scale) !== nothing
+            Metal.synchronize()
+            g32, g16 = Array(o32), Array(o16)
+            @test all(isfinite, g32)
+            @test all(isfinite, g16)
+            e32 = maximum(abs, Float64.(g32) .- ref) / maximum(abs, ref)
+            e16 = maximum(abs, Float64.(g16) .- ref) / maximum(abs, ref)
+            @test e32 < 3e-3
+            # The SAME number, not a smaller one: the op computed in fp16 either
+            # way and the fp32 destination holds that answer widened. Pinned as an
+            # equality so that a future MPSGraph which really does accumulate in
+            # single fails here and gets the docstring corrected, rather than
+            # quietly making a `<=` look prescient.
+            @test e32 == e16
+
+            # fp32 operands with an fp16 destination is the same door, the other way,
+            # and there the operand type is what carries the precision: computed in
+            # single and narrowed once at the end, it beats the fp16 operands above.
+            o = MtlArray(fill(Float16(NaN), E, Lq, H, B))
+            @test bt_sdpa!(o, MtlArray(Float32.(qh)), MtlArray(Float32.(kh)),
+                           MtlArray(Float32.(vh)), scale) !== nothing
+            o32 = MtlArray(fill(Float32(NaN), E, Lq, H, B))
+            @test bt_sdpa!(o32, MtlArray(Float32.(qh)), MtlArray(Float32.(kh)),
+                           MtlArray(Float32.(vh)), scale) !== nothing
+            Metal.synchronize()
+            @test all(isfinite, Array(o))
+            @test maximum(abs, Float64.(Array(o)) .- ref) / maximum(abs, ref) < 3e-3
+            @test maximum(abs, Float64.(Array(o32)) .- ref) / maximum(abs, ref) < e32
+        end
+
         # A projection leaves q, k and v as three windows on ONE buffer. Both have to
         # come out the same: the library reads the window where it lies, by slicing
         # the dense array inside the graph, and a copy of the same bytes into a packed
