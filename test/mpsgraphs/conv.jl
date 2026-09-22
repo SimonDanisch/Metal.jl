@@ -138,4 +138,45 @@ end
         # that was half rather than single would be an order of magnitude over this.
         @test maximum(abs, a .- b) / sc < 1.2 * Float64(eps(Float16(sc))) / 2 / sc
     end
+
+    # A TRANSPOSED convolution is the same node's data gradient, and the layouts line
+    # up without a transposition: ATen's transposed weight is `(KW, KH, Cout ÷ groups,
+    # Cin)`, which reversed is MPSGraph's `OIHW` for the forward convolution that maps
+    # this node's OUTPUT back to its input.
+    #
+    # Checked against that forward convolution rather than against a reimplementation:
+    # `conv_transpose2d(x, W)` scatters exactly what `conv(y, W)` gathers, so summing
+    # the product both ways has to agree. RIFE's decoder upsamples with seven of these
+    # and they were 438 ms of its 581 ms frame on the gather kernel; 21 ms here.
+    @testset "a transposed convolution is the data gradient" begin
+        # Which axis carries the output channels is the one thing that moves.
+        @test CVG.conv2d_shape_supported(mk(Float16, 16, 16, 6, 1), mk(Float16, 8, 8, 4, 1),
+                                         mk(Float16, 4, 4, 6, 4), nothing;
+                                         transposed = true, groups = 1)
+        # The FORWARD reading of the same operands is not a legal shape, so the flag is
+        # doing the work rather than both happening to pass.
+        @test !CVG.conv2d_shape_supported(mk(Float16, 16, 16, 6, 1), mk(Float16, 8, 8, 4, 1),
+                                          mk(Float16, 4, 4, 6, 4), nothing)
+
+        Cin, Cout, W, H = 4, 6, 8, 8
+        xh = Float32.(0.3f0 .* randn(Float32, W, H, Cin, 1))
+        wh = Float32.(0.2f0 .* randn(Float32, 4, 4, Cout, Cin))
+        ot = MtlArray(fill(NaN32, 2W, 2H, Cout, 1))
+        CVG.conv2d_batched!(ot, MtlArray(xh), MtlArray(wh), nothing,
+                            (2, 2), (1, 1), (1, 1), 1, :identity; transposed = true)
+        Metal.synchronize()
+        y = Array(ot)
+        @test all(isfinite, y)
+
+        # `<y, conv_transpose(x, W)> == <conv(y, W), x>`, which is what "data gradient"
+        # means and needs no second implementation of either.
+        yr = Float32.(randn(Float32, 2W, 2H, Cout, 1))
+        fwd = MtlArray(fill(NaN32, W, H, Cin, 1))
+        CVG.conv2d_batched!(fwd, MtlArray(yr), MtlArray(wh), nothing,
+                            (2, 2), (1, 1), (1, 1), 1)
+        Metal.synchronize()
+        lhs = sum(Float64.(yr) .* Float64.(y))
+        rhs = sum(Float64.(Array(fwd)) .* Float64.(xh))
+        @test isapprox(lhs, rhs; rtol = 1e-4)
+    end
 end

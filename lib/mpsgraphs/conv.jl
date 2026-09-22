@@ -8,6 +8,17 @@
 # The layouts line up without a transposition. A reversed-layout `(W, H, C, N)` is
 # MPSGraph's `(N, C, H, W)`, which is its `NCHW`, and `(KW, KH, Cin, Cout)` is
 # `(Cout, Cin, KH, KW)`, which is its `OIHW`. Both are what the descriptor is told.
+#
+# A TRANSPOSED convolution is the same node's data gradient, and needs no separate
+# kernel: `conv_transpose2d(x, W)` is exactly the gradient with respect to the input
+# of the forward convolution that would map the transpose's OUTPUT back to `x`. That
+# forward convolution's weight in `OIHW` is `(Cin, Cout ÷ groups, KH, KW)`, which is
+# what ATen already hands over -- reversed, `(KW, KH, Cout ÷ groups, Cin)` -- so the
+# operands line up here too and only the channel test changes sides.
+#
+# It is worth the wiring. RIFE's decoder upsamples with seven `4x4` stride-2
+# transposes, and on the implicit-GEMM kernel they ran at 0.03-0.04 TFLOP/s and were
+# **75% of the entire frame** (438 ms of 581).
 
 """What makes two convolution graphs the same graph."""
 struct Conv2DGraphKey
@@ -22,6 +33,7 @@ struct Conv2DGraphKey
     dilation::NTuple{2,Int}
     groups::Int
     act::Symbol
+    transposed::Bool
 end
 
 """One built convolution graph and the tensors a call binds."""
@@ -45,9 +57,15 @@ function CachedConv2DGraph(key::Conv2DGraphKey)
     desc = MPSGraphConvolution2DOpDescriptor(
         key.stride, (key.pad[1], key.pad[1], key.pad[2], key.pad[2]),
         key.dilation, key.groups)
-    t = convolution2DWithSourceTensor(
-        graph, reshapebound(graph, px, bx, key.dims_x, "xnd"),
-        reshapebound(graph, pw, bw, key.dims_w, "wnd"), desc)
+    xnd = reshapebound(graph, px, bx, key.dims_x, "xnd")
+    wnd = reshapebound(graph, pw, bw, key.dims_w, "wnd")
+    # The descriptor is the FORWARD convolution's in both cases. For the transpose
+    # that forward convolution runs the other way -- from this node's output shape to
+    # its input -- and the same stride, padding, dilation and groups describe it.
+    t = key.transposed ?
+        convolution2DDataGradientWithIncomingGradientTensor(
+            graph, xnd, wnd, convert(MPSShape, reverse(collect(key.dims_o))), desc) :
+        convolution2DWithSourceTensor(graph, xnd, wnd, desc)
     # The EPILOGUE in Float32 whenever there is one at all, which is stricter than
     # `gemm_batched!`. A convolution's other lowering here accumulates into a Float32
     # scratch and converts ONCE, in its epilogue pass — so adding the bias in half
@@ -90,7 +108,8 @@ graph has a node for, and a destination no wider than them — `convolution2DWit
 has no compute type any more than the product does, so a half convolution asked for in
 single is a half convolution cast afterwards.
 """
-function conv2d_shape_supported(out, x, w, bias, act::Symbol = :identity)
+function conv2d_shape_supported(out, x, w, bias, act::Symbol = :identity;
+                                transposed::Bool = false, groups::Int = 1)
     act in GEMM_ACTIVATIONS || return false
     all(v -> applicable(ndims, v) && applicable(eltype, v) && applicable(size, v),
         (out, x, w)) || return false
@@ -99,7 +118,15 @@ function conv2d_shape_supported(out, x, w, bias, act::Symbol = :identity)
     eltype(w) === T || return false
     (T === Float16 || T === Float32) || return false
     eltype(out) === T || return false
-    size(out, 3) == size(w, 4) || return false
+    # Which axis of the weight carries the OUTPUT channels is the one thing the
+    # transpose changes: ATen's forward weight is `(KW, KH, Cin ÷ groups, Cout)` and
+    # its transposed weight is `(KW, KH, Cout ÷ groups, Cin)`.
+    if transposed
+        size(x, 3) == size(w, 4) || return false
+        size(out, 3) == size(w, 3) * groups || return false
+    else
+        size(out, 3) == size(w, 4) || return false
+    end
     size(out, 4) == size(x, 4) || return false
     for v in (out, x, w)
         bindshape(size(v), eltype(v)) === nothing && return false
@@ -127,14 +154,14 @@ and kept.
 function conv2d_batched!(out::MtlArray, x::MtlArray, w::MtlArray, bias,
                          stride::NTuple{2,Int}, pad::NTuple{2,Int},
                          dilation::NTuple{2,Int}, groups::Int,
-                         act::Symbol = :identity)
-    conv2d_shape_supported(out, x, w, bias, act) || throw(ArgumentError(
+                         act::Symbol = :identity; transposed::Bool = false)
+    conv2d_shape_supported(out, x, w, bias, act; transposed, groups) || throw(ArgumentError(
         "conv2d_batched!: these operands are not ones MPSGraph can be given — " *
         "$(size(x)) * $(size(w)) into $(size(out)), $(eltype(x))/$(eltype(out)), " *
         "activation :$act. Ask `conv2d_shape_supported` first."))
     key = Conv2DGraphKey(size(x), size(w), size(out), eltype(x), eltype(out),
                          bias === nothing ? nothing : eltype(bias),
-                         stride, pad, dilation, groups, act)
+                         stride, pad, dilation, groups, act, transposed)
     cached = @lock _conv2d_graph_cache_lock get!(_conv2d_graph_cache, key) do
         CachedConv2DGraph(key)
     end
