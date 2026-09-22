@@ -1,23 +1,21 @@
 export MtlThreadGroupArray
 
 """
-    MtlThreadGroupArray(::Type{T}, dims[, id])
+    MtlThreadGroupArray(::Type{T}, dims)
 
 Create an array local to each threadgroup launched during kernel execution.
-`id` distinguishes multiple allocations of the same type and shape in one
-kernel; callers with more than one such allocation should pass distinct `Val`s.
 """
-@inline function MtlThreadGroupArray(::Type{T}, dims, id::Val=Val(0)) where {T}
+@inline function MtlThreadGroupArray(::Type{T}, dims) where {T}
     len = prod(dims)
     # NOTE: this relies on const-prop to forward the literal length to the generator.
     #       maybe we should include the size in the type, like StaticArrays does?
-    ptr = emit_threadgroup_memory(T, Val(len), id)
+    ptr = emit_threadgroup_memory(T, Val(len))
     MtlDeviceArray(dims, ptr)
 end
 
 # get a pointer to threadgroup memory, with known (static) or zero length (dynamic)
-@generated function emit_threadgroup_memory(::Type{T}, ::Val{len}=Val(0),
-                                             ::Val{id}=Val(0)) where {T,len,id}
+@generated function emit_threadgroup_memory(::Type{T}, ::Val{len} = Val(0),
+                                            ::Val{id} = Val(0)) where {T, len, id}
     Context() do ctx
         # XXX: as long as LLVMPtr is emitted as i8*, it doesn't make sense to type the GV
         eltyp = convert(LLVMType, LLVM.Int8Type())
