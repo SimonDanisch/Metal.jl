@@ -84,6 +84,9 @@ function free(buf::MTLBuffer)
     sz::Int = buf.length
 
     time = Base.@elapsed begin
+        # Out of its residency set BEFORE the release, or the release frees nothing:
+        # a set holds a strong reference to everything in it. See `forget_resident!`.
+        forget_resident!(buf)
         release(buf)
     end
 

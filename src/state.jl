@@ -218,11 +218,110 @@ reached from `adapt_storage` — once per baked address per LAUNCH, not once per
 buffer as its docstring assumed. Measured on a still Hikari frame: 1382 calls per
 sample, the largest single source of allocation in the render.
 
-Pointers are safe as keys here because nothing ever removes an allocation from
-these sets: a set holds a strong reference to everything in it, so an address
-inside one cannot be reused by a later buffer while the record still names it.
+A pointer is a safe key only because an allocation leaves a set exactly once, when
+it is FREED (`forget_resident!`), and its memory is released after that — so an
+address inside a set cannot be reused by a later buffer while the set still names
+it.
+
+This comment used to say "nothing ever removes an allocation from these sets", and
+that was the leak: a set holds a STRONG reference to everything in it, so a buffer
+made resident once was immortal however many times Julia freed it. Qwen-Image
+2.1's denoiser is 7.26 GB of weights, every one of them reached by a baked address
+and therefore resident; releasing the model gave back nothing. Measured on this
+machine: 1170 allocations totalling 22.0 GB, 775 of them freed totalling 16.1 GB,
+and the device still reporting 15.1 GiB in use.
 """
 const residency_members = Dict{UInt,Set{UInt}}()
+
+"""
+Buffers freed while `queue_residency_sets_lock` was busy, to be taken out of their
+set by the next caller that gets it.
+
+`free` runs from a FINALIZER, and a finalizer that blocks on a lock another thread
+is inside deadlocks. So the free path only ever `trylock`s, and what it cannot do
+now it leaves here. Deferring is safe: the set's own reference is what keeps the
+allocation alive, so a buffer waiting here is not dangling — it is merely still
+resident, which is the state it was already in.
+"""
+const pending_residency_drops = Vector{Any}()
+const pending_residency_lock = ReentrantLock()
+
+"""Buffers neither dropped nor deferred, because both `trylock`s lost. Observable
+rather than silent: a number that grows is this scheme failing."""
+const residency_drop_misses = Threads.Atomic{Int}(0)
+
+"""
+    forget_resident!(buf)
+
+Take `buf` out of every residency set that holds it, so that releasing it actually
+frees it. Called by [`free`](@ref), which runs from a finalizer — hence `trylock`
+throughout and [`pending_residency_drops`](@ref) for what has to wait.
+"""
+function forget_resident!(buf)
+    if trylock(queue_residency_sets_lock)
+        try
+            drop_resident_locked!(buf)
+            flush_pending_drops_locked!()
+        finally
+            unlock(queue_residency_sets_lock)
+        end
+        return nothing
+    end
+    if trylock(pending_residency_lock)
+        try
+            push!(pending_residency_drops, buf)
+        finally
+            unlock(pending_residency_lock)
+        end
+        return nothing
+    end
+    Threads.atomic_add!(residency_drop_misses, 1)
+    return nothing
+end
+
+"""One buffer out of whichever set holds it. `queue_residency_sets_lock` held."""
+function drop_resident_locked!(buf)
+    p = UInt(pointer(buf))
+    for (_, resset) in queue_residency_sets
+        members = get(residency_members, UInt(pointer(resset)), nothing)
+        members === nothing && continue
+        p in members || continue
+        delete!(members, p)
+        MTL.remove_allocation!(resset, buf)
+        # One `commit` per set per call. Batched with the deferred ones below,
+        # which is why they are flushed from here rather than each on its own.
+        MTL.commit!(resset)
+    end
+    return nothing
+end
+
+"""Everything that had to wait. `queue_residency_sets_lock` held."""
+function flush_pending_drops_locked!()
+    isempty(pending_residency_drops) && return 0
+    trylock(pending_residency_lock) || return 0
+    drops = try
+        d = copy(pending_residency_drops); empty!(pending_residency_drops); d
+    finally
+        unlock(pending_residency_lock)
+    end
+    for b in drops
+        drop_resident_locked!(b)
+    end
+    return length(drops)
+end
+
+"""
+    trim_residency!() -> Int
+
+Take every freed-but-still-resident buffer out of its set, now, and say how many.
+
+The free path defers whatever it could not do without blocking a finalizer; this
+is the caller saying "I have finished with a model and want the memory back" —
+the same explicit trim a pool has, for the same reason.
+"""
+function trim_residency!()
+    Base.@lock queue_residency_sets_lock flush_pending_drops_locked!()
+end
 
 command_queue_key(queue::MTLCommandQueue) = UInt(pointer(queue))
 
