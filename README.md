@@ -33,8 +33,8 @@ if you want to use it. PRs are very [welcome](#contributing)!
 ## Requirements
 
 -  Mac device with M-series chip
--  Julia 1.10-1.12
--  macOS 14-26
+-  Julia 1.10-1.13
+-  macOS 14-27
 
 These requirements are fairly strict, and are due to our limited development
 resources (manpower, hardware). Supported OS versions follow Apple's support,
@@ -62,22 +62,26 @@ importing the package:
 ```julia-repl
 julia> using Metal
 
-julia> Metal.versioninfo()
-macOS 26.6.1, Darwin 25.6.0
+julia> using Metal; Metal.versioninfo()
+macOS 27.0.0, Darwin 27.0.0
 
 Toolchain:
-- Julia: 1.12.7
-- LLVM: 18.1.7
-- Metal: 4.0 (MSL), 2.8 (AIR), 1.2.9 (metallib)
+- Julia: 1.13.0
+- LLVM: 20.1.8
+- Metal: 4.1 (MSL), 2.9 (AIR), 1.2.9 (metallib)
 
 Julia packages:
-- Metal.jl: 1.10.3
-- GPUArrays: 11.5.11
-- GPUCompiler: 2.2.1
+- Metal.jl: 1.11.0
+- GPUArrays: 11.5.14
+- GPUCompiler: 2.7.0
 - KernelAbstractions: 0.9.42
 - ObjectiveC: 6.0.1
-- LLVM: 9.13.0
-- LLVMDowngrader_jll: 0.9.0+0
+- LLVM: 9.13.1
+- LLVMDowngrader_jll: 0.10.0+1
+
+Kernel cache:
+- binary archives: enabled
+  (0 hits, 0 misses this session)
 
 1 device:
 - Apple M2 Max (30 GPU cores, 64.000 KiB allocated; Apple8, Metal4 family)

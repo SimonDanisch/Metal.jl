@@ -155,6 +155,16 @@ end
     end
 end
 
+# Cube root has an accurate refinement and a division-free fast-math polynomial.
+@testset "cbrt" begin
+    precise_ir = sprint(io -> Metal.code_llvm(io, x -> cbrt(x), Tuple{Float32}))
+    fast_ir = sprint(io -> Metal.code_llvm(io, x -> (@fastmath cbrt(x)), Tuple{Float32}))
+    @test occursin("fdiv fast float", precise_ir)
+    @test !occursin(r"\bfdiv\b", fast_ir)
+    @test !occursin(r"\bdouble\b", precise_ir)
+    @test !occursin(r"\bdouble\b", fast_ir)
+end
+
 # individually-shaped float intrinsics.
 @testset "misc" begin
     @eval begin
@@ -455,6 +465,51 @@ end
         buffer = MtlArray(arr)
         vec = acosh.(buffer)
         @test Array(vec) ≈ acosh.(arr)
+    end
+
+    let # cbrt
+        specials = T[0, -0.0, Inf, -Inf, NaN, 1, -1, 8, -27, 1000,
+                     floatmax(T), -floatmax(T), floatmin(T), nextfloat(zero(T)), -nextfloat(zero(T))]
+        # Exercise every exponent and each subnormal normalization shift, including
+        # values on either side of the boundaries.
+        powers = T[ldexp(one(T), e) for e in
+                   exponent(nextfloat(zero(T))):exponent(floatmax(T))]
+        boundaries = vcat(prevfloat.(powers), powers, nextfloat.(powers))
+        arr = vcat(specials, boundaries, -boundaries,
+                   reinterpret.(T, rand(Base.uinttype(T), 1024)))
+        if T === Float32
+            # Inputs with the largest measured errors in the precise and fast paths.
+            hard = reinterpret(Float32, UInt32[0x000db5b0, 0x000db5b1, 0x000db5b2,
+                                               0x40fa9b03, 0x40fa9b04, 0x40fa9b05])
+            append!(arr, hard)
+            append!(arr, -hard)
+        end
+        got = Array(cbrt.(MtlArray(arr)))
+        expected = cbrt.(arr)
+        @test all(got[i] === expected[i] for i in eachindex(specials) if !isnan(specials[i]))
+        @test all(isnan, got[isnan.(arr)])
+        # Allow one representable step from the CPU result.
+        ulps(a, b) = abs(Int(reinterpret(Base.uinttype(T), a)) - Int(reinterpret(Base.uinttype(T), b)))
+        @test all(isnan(expected[i]) || ulps(got[i], expected[i]) <= 1 for i in eachindex(arr))
+        @test all(signbit.(got) .== signbit.(expected))
+        if T === Float32
+            # A Float64 reference distinguishes nearly half-ulp errors from a full ulp.
+            @test all(eachindex(arr)) do i
+                !isfinite(arr[i]) && return true
+                ref = cbrt(Float64(arr[i]))
+                abs(Float64(got[i]) - ref) <= 0.51 * Float64(eps(Float32(ref)))
+            end
+            fastgot = Array(map(x -> (@fastmath cbrt(x)), MtlArray(arr)))
+            @test all(eachindex(arr)) do i
+                x = arr[i]
+                if !isfinite(x) || iszero(x)
+                    return reinterpret(UInt32, fastgot[i]) == reinterpret(UInt32, x)
+                end
+                ref = cbrt(Float64(x))
+                abs(Float64(fastgot[i]) - ref) <= 2.5 * Float64(eps(Float32(ref)))
+            end
+            @test all(signbit.(fastgot) .== signbit.(arr))
+        end
     end
 
     let # rsqrt (Metal-specific, no Base equivalent; compare the GPU intrinsic to 1/sqrt)
