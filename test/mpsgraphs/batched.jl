@@ -162,6 +162,20 @@ end
         end
         @test_throws ArgumentError BTG.gemm_batched!(
             MtlArray(zeros(Float16, Mw, Nw)), A, B, nothing, :softplus)
+
+        # An INTEGER operand is the one that used to end the process rather than
+        # the call. This graph hands its placeholders straight to `mps.matmul`,
+        # which has no integer node — "operand #0 must be tensor of floating
+        # point values" — and MPSGraph answers by failing its own module
+        # verification and calling `abort()`. Nothing to catch, no Julia frame.
+        # Reachable because `MPSGRAPH_VALID_MATMUL_TYPES` lists `Int8` pairs, so
+        # a caller reading that table would believe this works; what makes it
+        # true for `graph_matmul!` is that THAT graph casts both operands first.
+        let Ai = MtlArray(fill(Int8(1), Mw, 8)), Bi = MtlArray(fill(Int8(1), 8, Nw))
+            @test !BTG.gemm_shape_supported(MtlArray(zeros(Float16, Mw, Nw)), Ai, Bi, nothing)
+            @test_throws ArgumentError BTG.gemm_batched!(
+                MtlArray(zeros(Float16, Mw, Nw)), Ai, Bi)
+        end
     end
 
     @testset "which operands the product admits" begin

@@ -289,6 +289,18 @@ function gemm_batched!(C::Metal.MtlMatrix, A::Metal.MtlMatrix, B::Metal.MtlMatri
                        bias = nothing, act::Symbol = :identity)
     size(A, 2) == size(B, 1) && size(C) == (size(A, 1), size(B, 2)) ||
         throw(DimensionMismatch("gemm_batched!: $(size(A)) * $(size(B)) into $(size(C))"))
+    # Shapes were the only thing checked here, and the types are what ABORT.
+    # This graph feeds its placeholders straight into `mps.matmul` -- unlike
+    # `graph_matmul!`, which casts both operands to a common type first -- so an
+    # integer operand reaches a node that has none: "operand #0 must be tensor of
+    # floating point values". MPSGraph answers that by failing its own module
+    # verification and calling `abort()`, which takes the Julia process with it,
+    # with no exception to catch and nothing in the backtrace above Apple's
+    # assert. `conv2d_batched!` guards the same way for the same reason.
+    gemm_shape_supported(C, A, B, bias, act) || throw(ArgumentError(
+        "gemm_batched!: these operands are not ones MPSGraph can be given — " *
+        "$(size(A)) * $(size(B)) into $(size(C)), $(eltype(A))/$(eltype(B))/" *
+        "$(eltype(C)), activation :$act. Ask `gemm_shape_supported` first."))
     bias === nothing || length(bias) == size(C, 1) ||
         throw(DimensionMismatch("gemm_batched!: bias of $(length(bias)) for " *
                                 "$(size(C, 1)) rows"))
