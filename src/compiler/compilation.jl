@@ -886,7 +886,16 @@ end
             # the back-end compiler likely failed
             # XXX: check more accurately? the error domain doesn't help much here
             air_file, metallib_file = dump_artifacts(".air" => air, ".metallib" => metallib)
-            error("""Compilation to native code failed; see below for details.
+            # The driver's own explanation, which this used to throw away: the
+            # message named two temporary files and no reason, so every back-end
+            # compile failure looked identical and none of them said what was
+            # wrong. `localizedDescription` is where Metal puts it.
+            why = try
+                String(err.localizedDescription)
+            catch
+                "(the NSError carried no localizedDescription)"
+            end
+            error("""Compilation to native code failed: $(why)
                      If you think this is a bug, please file an issue and attach:
                      - $(air_file)
                      - $(metallib_file)""")
