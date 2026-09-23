@@ -206,7 +206,16 @@ function can_use_residency_sets(dev::MTLDevice)
     end::Bool
 end
 
+# Keyed by DEVICE, not by queue. `global_queue` is task-local, so a queue-keyed set
+# meant every task got its own — and `make_persistently_resident!` then added a buffer
+# to whichever set the baking task happened to have, leaving it unmapped for a launch
+# submitted from any other task. That reads as zeros, silently, which is the black
+# image texture in Raycore. A residency set may be attached to more than one queue,
+# so one per device and attached to each queue is both correct and what "persistently
+# resident" already claimed to mean.
 const queue_residency_sets = Dict{UInt,MTLResidencySet}()
+"""Queues this device's residency set has already been attached to."""
+const residency_attached_queues = Set{UInt}()
 const queue_residency_sets_lock = ReentrantLock()
 
 """
@@ -326,33 +335,42 @@ end
 command_queue_key(queue::MTLCommandQueue) = UInt(pointer(queue))
 
 function install_queue_residency!(queue::MTLCommandQueue, dev::MTLDevice)
-    key = command_queue_key(queue)
-    Base.@lock queue_residency_sets_lock begin
-        cached_resset = get(queue_residency_sets, key, nothing)
-        cached_resset === nothing || return cached_resset
+    devkey = UInt(pointer(dev))
+    qkey = command_queue_key(queue)
+    # Fast path only when the set exists AND this queue already has it. A queue
+    # created after the set is the whole bug, so "set exists" is not enough.
+    fast = Base.@lock queue_residency_sets_lock begin
+        resset = get(queue_residency_sets, devkey, nothing)
+        resset !== nothing && qkey in residency_attached_queues ? resset : nothing
     end
+    fast === nothing || return fast
 
     malloc_buf = malloc_buffer(dev)
     exc_buf = exception_info_buffer(dev)
 
     Base.@lock queue_residency_sets_lock begin
-        cached_resset = get(queue_residency_sets, key, nothing)
-        cached_resset === nothing || return cached_resset
+        resset = get(queue_residency_sets, devkey, nothing)
+        if resset === nothing
+            desc = MTLResidencySetDescriptor()
+            desc.initialCapacity = 2
+            @label! desc "Metal scratch buffers"
 
-        desc = MTLResidencySetDescriptor()
-        desc.initialCapacity = 2
-        @label! desc "Metal scratch buffers"
-
-        resset = MTLResidencySet(dev, desc)
-        MTL.add_allocation!(resset, malloc_buf)
-        MTL.add_allocation!(resset, exc_buf)
-        MTL.commit!(resset)
-        MTL.add_residency_set!(queue, resset)
-        queue_residency_sets[key] = resset
-        finalizer(queue) do _
-            Base.@lock queue_residency_sets_lock begin
-                get(queue_residency_sets, key, nothing) === resset &&
-                    delete!(queue_residency_sets, key)
+            resset = MTLResidencySet(dev, desc)
+            MTL.add_allocation!(resset, malloc_buf)
+            MTL.add_allocation!(resset, exc_buf)
+            MTL.commit!(resset)
+            queue_residency_sets[devkey] = resset
+        end
+        # Every queue gets the DEVICE's set, including ones created long after a
+        # buffer was made resident. The set outlives any one queue now, so the
+        # finalizer forgets the attachment and not the set.
+        if !(qkey in residency_attached_queues)
+            MTL.add_residency_set!(queue, resset)
+            push!(residency_attached_queues, qkey)
+            finalizer(queue) do _
+                Base.@lock queue_residency_sets_lock begin
+                    delete!(residency_attached_queues, qkey)
+                end
             end
         end
         return resset
