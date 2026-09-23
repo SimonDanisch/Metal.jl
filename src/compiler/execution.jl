@@ -327,9 +327,31 @@ end
 # workload only inferred the kernel without compiling it. The `compile_hook` check
 # additionally forces the compile path so reflection-style consumers (`@device_code_*`)
 # observe the compilation even on a cache hit.
+# How often a kernel was served from the compile cache, and how often it had to be
+# built. The same two numbers Lava reports for its frozen SPIR-V, so that Mantle's
+# `kernelcompiles` reads alike on both backends rather than each inventing a shape.
+#
+# `Ref` and not `Threads.Atomic`, matching Lava: these are diagnostics, and a lost
+# increment under contention costs a count, not correctness.
+const COMPILE_HITS = Ref(0)
+const COMPILE_MISSES = Ref(0)
+
+"""
+    compile_stats() -> (; hits, misses)
+
+Kernels served from the compile cache, and kernels built because they were not in
+it. Read through `Mantle.kernelcompiles(device)`; reset with
+[`reset_compile_stats!`](@ref).
+"""
+compile_stats() = (; hits = COMPILE_HITS[], misses = COMPILE_MISSES[])
+
+"""Zero both counters, so a measured region starts from a known point."""
+reset_compile_stats!() = (COMPILE_HITS[] = 0; COMPILE_MISSES[] = 0; nothing)
+
 function compile_or_lookup(@nospecialize(job::CompilerJob))::MetalResults
     res = GPUCompiler.cached_results(MetalResults, job)
     if res === nothing || res.metallib === nothing || GPUCompiler.compile_hook[] !== nothing
+        COMPILE_MISSES[] += 1
         artifacts = compile_to_metallib(job)
         res = @something res GPUCompiler.cached_results(MetalResults, job)
         res.air = artifacts.air
@@ -337,6 +359,8 @@ function compile_or_lookup(@nospecialize(job::CompilerJob))::MetalResults
         res.entry = artifacts.entry
         res.loggingEnabled = artifacts.loggingEnabled
         res.relocations = artifacts.relocations
+    else
+        COMPILE_HITS[] += 1
     end
     return res
 end
