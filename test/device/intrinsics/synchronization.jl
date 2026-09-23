@@ -180,3 +180,32 @@ end # static
 end # threadgroup memory
 
 end # memory
+
+# `MtlThreadGroupArray` had only a two-argument method, so every allocation in a kernel
+# took the generator's default `id` of 0. `emit_threadgroup_memory` has always carried the
+# id -- it names the backing global `threadgroup_memory_$id` -- there was simply no way to
+# reach it from a kernel. Fused attention raises seven threadgroup arrays and names each
+# one, so it did not compile at all: `jl_f_throw_methoderror` in the IR, which reads as a
+# rejected kernel rather than as a missing method.
+@testset "MtlThreadGroupArray takes an id" begin
+    function tg_ids!(out)
+        a = MtlThreadGroupArray(Float32, (4,), Val(0))
+        b = MtlThreadGroupArray(Float32, (4,), Val(1))
+        i = thread_position_in_threadgroup_1d()
+        a[i] = 1f0
+        b[i] = 2f0
+        threadgroup_barrier(Metal.MemoryFlagThreadGroup)
+        out[i] = a[i]
+        out[i + 4] = b[i]
+        return
+    end
+    out = MtlArray(zeros(Float32, 8))
+    Metal.@metal threads=4 tg_ids!(out)
+    # Same element type and same length under two ids: separate memory, not one array
+    # written twice.
+    @test Array(out) == Float32[1, 1, 1, 1, 2, 2, 2, 2]
+
+    # The id is optional, and the two-argument form still means id 0.
+    @test hasmethod(MtlThreadGroupArray, Tuple{Type{Float32}, Tuple{Int}})
+    @test hasmethod(MtlThreadGroupArray, Tuple{Type{Float32}, Tuple{Int}, Val{3}})
+end

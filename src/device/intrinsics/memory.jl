@@ -1,15 +1,21 @@
 export MtlThreadGroupArray
 
 """
-    MtlThreadGroupArray(::Type{T}, dims)
+    MtlThreadGroupArray(::Type{T}, dims, [::Val{id}])
 
 Create an array local to each threadgroup launched during kernel execution.
+
+`id` names the backing global, `threadgroup_memory_\$id`, and keys the generator along
+with `T` and the length. Two arrays raised under the default `Val(0)` still come out
+distinct — the linker renames the colliding global — but they are distinct by accident
+of that rename rather than by construction. Give each allocation its own `id` when a
+kernel wants several, so the IR says which is which.
 """
-@inline function MtlThreadGroupArray(::Type{T}, dims) where {T}
+@inline function MtlThreadGroupArray(::Type{T}, dims, id::Val = Val(0)) where {T}
     len = prod(dims)
     # NOTE: this relies on const-prop to forward the literal length to the generator.
     #       maybe we should include the size in the type, like StaticArrays does?
-    ptr = emit_threadgroup_memory(T, Val(len))
+    ptr = emit_threadgroup_memory(T, Val(len), id)
     MtlDeviceArray(dims, ptr)
 end
 
