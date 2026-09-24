@@ -66,6 +66,35 @@ function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLBuffer, doff::Integer,
                                           destinationBytesPerImage:bytes_per_image::NSUInteger]::Nothing
 end
 
+"""
+    append_copy!(enc, dst::MTLTexture, origin, size, src::MTLBuffer, soff,
+                 bytes_per_row, bytes_per_image, slice = 0, level = 0)
+
+Copy buffer memory into a texture region: the mirror of the method above.
+
+The way ONTO a texture that is ordered with the rest of a queue. `replaceRegion`
+writes from the CPU the moment it is called, while a command buffer that samples
+the texture may still be running; a blit is encoded like any other command and
+waits its turn. It is also the only way onto a PRIVATE texture, and the way to
+fill one from data that is already on the device without a host round trip.
+
+`bytes_per_image` may be 0 for a 2D copy.
+"""
+function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLTexture, origin::MTLOrigin,
+                      size::MTLSize, src::MTLBuffer, soff::Integer,
+                      bytes_per_row::Integer, bytes_per_image::Integer,
+                      slice::Integer = 0, level::Integer = 0)
+    @objc [enc::id{MTLBlitCommandEncoder} copyFromBuffer:src::id{MTLBuffer}
+                                          sourceOffset:soff::NSUInteger
+                                          sourceBytesPerRow:bytes_per_row::NSUInteger
+                                          sourceBytesPerImage:bytes_per_image::NSUInteger
+                                          sourceSize:size::MTLSize
+                                          toTexture:dst::id{MTLTexture}
+                                          destinationSlice:slice::NSUInteger
+                                          destinationLevel:level::NSUInteger
+                                          destinationOrigin:origin::MTLOrigin]::Nothing
+end
+
 # only for managed resources
 function append_sync!(enc::MTLBlitCommandEncoder, src::MTLBuffer)
     @objc [enc::id{MTLBlitCommandEncoder} synchronizeResource:src::id{MTLBuffer}]::Nothing
