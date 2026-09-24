@@ -62,8 +62,12 @@ mutable struct MetalResults
     relocations::Union{Nothing, GPUCompiler.Relocations}
     # host-side objects (session-local)
     pipelines::Vector{Tuple{MTLDevice, MTLComputePipelineState}}
+    # Built with `supportIndirectCommandBuffers`: a different object from the one
+    # a `@metal` launch wants, so a separate list rather than a flag on the other.
+    indirect_pipelines::Vector{Tuple{MTLDevice, MTLComputePipelineState}}
     reloc_tables::Vector{Tuple{MTLDevice, MTLBuffer}}
     MetalResults() = new(nothing, nothing, nothing, nothing, nothing,
+                         Tuple{MTLDevice, MTLComputePipelineState}[],
                          Tuple{MTLDevice, MTLComputePipelineState}[],
                          Tuple{MTLDevice, MTLBuffer}[])
 end

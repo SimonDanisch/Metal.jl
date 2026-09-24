@@ -260,18 +260,21 @@ function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, indirect::Bool=false,
         # Resolve the MTLComputePipelineState for the active device. Linear scan
         # over the session-local cache; almost always n=1, one `===` compare.
         #
-        # `indirect` skips that cache in both directions: a pipeline built with
-        # `supportIndirectCommandBuffers` is a different object from the one a
-        # `@metal` launch wants, and the cache is keyed by device alone. A caller
-        # asking for one holds it — Mantle's recorder builds it once per dispatch
-        # when a plan compiles — so there is nothing here to cache it for.
+        # An `indirect` pipeline — built with `supportIndirectCommandBuffers` — is a
+        # different object from the one a `@metal` launch wants, so it has its own
+        # list. It used to be built afresh on every call, on the reasoning that the
+        # caller holds it; but Mantle's recorder asks again every time a plan is
+        # REBUILT, and a RayMakie material switch rebuilds the renderer's plans.
+        # Measured on the isubd demo: 136 pipelines re-linked from code that was
+        # already compiled, 95 s of a 147 s stall, each one a native compile of
+        # the linked traversal. A pipeline state is immutable and may be named by
+        # any number of commands, so sharing it is safe.
+        pipes = indirect ? res.indirect_pipelines : res.pipelines
         pipeline = Ref{MTLComputePipelineState}()
-        if !indirect
-            @inbounds for (cached_dev, cached_pipeline) in res.pipelines
-                if cached_dev === dev
-                    pipeline[] = cached_pipeline
-                    break
-                end
+        @inbounds for (cached_dev, cached_pipeline) in pipes
+            if cached_dev === dev
+                pipeline[] = cached_pipeline
+                break
             end
         end
         if !isassigned(pipeline)
@@ -281,8 +284,8 @@ function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, indirect::Bool=false,
             # Don't cache session-local pipeline handles while precompiling: the
             # results struct is serialized into the package image along with its
             # CodeInstance, and ObjectiveC handles would come back dangling.
-            if !indirect && ccall(:jl_generating_output, Cint, ()) != 1
-                push!(res.pipelines, (dev, pipeline[]))
+            if ccall(:jl_generating_output, Cint, ()) != 1
+                push!(pipes, (dev, pipeline[]))
             end
         end
 
@@ -348,7 +351,9 @@ compile_stats() = (; hits = COMPILE_HITS[], misses = COMPILE_MISSES[])
 """Zero both counters, so a measured region starts from a known point."""
 reset_compile_stats!() = (COMPILE_HITS[] = 0; COMPILE_MISSES[] = 0; nothing)
 
-function compile_or_lookup(@nospecialize(job::CompilerJob))::MetalResults
+# Specialize on the target/parameter types so callers can avoid boxing CompilerJob.
+# Keep the body out of callers that specialize per kernel. (Upstream #967.)
+@noinline function compile_or_lookup(job::CompilerJob)::MetalResults
     res = GPUCompiler.cached_results(MetalResults, job)
     if res === nothing || res.metallib === nothing || GPUCompiler.compile_hook[] !== nothing
         COMPILE_MISSES[] += 1
