@@ -870,10 +870,14 @@ function stage_air_text(f, tt, stage::Symbol, name::String)
     job = Metal.GPUCompiler.CompilerJob(Metal.methodinstance(typeof(f), tt), cfg)
     bytes = Metal.compile_to_metallib(job).metallib
     fn = only(read(IOBuffer(bytes), Metal.MetalLib).functions)
-    bc, ll = tempname() * ".bc", tempname() * ".ll"
-    write(bc, fn.air_module)
-    run(`$(Metal.LLVMDowngrader_jll.llvm_dis_14()) -o $ll $bc`)
-    return read(ll, String)
+    # Parsed in process, not disassembled by `llvm-dis`. The tool was reached as
+    # `LLVMDowngrader_jll.llvm_dis_14()`, which that package does not export on
+    # every version it resolves to — and an `UndefVarError` inside a testset
+    # ABORTS THE FILE, so every testset after this one silently did not run.
+    # `LLVM.jl` is already a dependency here and already parses this module.
+    LLVM.@dispose ctx = LLVM.Context() begin
+        return string(parse(LLVM.Module, fn.air_module))
+    end
 end
 
 @testset "a texture argument reaches AIR as an opaque texture pointer" begin
@@ -885,12 +889,17 @@ end
     @test occursin("%struct._sampler_t = type opaque", air)
 
     entry = only(filter(l -> startswith(l, "define"), split(air, '\n')))
-    @test occursin("%struct._texture_2d_t addrspace(1)*", entry)
-    @test occursin("%struct._sampler_t addrspace(2)*", entry)
-    # …and NOT the downgrader's stand-in for a pointee it could not work out,
-    # which is what the parameters degrade to the moment the `byref` is lost.
-    @test !occursin("{} addrspace(1)*", entry)
-    @test !occursin("{} addrspace(2)*", entry)
+    # OPAQUE-POINTER spelling: `ptr addrspace(1) byref(%struct._texture_2d_t)`.
+    # These read `%struct._texture_2d_t addrspace(1)*` when the text came from
+    # `llvm-dis-14`, which still printed typed pointers. The PROPERTY is the
+    # same and is what matters — the parameter is a pointer to the texture
+    # handle type, in the texture address space, and the pointee is still named.
+    @test occursin("ptr addrspace(1) byref(%struct._texture_2d_t)", entry)
+    @test occursin("ptr addrspace(2) byref(%struct._sampler_t)", entry)
+    # …and NOT a pointee it could not work out, which is what the parameters
+    # degrade to the moment the `byref` is lost — the crash this pins.
+    @test !occursin("byref({})", entry)
+    @test occursin("byref(", entry)
 
     # The argument metadata names them as a texture and a sampler rather than as
     # the buffers the kernel ABI made them, each with its own location namespace.
@@ -965,4 +974,148 @@ end
     mid = ((H ÷ 2) * W + (W ÷ 2)) * 4
     @test px[mid + 1] == 0x00 && px[mid + 2] == 0xff && px[mid + 3] == 0x00
     @test count(i -> px[4i + 2] > 0x80, 0:(W*H - 1)) > 500
+end
+
+# ── A VISIBLE function ───────────────────────────────────────────────────────
+
+struct VisOut
+    v::NTuple{4,Float32}
+end
+
+# The shape a procedural ray-tracing candidate needs — `(prim, o, d, best)` in,
+# `(hit, t, a, b)` out. Written like a fragment stage, with a trailing output
+# pointer, because that is what `stage_return!` turns into a real AIR return.
+function vis_candidate(prim::UInt32, ox::Float32, oy::Float32, oz::Float32,
+                       dx::Float32, dy::Float32, dz::Float32, best::Float32,
+                       out::Core.LLVMPtr{VisOut,1})
+    t = ox * dx + oy * dy + oz * dz + Float32(prim)
+    Base.unsafe_store!(out, VisOut((t < best ? 1f0 : 0f0, t, 0.25f0, 0.5f0)))
+    return nothing
+end
+
+const VIS_TT = Tuple{UInt32, Float32, Float32, Float32, Float32, Float32, Float32,
+                     Float32, Core.LLVMPtr{VisOut,1}}
+
+"""What `vis_candidate` computes, on the host."""
+vis_ref(i) = (1f0, 1f0*0.5f0 + 2f0*0.25f0 + 3f0*0.125f0 + Float32(i), 0.25f0, 0.5f0)
+
+@testset "a Julia function compiles to an AIR visible function" begin
+    # Why this exists: `metal::raytracing::intersector<>` and
+    # `intersection_query<>` are C++ class templates the Metal frontend
+    # instantiates and inlines, so a traversal LOOP can only be MSL — while the
+    # body that has to run for a procedural box (Hikari's Newton solve) is
+    # Julia. A `[[visible]]` function is the join: MSL runs the query, this runs
+    # the solve, and only scalars cross.
+    dev = Metal.device()
+    cfg = compiler_config(dev; stage = :visible, name = "vis_candidate")
+    job = Metal.GPUCompiler.CompilerJob(Metal.methodinstance(typeof(vis_candidate), VIS_TT), cfg)
+    res = Metal.compile_to_metallib(job)
+
+    # The metallib TAG. `library.jl` hardcoded `PROGRAM_KERNEL` for everything it
+    # packed; a visible function packed under that tag is not one.
+    lib = read(IOBuffer(res.metallib), Metal.MetalLib)
+    @test only(lib.functions).program_type == Metal.PROGRAM_VISIBLE
+
+    mod = compile_stage(vis_candidate, VIS_TT, :visible; name = "vis_candidate")
+
+    # BY VALUE, and returning the value BARE. Both are the ABI a caller links
+    # against and neither is what a stage gets: the kernel ABI passes every
+    # argument as `ptr addrspace(1)`, and every other stage returns a packed
+    # struct because it has several outputs to name. Left either way this still
+    # compiles, links, dispatches and completes — and the caller reads zeros.
+    @test string(LLVM.function_type(LLVM.functions(mod)["vis_candidate"])) ==
+          "<4 x float> (i32, float, float, float, float, float, float, float)"
+
+    # …and the AIR metadata, whose shape is Apple's: `air.visible` holding
+    # `{ptr @fn, outputs, inputs}`, the output carrying only a TYPE — no index
+    # and no name, unlike a render target or a varying. Read out of
+    # `CC_InlineCompositing32x32` in CoreComposite's shipped `default-cc.metallib`.
+    vis = nodes(mod, "air.visible")
+    @test length(vis) == 1
+    ops = collect(LLVM.operands(vis[1]))
+    @test length(ops) == 3
+    outs = collect(LLVM.operands(ops[2]))
+    @test length(outs) == 1
+    @test occursin("air.visible_output", string(outs[1]))
+    @test occursin("float4", string(outs[1]))
+    ins = collect(LLVM.operands(ops[3]))
+    @test length(ins) == 8
+    @test all(i -> occursin("air.visible_input", string(ins[i])), 1:length(ins))
+    # `uint`, from the JULIA type: LLVM cannot tell it from `int` — both are
+    # `i32` — and Apple's own visible functions spell the unsigned one `uint`.
+    @test occursin("!\"uint\"", string(ins[1]))
+    @test occursin("!\"float\"", string(ins[2]))
+
+    # It is no longer a kernel: leaving `air.kernel` behind would point it at a
+    # function that now returns a value.
+    @test isempty(nodes(mod, "air.kernel"))
+
+    # …and Metal agrees.
+    vislib = Metal.MTL.MTLLibraryFromData(dev, res.metallib)
+    visfn  = Metal.MTL.MTLFunction(vislib, "vis_candidate")
+    @test visfn.functionType == Metal.MTL.MTLFunctionTypeVisible
+end
+
+@testset "an MSL kernel calls the Julia visible function" begin
+    # END TO END, and the point of the whole exercise.
+    #
+    # Through a TABLE and not an `extern` declaration linked by name: the
+    # frontend `newLibraryWithSource:` runs resolves symbols immediately and
+    # refuses an unresolved one ("Undefined symbol(s) for architecture
+    # 'air64'"). An AIR module can carry an unresolved extern — which is how a
+    # Julia kernel calls INTO MSL — but a source-compiled MSL kernel cannot, so
+    # this direction indexes a visible function table instead.
+    dev = Metal.device()
+    cfg = compiler_config(dev; stage = :visible, name = "vis_candidate")
+    job = Metal.GPUCompiler.CompilerJob(Metal.methodinstance(typeof(vis_candidate), VIS_TT), cfg)
+    visfn = Metal.MTL.MTLFunction(
+        Metal.MTL.MTLLibraryFromData(dev, Metal.compile_to_metallib(job).metallib),
+        "vis_candidate")
+
+    caller = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void call_vis(
+        device float4 *out [[buffer(0)]],
+        visible_function_table<float4(uint, float, float, float, float, float, float, float)> tbl [[buffer(1)]],
+        uint tid [[thread_position_in_grid]])
+    {
+        out[tid] = tbl[0](tid, 1.0f, 2.0f, 3.0f, 0.5f, 0.25f, 0.125f, 100.0f);
+    }
+    """
+    cfn = Metal.MTL.MTLFunction(Metal.MTL.MTLLibrary(dev, caller), "call_vis")
+    desc = Metal.MTLComputePipelineDescriptor()
+    desc.computeFunction = cfn
+    lf = Metal.MTL.MTLLinkedFunctions()
+    # `functions`, not `privateFunctions`: a table entry is reached through a
+    # pointer, so the function has to survive as a real call with a stable ABI
+    # rather than being inlined into this pipeline.
+    lf.functions = Metal.NSArray([visfn])
+    desc.linkedFunctions = lf
+    desc.maxCallStackDepth = 4
+    pipe = Metal.MTLComputePipelineState(dev, desc)
+
+    # `nothing` here means the function was not linked in — worth its own
+    # assertion, because an unset table entry is a GPU fault and not an error.
+    handle = Metal.MTL.function_handle(pipe, visfn)
+    @test handle !== nothing
+    tbl = Metal.MTL.MTLVisibleFunctionTable(pipe, Metal.MTL.MTLVisibleFunctionTableDescriptor(1))
+    Metal.MTL.set_function!(tbl, handle, 0)
+
+    n = 8
+    out = Metal.MtlVector{NTuple{4,Float32}}(undef, n)
+    cb  = Metal.MTL.MTLCommandBuffer(GFX_QUEUE)
+    enc = Metal.MTL.MTLComputeCommandEncoder(cb)
+    Metal.MTL.set_function!(enc, pipe)
+    Metal.MTL.set_buffer!(enc, out.data[], 0, 1)
+    Metal.MTL.set_visible_function_table!(enc, tbl, 1)
+    Metal.MTL.append_current_function!(enc, Metal.MTL.MTLSize(1,1,1), Metal.MTL.MTLSize(n,1,1))
+    Metal.MTL.endEncoding!(enc)
+    Metal.MTL.commit!(cb)
+    Metal.MTL.wait_completed(cb)
+
+    # Bit-identical to the same function on the host — not merely non-zero. A
+    # wrong ABI reads as all zeros, which `!= 0` would catch, but a SHIFTED one
+    # reads as plausible garbage and would not.
+    @test Array(out) == [vis_ref(i) for i in 0:(n - 1)]
 end

@@ -19,6 +19,7 @@
 
 export MTLPrimitiveAccelerationStructureDescriptor,
        MTLAccelerationStructureTriangleGeometryDescriptor,
+       MTLAccelerationStructureBoundingBoxGeometryDescriptor,
        MTLInstanceAccelerationStructureDescriptor,
        MTLAccelerationStructureCommandEncoder,
        accelerationStructureSizes, alloc_acceleration_structure,
@@ -45,6 +46,21 @@ Triangle geometry for a bottom-level structure. Set `vertexBuffer`,
 """
 MTLAccelerationStructureTriangleGeometryDescriptor() =
     @objc [MTLAccelerationStructureTriangleGeometryDescriptor descriptor]::MTLAccelerationStructureTriangleGeometryDescriptor
+
+"""
+    MTLAccelerationStructureBoundingBoxGeometryDescriptor()
+
+PROCEDURAL geometry for a bottom-level structure: axis-aligned boxes standing in
+for primitives the traversal cannot intersect itself. Set `boundingBoxBuffer`,
+`boundingBoxStride` and `boundingBoxCount`.
+
+A box is six `Float32`s, `(min.xyz, max.xyz)`, so the natural stride is 24. What
+is INSIDE it is not Metal's business: a ray that enters one is handed to an
+intersection function, which answers whether and where it really hit. That is the
+whole point of the descriptor — it says "ask me" rather than describing a surface.
+"""
+MTLAccelerationStructureBoundingBoxGeometryDescriptor() =
+    @objc [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor]::MTLAccelerationStructureBoundingBoxGeometryDescriptor
 
 """
     MTLPrimitiveAccelerationStructureDescriptor()

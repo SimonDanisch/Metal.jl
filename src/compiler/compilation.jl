@@ -139,6 +139,37 @@ const LINKED_FUNCTION_PREFIX = "__metal_linked_"
 const linked_functions_lock = ReentrantLock()
 # Keyed on the device pointer, like `submission_state_per_queue` next door.
 const linked_functions = Dict{id{MTLDevice}, Vector{MTLFunction}}()
+# Those reachable through a VISIBLE FUNCTION TABLE, which is a different
+# promise — see `linked_pipeline`.
+const table_functions = Dict{id{MTLDevice}, Vector{MTLFunction}}()
+
+"""
+    register_table_function!(dev, fun)
+
+Like [`register_linked_function!`](@ref), for a function a shader calls through a
+VISIBLE FUNCTION TABLE rather than by name.
+
+The difference is `functions` against `privateFunctions` in `linked_pipeline`,
+and it is the difference between working and silently not: a private function may
+be INLINED, and an inlined function has no address for a table entry to point at.
+The call is still made, returns undef, and nothing reports it.
+"""
+function register_table_function!(dev::MTLDevice, fun::MTLFunction)
+    name = String(fun.name)
+    Base.@lock linked_functions_lock begin
+        v = get!(() -> MTLFunction[], table_functions, pointer(dev))
+        any(f -> String(f.name) == name, v) || push!(v, fun)
+    end
+    return fun
+end
+
+"""The table-reachable functions registered for `dev`."""
+function table_functions_for(dev::MTLDevice)
+    Base.@lock linked_functions_lock begin
+        v = get(table_functions, pointer(dev), nothing)
+        return v === nothing ? MTLFunction[] : copy(v)
+    end
+end
 
 """
     register_linked_function!(dev, fun)
@@ -204,6 +235,11 @@ function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFun
     # `NSArray`, as with `desc.binaryArchives` in archive.jl — the setter takes
     # an ObjC array, not a Julia Vector.
     lf.privateFunctions = NSArray(linked)
+    # …and the table-reachable ones in `functions`, which is the half of this
+    # that survives as a real call. A private function may be inlined and then
+    # has no address for a table entry to name.
+    tbl = table_functions_for(dev)
+    isempty(tbl) || (lf.functions = NSArray(tbl))
     desc.linkedFunctions = lf
     desc.maxCallStackDepth = 4
     desc.supportIndirectCommandBuffers = indirect
@@ -448,6 +484,11 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         # parameters, so the entry has to be the final one. See
         # `compiler/texture.jl` for why this cannot be an argument the body takes.
         lower_texture_bindings!(job, mod, entry, length(markers))
+        # A visible function's parameters are VALUES; every stage above takes
+        # its arguments the kernel way, one buffer pointer each. Before
+        # `retag_stage!`, because the metadata it writes describes the signature
+        # and would otherwise say `float` over a `ptr addrspace(1)`.
+        isvisiblestage(stage) && (entry = stage_values!(job, mod, entry))
         retag_stage!(job, mod, entry, stage, T_out, markers)
         # A stage has no kernel state, so the throw sites GPUCompiler lowered
         # cannot signal through one. Before the cleanup, so the emptied function
@@ -670,8 +711,14 @@ end
                                          opt_level=2,
                                          macos=nothing, air=nothing, metal=nothing,
                                          gpufamily=nothing, stage::Symbol=:kernel, kwargs...)
-    stage in (:kernel, :vertex, :fragment, :mesh) ||
-        throw(ArgumentError("stage must be :kernel, :vertex, :fragment or :mesh, got :$stage"))
+    # `:visible` is not a stage in the rasteriser sense — it is an ordinary AIR
+    # function a kernel CALLS (`MTLLinkedFunctions`), which is how a body that
+    # has to be Julia reaches a loop that has to be MSL. It travels here because
+    # everything a graphics stage needs is what it needs: a real return value
+    # instead of an output pointer, no kernel state, no exception mailbox.
+    stage in (:kernel, :vertex, :fragment, :mesh, :visible, :candidate) ||
+        throw(ArgumentError("stage must be :kernel, :vertex, :fragment, :mesh, " *
+                            ":visible or :candidate, got :$stage"))
     # A graphics stage reports no exceptions, so it is compiled at debug level 0
     # whatever the session's `-g` is.
     #
@@ -877,7 +924,10 @@ end
             # Linked functions bypass the binary archive — see
             # `register_linked_function!` for why.
             linked = linked_functions_for(dev)
-            isempty(linked) || return linked_pipeline(dev, fun, linked; indirect)
+            # Either registry is enough to take the linked path: a table-only
+            # registration still has to reach `lf.functions`.
+            (isempty(linked) && isempty(table_functions_for(dev))) ||
+                return linked_pipeline(dev, fun, linked; indirect)
             indirect && return indirect_pipeline(dev, fun)
             return archived_pipeline(dev, fun, metallib, entry)
         catch err

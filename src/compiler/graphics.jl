@@ -179,6 +179,11 @@ air_type_mangling(::Type{Float32}) = "f"
 air_type_mangling(::Type{Float16}) = "Dh"
 air_type_mangling(::Type{Int32})   = "i"
 air_type_mangling(::Type{UInt32})  = "j"
+# `h` is Itanium's `unsigned char`, which is what a `device uchar*` points at —
+# how a VISIBLE function takes an opaque payload buffer. (`Dh` above is `half`;
+# the two are distinct manglings that both start with an h.)
+air_type_mangling(::Type{UInt8})   = "h"
+air_type_mangling(::Type{Int8})    = "a"
 air_type_mangling(::Type{NTuple{N,T}}) where {N,T} = "Dv$(N)_" * air_type_mangling(T)
 
 """
@@ -226,6 +231,8 @@ air_stage_name(::Type{Float32}) = "float"
 air_stage_name(::Type{Float16}) = "half"
 air_stage_name(::Type{Int32})   = "int"
 air_stage_name(::Type{UInt32})  = "uint"
+air_stage_name(::Type{UInt8})   = "uchar"
+air_stage_name(::Type{Int8})    = "char"
 air_stage_name(::Type{NTuple{N,T}}) where {N,T} = air_stage_name(T) * string(N)
 function air_stage_name(@nospecialize(T::Type))
     F = air_wrapped_vector(T)
@@ -306,7 +313,14 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
     # `<{ <4 x float>, <2 x float>, … }>` — a PACKED struct of VECTORS — and a
     # struct of arrays is a different type that the Metal loader rejects.
     T_jl  = stage_output_type(job)
-    T_out = air_output_struct(T_jl)
+    # A VISIBLE function returns its one value BARE. Every stage above returns a
+    # packed struct because it has several outputs to name; a visible function
+    # has exactly one and its caller is MSL, where `float4 f(...)` returns a
+    # `<4 x float>` and nothing else. Handing back `<{ <4 x float> }>` links,
+    # builds a pipeline, dispatches and completes -- and the caller reads zeros,
+    # because a packed one-field struct is a different ABI and nothing checks it.
+    T_out = isvisiblestage(job.config.params.stage) ?
+            air_field_type(fieldtype(T_jl, 1)) : air_output_struct(T_jl)
 
     new_ft = LLVM.FunctionType(T_out, params[1:(end - 1)])
     new_f = LLVM.Function(mod, "", new_ft)
@@ -352,7 +366,10 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
         @dispose builder = IRBuilder() begin
             position!(builder, inst)
             jl = load!(builder, convert(LLVMType, T_jl), slot)
-            ret!(builder, to_air_output(builder, jl, T_jl, T_out))
+            ret!(builder, T_out isa LLVM.StructType ?
+                          to_air_output(builder, jl, T_jl, T_out) :
+                          to_air_field(builder, extract_value!(builder, jl, 0),
+                                       fieldtype(T_jl, 1)))
         end
         erase!(inst)
     end
@@ -360,6 +377,119 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
     fn = LLVM.name(f)
     GPUCompiler.prune_constexpr_uses!(f)
     @assert isempty(uses(f)) "graphics entry $(fn) still has uses after cloning"
+    replace_metadata_uses!(f, new_f)
+    erase!(f)
+    LLVM.name!(new_f, fn)
+    return new_f
+end
+
+"""
+    stage_values!(job, mod, f) -> LLVM.Function
+
+Pass a visible function's parameters BY VALUE.
+
+Every other stage takes its arguments the way a kernel does — one
+`ptr addrspace(1)` per argument, loaded in the entry block — because that is what
+the kernel ABI makes of them and what the binder on the host fills in. A VISIBLE
+function has no binder: it is called from another shader, so its parameters are
+values in registers and its signature is what the caller links against. Left as
+pointers it compiles and tags correctly and then cannot be called at all.
+
+The rewrite is the same clone-and-remap `stage_return!` does for the output
+pointer, run the other way: the new entry takes values, and each one is stored
+into a stack slot that the cloned body loads from exactly as before. The slot and
+its thread-to-device cast are what `stage_cleanup!` promotes away — this is the
+house pattern, not a leak, and the store/load pair does not survive it.
+
+A parameter is only converted when its pointee type is unambiguous: every use in
+the body is a `load` of one type. Anything else — an aggregate read through a
+GEP, a pointer passed along — stays a pointer, because a visible function may
+legitimately take one and guessing would silently change the ABI.
+"""
+function stage_values!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
+                       f::LLVM.Function)
+    params = collect(LLVM.parameters(function_type(f)))
+    args   = collect(LLVM.parameters(f))
+
+    # What each parameter is worth as a value, or `nothing` to leave it alone.
+    #
+    # From the DECLARED Julia type, not from the load in the body. Those differ
+    # whenever the body reinterprets: a `Float32` parameter whose only use is
+    # `reinterpret(UInt32, x)` folds to a `load i32`, and taking that would give
+    # the function an `i32` parameter where its caller — MSL, declaring the table
+    # signature by hand — writes `float`. Bit-identical and still wrong: they are
+    # different register classes, and nothing checks the two spellings agree.
+    jltys = visible_arg_types(job)
+    pointee = Vector{Union{Nothing,LLVMType}}(nothing, length(args))
+    for (i, arg) in enumerate(args)
+        params[i] isa LLVM.PointerType || continue
+        if i <= length(jltys)
+            # A `Core.LLVMPtr` really is a pointer; leave it one.
+            jltys[i] <: Core.LLVMPtr && continue
+            # Everything else follows the DECLARATION, whatever the body does
+            # with it — including nothing. An unused parameter has no loads to
+            # infer from, and leaving it a pointer gives the function a
+            # signature its caller does not have: the metadata still says
+            # `float` while the entry takes `ptr`, and the call reads garbage or
+            # does not happen at all. Neither is reported.
+            isbitstype(jltys[i]) || continue
+            pointee[i] = convert(LLVMType, jltys[i])
+            continue
+        end
+        # Past the declared arguments: an appended builtin, whose type is
+        # whatever it is loaded as.
+        us = [user(u) for u in uses(arg)]
+        isempty(us) && continue
+        all(u -> u isa LLVM.LoadInst, us) || continue
+        ts = unique(LLVMType[value_type(u) for u in us])
+        length(ts) == 1 || continue
+        pointee[i] = only(ts)
+    end
+    all(isnothing, pointee) && return f
+
+    new_ft = LLVM.FunctionType(LLVM.return_type(function_type(f)),
+                               LLVMType[pointee[i] === nothing ? params[i] : pointee[i]
+                                        for i in eachindex(params)])
+    new_f = LLVM.Function(mod, "", new_ft)
+    linkage!(new_f, linkage(f))
+    for (arg, new_arg) in zip(args, LLVM.parameters(new_f))
+        LLVM.name!(new_arg, LLVM.name(arg))
+    end
+
+    @dispose builder = IRBuilder() begin
+        position!(builder, BasicBlock(new_f, "byvalue"))
+        new_args = LLVM.Value[]
+        for (i, ty) in enumerate(pointee)
+            np = LLVM.parameters(new_f)[i]
+            if ty === nothing
+                # Carried through untouched, attributes and all.
+                for attr in collect(parameter_attributes(f, i))
+                    push!(parameter_attributes(new_f, i), attr)
+                end
+                push!(new_args, np)
+                continue
+            end
+            # The slot carries the DECLARED type, and the cloned body loads
+            # whatever it was compiled to load — the same 32 bits under a
+            # different name when the body reinterprets. `stage_cleanup!`
+            # promotes the slot away and the bitcast with it.
+            slot = alloca!(builder, ty, LLVM.name(args[i]))
+            store!(builder, np, slot)
+            as = addrspace(params[i])
+            push!(new_args, as == 0 ? slot : addrspacecast!(builder, slot, params[i]))
+        end
+
+        value_map = Dict{LLVM.Value, LLVM.Value}(
+            param => new_args[i] for (i, param) in enumerate(args))
+        value_map[f] = new_f
+        clone_into!(new_f, f; value_map,
+                    changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
+        br!(builder, blocks(new_f)[2])
+    end
+
+    fn = LLVM.name(f)
+    GPUCompiler.prune_constexpr_uses!(f)
+    @assert isempty(uses(f)) "visible function $(fn) still has uses after cloning"
     replace_metadata_uses!(f, new_f)
     erase!(f)
     LLVM.name!(new_f, fn)
@@ -382,11 +512,28 @@ end
 # from scratch would mean re-deriving sizes, alignments and address spaces that
 # GPUCompiler has already computed correctly.
 
+"""
+    isvisiblestage(stage) -> Bool
+
+Whether `stage` compiles to an AIR VISIBLE function — one a kernel calls, rather
+than one the rasteriser runs.
+
+Two of them. `:visible` is the plain form: its signature is exactly what the
+Julia function declares. `:candidate` is a PROCEDURAL RAY CANDIDATE, which takes
+the seven candidate builtins on top, always and in a fixed order, because the MSL
+traversal that calls it declares the table's type by hand and cannot know what a
+particular payload happens to read. Making that the rule for every visible
+function instead was tried and is wrong: it silently re-shaped the signature of
+ones that take their arguments explicitly.
+"""
+isvisiblestage(stage::Symbol) = stage === :visible || stage === :candidate
+
 """Named metadata a stage is registered under."""
 stage_metadata_key(stage::Symbol) =
     stage === :vertex ? "air.vertex" :
     stage === :fragment ? "air.fragment" :
     stage === :mesh ? "air.mesh" :
+    isvisiblestage(stage) ? "air.visible" :
     error("no AIR metadata key for stage :$stage")
 
 """
@@ -405,6 +552,23 @@ function stage_outputs(stage::Symbol, @nospecialize(T::Type))
     # list. That is the structural difference from the two stages below, and it
     # is what the shipping metallib shows.
     stage === :mesh && return Metadata[]
+    # A VISIBLE function is not a stage at all: it is an ordinary AIR function a
+    # kernel calls, so it has ONE return value and no per-target or per-varying
+    # tagging. `air.visible_output` carries just the type — no index, no name,
+    # which is the shape `CC_InlineCompositing32x32` shows in CoreComposite's
+    # shipped `default-cc.metallib`.
+    #
+    # The single field is UNWRAPPED here. Every other stage returns a packed
+    # struct because it has several outputs; a visible function has one, and a
+    # caller declaring `extern float4 f(...)` links against the bare type.
+    if isvisiblestage(stage)
+        names = fieldnames(T)
+        length(names) == 1 ||
+            error("a visible function returns ONE value; got $(length(names)): $names")
+        return Metadata[MDNode(Metadata[MDString("air.visible_output"),
+                                        MDString("air.arg_type_name"),
+                                        MDString(air_stage_name(fieldtype(T, 1)))])]
+    end
     names = fieldnames(T)
     isempty(names) && error("a graphics stage must return at least one value")
     out = Metadata[]
@@ -512,7 +676,48 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
         error("argument metadata does not match the rewritten signature: " *
               "$(length(arg_infos)) entries for $nparams parameters")
 
-    isempty(markers) ||
+    # A visible function's parameters are VALUES, not bindings. GPUCompiler
+    # described them as buffers because that is what the kernel ABI makes of
+    # every argument; `air.visible_input` is what AIR wants, and the whole list
+    # is rebuilt rather than patched because none of the buffer description
+    # survives — no location, no address space, just index/type/name.
+    #
+    # INCOMPLETE, and this is the remaining gap: the metadata says `float`, the
+    # SIGNATURE still says `ptr addrspace(1)`, because the kernel ABI passes
+    # every argument by pointer and nothing here undoes that. A caller linking
+    # `extern float4 f(uint, float3, float3, float)` would pass values where the
+    # body loads pointers. What is needed is a by-value rewrite of the entry —
+    # the same clone-and-remap shape `stage_builtins!` already does for appended
+    # builtins and `stage_return!` for the output pointer, run the other way.
+    # Until then this emits a well-formed `PROGRAM_VISIBLE` function with the
+    # right output type that cannot yet be CALLED with a value signature.
+    if isvisiblestage(stage)
+        ptys = collect(LLVM.parameters(function_type(entry)))
+        # Named from the JULIA types where there are any, because LLVM cannot
+        # tell `uint` from `int` — both are `i32`, and Apple's own visible
+        # functions spell the unsigned one `uint`. `air_visible_type_name` is the
+        # fallback for a parameter with no Julia counterpart.
+        jltys = visible_arg_types(job)
+        # The parameters `stage_builtins!` APPENDED have no Julia argument to be
+        # named from; their marker carries the AIR spelling instead. Without this
+        # a `CandidatePrim` is named `int`, because LLVM has only `i32` to go on,
+        # while the MSL caller declares `uint`.
+        aligned = stage_align_markers(markers, length(ptys))
+        arg_infos = Metadata[
+            MDNode(Metadata[Metadata(ConstantInt(Int32(i - 1))),
+                            MDString("air.visible_input"),
+                            MDString("air.arg_type_name"),
+                            MDString(i <= length(jltys) ?
+                                     air_visible_arg_name(jltys[i], ptys[i]) :
+                                     (aligned[i] === nothing ?
+                                      air_visible_type_name(ptys[i]) :
+                                      last(stage_input_tag(aligned[i])))),
+                            MDString("air.arg_name"),
+                            MDString(string("arg", i - 1))])
+            for i in eachindex(ptys)]
+    end
+
+    isempty(markers) || isvisiblestage(stage) ||
         stage_input_metadata!(arg_infos, stage_align_markers(markers, length(arg_infos)))
 
     # A texture and a sampler are both `ptr addrspace(1)`/`ptr addrspace(2)` to the
@@ -588,6 +793,60 @@ function air_output_struct(@nospecialize(T::Type))
     # it is left alone: returning it bare was tried while chasing the texture
     # crash in `compiler/texture.jl` and changed nothing.
     return LLVM.StructType(fields; packed = true)
+end
+
+"""
+    visible_arg_types(job) -> Vector{Union{Nothing,Type}}
+
+The Julia types of a visible function's parameters, trailing output pointer
+dropped — the same slice `stage_input_types` takes, kept whole rather than
+reduced to stage markers, because here every one of them names a type in AIR.
+"""
+function visible_arg_types(@nospecialize(job::CompilerJob))
+    args = collect(job.source.specTypes.parameters[2:end])
+    isempty(args) || pop!(args)                 # the output pointer
+    return Union{Nothing,Type}[a for a in args]
+end
+
+"""
+    air_visible_arg_name(jl, llvm) -> String
+
+What AIR calls one visible-function parameter.
+
+From the JULIA type where there is one, because LLVM cannot tell `uint` from
+`int` — both are `i32` — and Apple's own visible functions spell the unsigned one
+`uint`. A `Core.LLVMPtr{T,AS}` is a DEVICE POINTER and has no `air_stage_name`;
+it is named for what it points at, which is how MSL spells the parameter the
+caller must declare (`device float*`).
+"""
+air_visible_arg_name(::Nothing, llvm::LLVMType) = air_visible_type_name(llvm)
+air_visible_arg_name(@nospecialize(jl::Type), llvm::LLVMType) =
+    jl <: Core.LLVMPtr ? air_stage_name(first(jl.parameters)) * "*" :
+    air_stage_name(jl)
+
+"""
+    air_visible_type_name(t::LLVMType) -> String
+
+What AIR calls one visible-function parameter, read off the LLVM type.
+
+Off the LLVM type and not the Julia one, because by this point the signature has
+already been rewritten — this is the type the CALLER will link against, and a
+mismatch is a link failure with no diagnostic rather than a wrong answer.
+"""
+function air_visible_type_name(t::LLVMType)
+    t isa LLVM.PointerType && return "void*"
+    if t isa LLVM.VectorType
+        base = air_visible_type_name(LLVM.eltype(t))
+        return "$base$(Int(length(t)))"
+    end
+    t == LLVM.FloatType()  && return "float"
+    t == LLVM.HalfType()   && return "half"
+    t == LLVM.Int32Type()  && return "int"
+    t == LLVM.Int16Type()  && return "short"
+    t == LLVM.Int8Type()   && return "char"
+    t == LLVM.Int1Type()   && return "bool"
+    t == LLVM.VoidType()   && return "void"
+    error("no AIR visible-function type name for $t")
 end
 
 """AIR's type for one stage output field: a vector for an `NTuple`, else itself."""
@@ -688,12 +947,51 @@ struct Varying{name, T}
     value::T
 end
 
-const STAGE_INPUTS = Union{VertexID, InstanceID, FragCoord, Varying}
+# ── The procedural-candidate builtins ────────────────────────────────────────
+#
+# What a ray query is OFFERING, inside a visible function called from an MSL
+# traversal loop. Ambient for the same reason `vertex_index()` is: the portable
+# protocol (`Mantle.candidate_primitive_index` and friends) is a zero-argument
+# call, because on Vulkan it reads the inline ray query that is already in
+# scope. Here there is no query in scope — it lives in the MSL caller — so the
+# values arrive as parameters, and these globals are how a body asks for them
+# without spelling them in its signature.
+
+"""The primitive the traversal is offering, ZERO-based as AIR reports it."""
+struct CandidatePrim
+    value::UInt32
+end
+
+# SCALARS, one per component, and not a `float3`. MSL's `float3` is 16 bytes
+# with a padding lane; AIR's `<3 x float>` is 12. A visible function table
+# declares its signature in MSL and the function is compiled from Julia, so the
+# two spellings have to agree at the ABI and nothing checks that they do — the
+# call is made, returns UNDEF, and the traversal commits nothing.
+"""One component of the candidate's ray origin, in OBJECT space."""
+struct CandidateOriginX; value::Float32; end
+@doc (@doc CandidateOriginX) struct CandidateOriginY; value::Float32; end
+@doc (@doc CandidateOriginX) struct CandidateOriginZ; value::Float32; end
+
+"""One component of the candidate's ray direction, in OBJECT space."""
+struct CandidateDirX; value::Float32; end
+@doc (@doc CandidateDirX) struct CandidateDirY; value::Float32; end
+@doc (@doc CandidateDirX) struct CandidateDirZ; value::Float32; end
+
+const STAGE_INPUTS = Union{VertexID, InstanceID, FragCoord, Varying, CandidatePrim,
+                           CandidateOriginX, CandidateOriginY, CandidateOriginZ,
+                           CandidateDirX, CandidateDirY, CandidateDirZ}
 
 """What `air.*` tag a stage-input marker carries, and how AIR names its type."""
 stage_input_tag(::Type{VertexID})   = ("air.vertex_id",   "uint")
 stage_input_tag(::Type{InstanceID}) = ("air.instance_id", "uint")
 stage_input_tag(::Type{FragCoord})  = ("air.position",    "float4")
+# A visible function's parameters carry no builtin tag — `retag_stage!` writes
+# `air.visible_input` for all of them — so these are named only for the AIR type.
+stage_input_tag(::Type{CandidatePrim}) = ("air.visible_input", "uint")
+for C in (:CandidateOriginX, :CandidateOriginY, :CandidateOriginZ,
+          :CandidateDirX, :CandidateDirY, :CandidateDirZ)
+    @eval stage_input_tag(::Type{$C}) = ("air.visible_input", "float")
+end
 stage_input_tag(::Type{Varying{name,T}}) where {name,T} =
     ("air.fragment_input", air_stage_name(T))
 
@@ -701,6 +999,11 @@ stage_input_tag(::Type{Varying{name,T}}) where {name,T} =
 stage_input_llvmtype(::Type{VertexID})   = convert(LLVMType, UInt32)
 stage_input_llvmtype(::Type{InstanceID}) = convert(LLVMType, UInt32)
 stage_input_llvmtype(::Type{FragCoord})  = LLVM.VectorType(convert(LLVMType, Float32), 4)
+stage_input_llvmtype(::Type{CandidatePrim}) = convert(LLVMType, UInt32)
+for C in (:CandidateOriginX, :CandidateOriginY, :CandidateOriginZ,
+          :CandidateDirX, :CandidateDirY, :CandidateDirZ)
+    @eval stage_input_llvmtype(::Type{$C}) = convert(LLVMType, Float32)
+end
 stage_input_llvmtype(::Type{Varying{name,T}}) where {name,T} = air_field_type(T)
 
 """
@@ -871,6 +1174,7 @@ function air_program_type(@nospecialize(job::MetalCompilerJob))
     return stage === :vertex   ? PROGRAM_VERTEX :
            stage === :fragment ? PROGRAM_FRAGMENT :
            stage === :mesh     ? PROGRAM_MESH :
+           isvisiblestage(stage) ? PROGRAM_VISIBLE :
                                  PROGRAM_KERNEL
 end
 
@@ -941,6 +1245,13 @@ function stage_drop_exception_signal!(mod::LLVM.Module)
     # It does nothing now, and saying so lets the inliner and DCE treat it as
     # the no-op it is instead of a call that might write memory.
     push!(function_attributes(f), EnumAttribute("alwaysinline", 0))
+    # …and PRIVATE, so it is not exported. A stage compiled on its own never
+    # noticed: its metallib is linked with nothing. A VISIBLE function is linked
+    # INTO a kernel's pipeline, and that kernel carries its own
+    # `gpu_signal_exception` — two external definitions of the same name, which
+    # the Metal linker refuses with "symbol multiply defined" and no hint that an
+    # emptied helper is what collided.
+    linkage!(f, LLVM.API.LLVMPrivateLinkage)
     return true
 end
 
@@ -965,6 +1276,18 @@ const STAGE_BUILTINS = Dict(
     "__air_stage_vertex_id"   => VertexID,
     "__air_stage_instance_id" => InstanceID,
     "__air_stage_frag_coord"  => FragCoord,
+    # Visible functions only. They carry no `air.*` tag — a visible function's
+    # parameters are ordinary values, so these become plain `air.visible_input`
+    # entries like every other one.
+    # Appended SORTED BY NAME, so the caller's argument order is
+    # dx, dy, dz, ox, oy, oz, prim — alphabetical, not declaration order.
+    "__air_candidate_dx"   => CandidateDirX,
+    "__air_candidate_dy"   => CandidateDirY,
+    "__air_candidate_dz"   => CandidateDirZ,
+    "__air_candidate_ox"   => CandidateOriginX,
+    "__air_candidate_oy"   => CandidateOriginY,
+    "__air_candidate_oz"   => CandidateOriginZ,
+    "__air_candidate_prim" => CandidatePrim,
 )
 
 """
@@ -983,9 +1306,27 @@ function stage_builtins!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                          f::LLVM.Function)
     used = Tuple{String,Type,LLVM.GlobalVariable}[]
     for (name, marker) in STAGE_BUILTINS
-        haskey(globals(mod), name) || continue
+        # A VISIBLE function takes the candidate builtins whether its body reads
+        # them or not. Every other stage appends only what it USES, because an
+        # unreferenced builtin would cost a register and shift every buffer
+        # index after it — there is no caller with a fixed idea of the signature.
+        #
+        # A visible function has exactly that: the MSL traversal declares the
+        # table's type by hand and passes all seven. A payload whose candidate
+        # happens to read only `o[1]` would otherwise be compiled to take one
+        # float where the caller passes six, and the call returns UNDEF — no
+        # error, no diagnostic, and a traversal that commits nothing.
+        alwayson = job.config.params.stage === :candidate &&
+                   startswith(name, "__air_candidate_")
+        if !haskey(globals(mod), name)
+            alwayson || continue
+            # Declare it so there is something to turn into a parameter. With no
+            # uses the rewrite below simply drops the load, which is what an
+            # unread builtin should cost.
+            GlobalVariable(mod, stage_input_llvmtype(marker), name)
+        end
         gv = globals(mod)[name]
-        isempty(uses(gv)) && continue
+        (alwayson || !isempty(uses(gv))) || continue
         push!(used, (name, marker, gv))
     end
     isempty(used) && return (f, Type[])
