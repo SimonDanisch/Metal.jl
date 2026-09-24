@@ -92,6 +92,10 @@ function KI.multiprocessor_count(::MetalBackend)::Int
 end
 
 KI.shfl_down_types(::MetalBackend) = DataType[Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8]
+# The same eight, because both lower to the same family: `simd_shuffle_down` and
+# `simd_shuffle` take exactly the types `simd_shuffle_map` lists. Float64 is
+# absent from both because an Apple GPU does not have it.
+KI.shfl_types(::MetalBackend) = DataType[Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8]
 
 
 
@@ -152,6 +156,13 @@ end
 
 @device_override function KI.shfl_down(val::T, offset::Integer) where T
     simd_shuffle_down(val, offset)
+end
+
+# `lane + 1`: KI's lane is ABSOLUTE and ZERO-based, Metal's `simd_lane_id` is
+# one-based. The off-by-one reads a neighbour's value rather than failing, so
+# nothing catches it but a test that checks WHICH lane it got.
+@device_override function KI.shfl(val::T, lane::Integer) where T
+    simd_shuffle(val, lane + 1)
 end
 
 @device_override @inline function KI._print(args...)
