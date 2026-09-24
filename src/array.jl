@@ -643,6 +643,11 @@ function Base.resize!(A::MtlVector{T}, n::Integer) where T
         maxsize + n
     end
 
+    # Metal doesn't support empty allocations: the constructor uses a 1-byte
+    # buffer for a zero-length array, and a resize DOWN to zero has to as well,
+    # or `alloc` trips its `0 < bytesize` assertion.
+    bufsize == 0 && (bufsize = 1)
+
     # replace the data with a new one. this 'unshares' the array.
     # as a result, we can safely support resizing unowned buffers.
     buf = alloc(device(A), bufsize; storage=storagemode(A))

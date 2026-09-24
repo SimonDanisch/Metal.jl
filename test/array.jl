@@ -413,6 +413,16 @@ end
     @test length(b) == 0
     resize!(b, 1)
     @test length(b) == 1
+
+    # Down to ZERO, which the constructor supports and `resize!` did not: it
+    # asked `alloc` for 0 bytes and tripped its assertion. Found through
+    # RayMakie, whose line overlay resizes its index buffer to fit a polyline
+    # with nothing valid in it.
+    resize!(a, 0)
+    @test length(a) == 0
+    @test Array(a) == Int[]
+    resize!(a, 2)                 # and back up from there
+    @test length(a) == 2
 end
 
 function _alignedvec(::Type{T}, n::Integer, alignment::Integer = 16384) where {T}
