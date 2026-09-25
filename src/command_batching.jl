@@ -400,10 +400,18 @@ end
 defer_cleanup!(queue, cmdbuf::MTL.MTLCommandBufferLike, roots::Vector{Any}) =
     defer_cleanup!(batched_queue(queue), cmdbuf, roots)
 
+# A barrier that returns a `Bool`. `PendingCommand.cmdbuf` is the abstract
+# `MTLCommandBufferLike`, so reading `.status` inline dispatched dynamically and
+# boxed the enum it returned: 40 B for every command buffer that retired, which
+# made a frame's allocations depend on how many happened to finish during it.
+# `true` and `false` are singletons, so the same dynamic call returns without
+# allocating.
+completed(cmdbuf) = cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
+
 function drain_cleanups!(bq::BatchedCommandQueue; force::Bool=false)
     n = 0
     for cleanup in bq.cleanups
-        if !(force || cleanup.cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted)
+        if !(force || completed(cleanup.cmdbuf))
             break
         end
         n += 1
