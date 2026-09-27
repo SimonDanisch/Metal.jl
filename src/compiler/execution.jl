@@ -407,7 +407,13 @@ const kernel_instances = Dict{UInt, Any}()
         elseif argtyp <: MtlPtr
             # the same as a buffer, but with an offset
             push!(ex.args, :(set_buffer!(cce, $argex.buffer, $argex.offset, $idx)))
-        elseif isghosttype(argtyp) || Core.Compiler.isconstType(argtyp)
+        elseif isghosttype(argtyp) || Core.Compiler.isconstType(argtyp) || argtyp <: Type
+            # `argtyp <: Type`: a type-valued argument read out of the TUPLE is a
+            # `DataType` (or `UnionAll`, `Union`), never the `Type{T}` that
+            # `isconstType` recognises. The kernel was compiled at `Core.Typeof`,
+            # which makes it `Type{T}`, a ghost with no slot; binding one here
+            # shifted every later argument by one, and `@metal k(Int, pointer(a))`
+            # stored nowhere.
             continue
         else
             # everything else is passed by reference, copied into Metal's transient buffer

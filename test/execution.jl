@@ -736,6 +736,20 @@ end
         @metal kernel(Int, pointer(a))
         @test Array(a)[] == 1
     end
+
+    # A type argument has no slot in the compiled kernel, and the launcher read it
+    # out of the argument tuple as a `DataType`, bound one anyway, and shifted
+    # every later argument by one: each of these stored nothing.
+    @testset "type arguments before a buffer" begin
+        one_kernel(T, a) = (a[1] = one(T); return)
+        a = MtlArray([0])
+        @metal one_kernel(Int, a)
+        @test Array(a)[] == 1
+
+        sum_kernel(T, S, a) = (a[1] = one(T) + one(S); return)
+        @metal sum_kernel(Int, Int32, a)
+        @test Array(a)[] == 2
+    end
 end
 
 @testset "compilation cache" begin
