@@ -236,9 +236,13 @@ a callable kernel object. For a higher-level interface, use [`@metal`](@ref).
 
 The following keyword arguments are supported:
 - `macos`, `metal` and `air`: to override the macOS OS, Metal language and AIR bitcode
-   versions used during compilation. Value should be a valid version number.
+   versions used during compilation. Value should be a valid version number. `macos`
+   defaults to the `target_macos` preference (or `JULIA_METAL_TARGET_MACOS`), and without
+   one to the running system.
 - `gpufamily`: to override the Apple GPU family (`MTL.MTLGPUFamilyApple<n>`) that the
-   generated code may rely on. Defaults to the highest family the device supports.
+   generated code may rely on. Defaults to the `target_gpufamily` preference (or
+   `JULIA_METAL_TARGET_GPUFAMILY`, e.g. `7` to compile as for an M1), and without one to
+   the highest family the device supports.
 - `indirect`: build a pipeline an `MTLIndirectCommandBuffer` command may name. The
    compiled code is the same and is cached the same; only the pipeline differs, and
    it is not cached, because a caller who asks for one holds it.

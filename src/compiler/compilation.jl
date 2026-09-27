@@ -699,6 +699,58 @@ end
 
 ## compiler implementation (configure, compile, and link)
 
+# The oldest macOS and Apple GPU family this process compiles for, when a caller
+# names neither. Compiling for an older target on newer hardware is how a machine
+# checks that code will run on the older one: device code gated on
+# `apple_family()` or `metal_version()` fails to compile exactly where it would
+# there, e.g. a 64-bit atomic max for an M1 (`target_gpufamily = 7`). Set as a
+# preference, or for one run through the environment variable; both are read once.
+function load_compile_target(name::String, env::String, parse_target)
+    s = get(ENV, env, nothing)
+    value = s === nothing ? load_preference(Metal, name) : s
+    value === nothing && return nothing
+    source = s === nothing ? "preference `$name`" : "environment variable `$env`"
+    return parse_target(value, source)
+end
+
+function parse_target_macos(value, source)
+    version = tryparse(VersionNumber, string(value))
+    version === nothing && throw(ArgumentError(
+        "$source must be a macOS version such as \"15\", got $(repr(value))"))
+    version = normalize_macos(version)
+    version >= v"14" || throw(ArgumentError(
+        "$source is macOS $version, and Metal.jl requires macOS 14 or newer"))
+    version <= macos_version() || throw(ArgumentError(
+        "$source is macOS $version, newer than this system's $(macos_version()): " *
+        "code compiled for it would not load here"))
+    return version
+end
+
+function parse_target_gpufamily(value, source)
+    family = value isa Integer ? Int(value) : tryparse(Int, string(value))
+    (family === nothing || !(1 <= family <= 10)) && throw(ArgumentError(
+        "$source must be an Apple GPU family from 1 to 10 (7 is the M1), got $(repr(value))"))
+    return family
+end
+
+target_macos() = @memoize begin
+    load_compile_target("target_macos", "JULIA_METAL_TARGET_MACOS", parse_target_macos)
+end::Union{Nothing,VersionNumber}
+
+target_gpufamily() = @memoize begin
+    load_compile_target("target_gpufamily", "JULIA_METAL_TARGET_GPUFAMILY", parse_target_gpufamily)
+end::Union{Nothing,Int}
+
+# The Apple family code for `dev` is compiled for when the caller names none.
+function default_apple_family(dev, target = target_gpufamily())
+    highest = something(MTL.highest_apple_family(dev), 0)
+    family = something(target, highest)
+    family <= highest || throw(ArgumentError(
+        "the target GPU family is Apple$family, but this device supports only " *
+        "Apple$highest: code compiled for it may use features this GPU lacks"))
+    return family
+end
+
 # cache of compiler configurations, per device (but additionally configurable via kwargs)
 const _compiler_configs = Dict{UInt, MetalCompilerConfig}()
 const compiler_configs_lock = ReentrantLock()
@@ -741,7 +793,7 @@ end
     stage === :kernel || (debug_level = 0)
     # determine the versions of things to target
     if macos === nothing
-        macos = macos_version()
+        macos = something(target_macos(), macos_version())
     else
         macos = normalize_macos(macos)
     end
@@ -760,8 +812,7 @@ end
     end
     # Only Apple family values form the capability sequence used by device code.
     if gpufamily === nothing
-        highest_family = MTL.highest_apple_family(dev)
-        apple_family = something(highest_family, 0)
+        apple_family = default_apple_family(dev)
     else
         gpufamily = convert(MTL.MTLGPUFamily, gpufamily)
         apple_family = Int(gpufamily) - 1000

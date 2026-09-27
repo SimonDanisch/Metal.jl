@@ -177,6 +177,45 @@ end
         end
     end
 
+    # The process-wide compile target: what a caller that names no `macos` or
+    # `gpufamily` compiles for. `JULIA_METAL_TARGET_GPUFAMILY=7` compiles as for an
+    # M1 on any Apple silicon machine, which is how code using a newer GPU's
+    # features is caught without one.
+    let
+        @test Metal.parse_target_gpufamily("7", "env") == 7
+        @test Metal.parse_target_gpufamily(8, "pref") == 8
+        @test_throws "Apple GPU family from 1 to 10" Metal.parse_target_gpufamily("M1", "env")
+        @test_throws "Apple GPU family from 1 to 10" Metal.parse_target_gpufamily(11, "pref")
+        @test Metal.parse_target_macos("15", "env") == v"15"
+        @test Metal.parse_target_macos("16.1", "env") == v"26.1"  # a compatibility version
+        @test_throws "requires macOS 14" Metal.parse_target_macos("13", "env")
+        @test_throws "newer than this system" Metal.parse_target_macos("99", "env")
+        @test_throws "macOS version" Metal.parse_target_macos("tahoe", "env")
+
+        load(env) = Metal.load_compile_target("target_test", env, Metal.parse_target_gpufamily)
+        @test load("JULIA_METAL_TARGET_TEST") === nothing
+        withenv("JULIA_METAL_TARGET_TEST" => "7") do
+            @test load("JULIA_METAL_TARGET_TEST") == 7
+        end
+        withenv("JULIA_METAL_TARGET_TEST" => "M1") do
+            @test_throws "environment variable `JULIA_METAL_TARGET_TEST`" load("JULIA_METAL_TARGET_TEST")
+        end
+
+        highest = something(MTL.highest_apple_family(device()), 0)
+        @test Metal.default_apple_family(device(), nothing) == highest
+        @test Metal.default_apple_family(device(), highest) == highest
+        @test_throws "supports only" Metal.default_apple_family(device(), highest + 1)
+
+        # What the target is for: device code gated on the family refuses to
+        # compile for a GPU that lacks the feature.
+        function u64_max(a)
+            Metal.atomic_max_explicit(pointer(a, 1), UInt64(1))
+            return
+        end
+        a = MtlArray(UInt64[0])
+        @test_throws "requires Apple8" @metal launch=false gpufamily=MTL.MTLGPUFamilyApple7 u64_max(a)
+    end
+
     @test Metal.return_type(identity, Tuple{Int}) === Int
     @test Metal.return_type(sin, Tuple{Float32}) === Float32
     @test Metal.return_type(getindex, Tuple{MtlDeviceArray{Float32,1,1},Int32}) === Float32

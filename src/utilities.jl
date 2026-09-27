@@ -56,6 +56,8 @@ function versioninfo(io::IO=stdout; verbose=false)
         "precompile" => load_preference(Metal, "precompile"),
         "binary_archives" => load_preference(Metal, "binary_archives"),
         "binary_archives_max_size" => load_preference(Metal, "binary_archives_max_size"),
+        "target_macos" => load_preference(Metal, "target_macos"),
+        "target_gpufamily" => load_preference(Metal, "target_gpufamily"),
     ]
     if any(x->!isnothing(x[2]), prefs)
         println(io, "Preferences:")
