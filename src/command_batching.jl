@@ -164,7 +164,21 @@ has_active_batched_queues() =
 
 batched_queue(bq::BatchedCommandQueue) = bq
 
+# The batch `adopt_queue!` installed, if `queue` is the queue it wraps. That batch is
+# every task's, so it is not in any task's local storage, and the two lookups below
+# have to ask for it first: missing it, the commit hook flushed nothing and a command
+# buffer committed on the adopted queue ran AHEAD of the work still open in its batch,
+# and `batched_queue` wrapped the same queue a second time.
+@inline function adopted_batch(queue::MTLCommandQueue)
+    bq = adopted_queue[]
+    bq === nothing && return nothing
+    bq = bq::BatchedCommandQueue
+    return pointer(bq.queue) == pointer(queue) ? bq : nothing
+end
+
 function batched_queue(queue::MTLCommandQueue)
+    bq = adopted_batch(queue)
+    bq === nothing || return bq
     get!(task_local_storage(), batched_queue_key(queue)) do
         BatchedCommandQueue(queue)
     end::BatchedCommandQueue
@@ -203,7 +217,8 @@ end
 
 function flush_open_batch(cmdbuf)
     queue = cmdbuf.commandQueue
-    bq = get(task_local_storage(), batched_queue_key(queue), nothing)
+    bq = adopted_batch(queue)
+    bq === nothing && (bq = get(task_local_storage(), batched_queue_key(queue), nothing))
     bq === nothing || flush!(bq)
     return
 end
