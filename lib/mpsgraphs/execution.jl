@@ -75,6 +75,9 @@ function encode_batched!(graph::MPSGraph, feeds, results, roots...)
     # `batchbuffer` ends the open encoder and holds the operands; see its docstring for
     # why a command buffer of this call's own would be wrong.
     bq = Metal.global_queue(Metal.device())
+    # Before the buffer is taken: it may commit the batch to make room (a command
+    # buffer holds the residency sets of at most 16 distinct graphs).
+    Metal.joingraph!(bq, graph)
     cmdbuf = Metal.batchbuffer(roots...)
     mps = MPSCommandBuffer(cmdbuf)
     encode!(mps, graph, NSDictionary(feeds), NSDictionary(results), nil,
@@ -84,6 +87,8 @@ function encode_batched!(graph::MPSGraph, feeds, results, roots...)
     # SAM 2.1's encoder frame. The batch adopts the continuation rather than being
     # left holding a committed buffer. A no-op in the usual case.
     Metal.adopt_continued!(bq, cmdbuf, mps.commandBuffer)
+    # An adopted continuation starts with no graphs counted, and holds this one.
+    Metal.joingraph!(bq, graph)
     return nothing
 end
 

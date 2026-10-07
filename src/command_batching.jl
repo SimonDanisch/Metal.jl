@@ -108,6 +108,10 @@ mutable struct BatchedCommandQueue
     # waiting for the oldest to retire. Per queue, not global, for the same reason
     # `autoflush` is: it is a property of how the CALLER submits. See `inflight!`.
     inflight::Int
+    # The MPSGraphs encoded into the open command buffer, by pointer. Each distinct
+    # one adds residency sets to the buffer, and Metal aborts the process past 32 —
+    # see `joingraph!`.
+    graphs::Vector{UInt}
 end
 
 function BatchedCommandQueue(queue::MTLCommandQueue)
@@ -115,7 +119,7 @@ function BatchedCommandQueue(queue::MTLCommandQueue)
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
     BatchedCommandQueue(queue, dev, nothing, nothing, NoEncoder,
                         Any[], nothing, 0, 0, Any[], PendingCommand[],
-                        Vector{Any}[], true, command_batching_inflight())
+                        Vector{Any}[], true, command_batching_inflight(), UInt[])
 end
 
 
@@ -298,6 +302,35 @@ function batchbuffer(roots...)
     cmdbuf = ensure_cmdbuf!(bq)
     record_operation!(bq, roots...)
     return cmdbuf
+end
+
+"""
+    joingraph!(bq, graph; limit = 16)
+
+Count `graph` into the open batch, committing the batch first if it already holds
+`limit` distinct graphs.
+
+Every distinct MPSGraph encoded into a command buffer adds residency sets to it, and
+a command buffer holds at most 32: past that Metal fails an assertion
+(`IOGPUMetalCommandBufferStorageAddResidencySets: command buffer residency set limit
+of 32 exceeded`) and the process aborts, with nothing to catch. Measured on an M5,
+GEMM graphs of distinct shapes into one buffer: 16 run, 17 abort — two sets each.
+Encoding the SAME graph again adds none (100 encodes of one graph run), and neither do
+distinct operand buffers (40 for one graph run). SAM 2's precompile workload hit it:
+a caller that owns its flushes (`own_flushes!`) put a whole frame's GEMMs and
+convolutions into one buffer.
+
+Not subject to `own_flushes!`. That turns off a THRESHOLD this queue chose; this is
+Metal's limit, and the alternative to a commit here is an abort. The commit keeps the
+order — command buffers on one queue run in commit order — so a caller that counts
+its own submissions sees one more and nothing else.
+"""
+function joingraph!(bq::BatchedCommandQueue, graph; limit::Int = 16)
+    p = UInt(pointer(graph))
+    p in bq.graphs && return
+    length(bq.graphs) >= limit && flush!(bq)
+    push!(bq.graphs, p)
+    return
 end
 
 """
@@ -522,6 +555,7 @@ function reset_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
     # …and this one is never given away at all — `register_operations!` reads it
     # before the reset and nothing holds it after — so it is emptied in place.
     empty!(bq.pending_ops)
+    empty!(bq.graphs)
     bq.nops = 0
     bq.nbytes = 0
     unregister_queue_if_idle!(bq)

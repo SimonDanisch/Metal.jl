@@ -307,6 +307,28 @@ end
         end
     end
 
+    @testset "a batch holding more distinct graphs than one buffer takes" begin
+        # Each distinct graph adds residency sets to the command buffer, and Metal
+        # ABORTS the process past 32 of them — 17 GEMM shapes in one buffer did,
+        # with the batch's flushes owned by the caller as a render graph owns them.
+        # `joingraph!` commits before the 17th; reaching the end is the test.
+        bq = Metal.global_queue(device())
+        was = Metal.own_flushes!(bq, true)
+        try
+            ops = [(MtlArray(rand(Float32, 16k, 64)), MtlArray(rand(Float32, 64, 40)),
+                    MtlArray(zeros(Float32, 16k, 40))) for k in 1:40]
+            for (A, B, C) in ops
+                BTG.gemm_batched!(C, A, B)
+            end
+            @test length(bq.graphs) <= 16
+            Metal.flush!(bq)
+            Metal.synchronize()
+            @test all(((A, B, C),) -> Array(C) ≈ Array(A) * Array(B), ops)
+        finally
+            Metal.own_flushes!(bq, was)
+        end
+    end
+
     @testset "which strided views are windows on a dense array" begin
         parent = MtlArray(zeros(Float16, 16 * 2 * 3 * 16 * 2))
         view4(st, off) = (; res = parent, dims = (16, 16, 2, 2), strides = st, offset = off)
