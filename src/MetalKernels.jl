@@ -28,7 +28,13 @@ KI.versioninfo(io::IO, ::MetalBackend) = Metal.versioninfo(io)
 KI.zeros(::MetalBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where T = Metal.zeros(T, dims; storage=unified ? SharedStorage : DefaultStorageMode)
 KI.ones(::MetalBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where T = Metal.ones(T, dims; storage=unified ? SharedStorage : DefaultStorageMode)
 
-KI.get_backend(::MtlArray) = MetalBackend()
+# From KernelAbstractions 0.10 on, `KA.get_backend` IS this function, and
+# MetalKernelsOld.jl already answers it for an `MtlArray` with the backend KA
+# kernels launch on. A second method for the same signature is an overwrite,
+# which stops Metal from precompiling.
+if KI.get_backend !== Metal.KernelAbstractions.get_backend
+    KI.get_backend(::MtlArray) = MetalBackend()
+end
 KI.synchronize(::MetalBackend) = synchronize()
 
 KI.functional(::MetalBackend) = Metal.functional()
