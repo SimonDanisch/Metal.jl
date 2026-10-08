@@ -148,8 +148,9 @@ function matmul!(c::MtlArray{T1,N}, a::MtlArray{T2,N}, b::MtlArray{T3,N},
     # The batch's command buffer, not one of this call's own: committing a private one
     # here put the product ahead of the uploads that fill its operands, and the batch's
     # `fill!(c, 0)` then landed on top of the result. See `Metal.batchbuffer`.
-    cmdbuf = Metal.batchbuffer(mat_mul_kernel, mps_a, mps_b, mps_c, a, b, c)
-    encode!(cmdbuf, mat_mul_kernel, mps_b, mps_a, mps_c)
+    Metal.batchbuffer(mat_mul_kernel, mps_a, mps_b, mps_c, a, b, c) do cmdbuf
+        encode!(cmdbuf, mat_mul_kernel, mps_b, mps_a, mps_c)
+    end
 
     return c
 end
@@ -211,8 +212,9 @@ end
 
     # The batch's buffer, for the reason `Metal.batchbuffer` gives: committing a private
     # one runs this ahead of whatever is still open that filled `A`.
-    cmdbuf = Metal.batchbuffer(topk_kernel, mps_a, mps_i, mps_v, A, I, V)
-    encode!(cmdbuf, topk_kernel, mps_a, mps_i, mps_v)
+    Metal.batchbuffer(topk_kernel, mps_a, mps_i, mps_v, A, I, V) do cmdbuf
+        encode!(cmdbuf, topk_kernel, mps_a, mps_i, mps_v)
+    end
 
     return I, V
 end

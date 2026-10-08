@@ -337,10 +337,10 @@ function end_encoder!(bq::BatchedCommandQueue)
 end
 
 """
-    batchbuffer(roots...) -> MTLCommandBuffer
+    batchbuffer(f, roots...) -> f(cmdbuf)
 
-The command buffer this task's queue is already BATCHING into, ready for a library to
-encode into — the one a kernel launch or a blit would go into.
+Call `f` with the command buffer this task's queue is already BATCHING into, for a library
+to encode into — the one a kernel launch or a blit would go into.
 
 Use this instead of `MTLCommandBuffer(global_queue(device()))` for anything that encodes
 and would then commit. Command buffers run in COMMIT order, so a library that commits its
@@ -363,8 +363,16 @@ to them waits for this batch. Wrap the operands BEFORE calling this.
 
 The buffer is NOT committed here. Whoever owns the frame commits it, which is the whole
 point.
+
+`f` runs under `submission_lock`, and that is why this takes a function rather than
+returning the buffer. Encoding into the batch is changing it, and a batch is changed only
+under that lock: on a queue another task can reach — the one [`adopt_queue!`](@ref)
+installs is every task's — a launch from that task in the middle of the library's encode
+opens a second encoder on the command buffer, and a flush commits it with the library's
+encoder still open. Metal aborts the process for either. Handing the buffer back and
+encoding after the lock was released left exactly that window.
 """
-function batchbuffer(roots...)
+function batchbuffer(f, roots...)
     bq = global_queue(device())
     pending = pending_ownership()
     while true
@@ -376,7 +384,7 @@ function batchbuffer(roots...)
                 end_encoder!(bq)
                 cmdbuf = ensure_cmdbuf!(bq)
                 record_operation!(bq, roots...)
-                return cmdbuf
+                return f(cmdbuf)
             end
             pending[i]
         end

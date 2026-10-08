@@ -80,17 +80,20 @@ function encode_batched!(graph::MPSGraph, feeds, results, roots...)
     # Before the buffer is taken: it may commit the batch to make room (a command
     # buffer holds the residency sets of at most 16 distinct graphs).
     Metal.joingraph!(bq, graph)
-    cmdbuf = Metal.batchbuffer(roots...)
-    mps = MPSCommandBuffer(cmdbuf)
-    encode!(mps, graph, NSDictionary(feeds), NSDictionary(results), nil,
-            default_exec_desc())
-    # MPS may have `commitAndContinue`d: committed the buffer it was given and moved
-    # to one of its own, which it does on its own schedule — once in 161 encodes of
-    # SAM 2.1's encoder frame. The batch adopts the continuation rather than being
-    # left holding a committed buffer. A no-op in the usual case.
-    Metal.adopt_continued!(bq, cmdbuf, mps.commandBuffer)
-    # An adopted continuation starts with no graphs counted, and holds this one.
-    Metal.joingraph!(bq, graph)
+    # The encode, the adoption and the count all inside `batchbuffer`'s lock: a launch
+    # or a flush from another task between them lands in a buffer MPS is encoding into.
+    Metal.batchbuffer(roots...) do cmdbuf
+        mps = MPSCommandBuffer(cmdbuf)
+        encode!(mps, graph, NSDictionary(feeds), NSDictionary(results), nil,
+                default_exec_desc())
+        # MPS may have `commitAndContinue`d: committed the buffer it was given and
+        # moved to one of its own, which it does on its own schedule — once in 161
+        # encodes of SAM 2.1's encoder frame. The batch adopts the continuation rather
+        # than being left holding a committed buffer. A no-op in the usual case.
+        Metal.adopt_continued!(bq, cmdbuf, mps.commandBuffer)
+        # An adopted continuation starts with no graphs counted, and holds this one.
+        Metal.joingraph!(bq, graph)
+    end
     return nothing
 end
 

@@ -66,8 +66,9 @@ function blur(image, kernel; pixelFormat=MTL.MTLPixelFormatRGBA8Unorm)
     # The batch's buffer, not one of this call's own — see `Metal.batchbuffer`. The two
     # textures and the kernel are held until it retires; nothing else references them once
     # this returns, and the encoding does not copy them.
-    cmdbuf = Metal.batchbuffer(kernel, text1, text2, image, res)
-    encode!(cmdbuf, kernel, text1, text2)
+    Metal.batchbuffer(kernel, text1, text2, image, res) do cmdbuf
+        encode!(cmdbuf, kernel, text1, text2)
+    end
 
     return res
 end

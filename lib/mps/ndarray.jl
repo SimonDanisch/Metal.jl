@@ -111,7 +111,9 @@ function exportToMtlArray!(arr::MtlArray{T}, ndarr::MPSNDArrayLike; async=false)
     #
     # The buffer is taken before `batchbuffer`, which claims it for the batch.
     buf = Base.unsafe_convert(MTLBuffer, arr)
-    exportDataWithCommandBuffer(ndarr, Metal.batchbuffer(ndarr, arr), buf, T, arr.offset)
+    Metal.batchbuffer(ndarr, arr) do cmdbuf
+        exportDataWithCommandBuffer(ndarr, cmdbuf, buf, T, arr.offset)
+    end
 
     async || synchronize(global_queue(dev))
     return arr
