@@ -113,7 +113,7 @@ function mtl4_probe!(a::Metal.MtlVector{Float32}, value::Float32, useicb::Bool)
         MTL.add_allocation!(resset, icb)
     end
     MTL.add_allocation!(resset, argbuf)
-    MTL.add_allocation!(resset, a.data[])
+    MTL.add_allocation!(resset, a.data[].buffer)
     MTL.commit!(resset)
 
     q4 = msg0(d, "newMTL4CommandQueue")
@@ -216,7 +216,7 @@ function mtl4_indirect_probe!(a::Metal.MtlVector{Float32}, value::Float32, group
     legacy = Metal.global_queue(dev)
     lq = legacy isa MTL.MTLCommandQueue ? legacy : getfield(legacy, :queue)
     resset = Metal.install_queue_residency!(lq, dev)
-    for r in (argbuf, gridbuf, a.data[])
+    for r in (argbuf, gridbuf, a.data[].buffer)
         MTL.add_allocation!(resset, r)
     end
     MTL.commit!(resset)

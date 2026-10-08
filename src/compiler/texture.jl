@@ -218,7 +218,7 @@ function lower_texture_bindings!(@nospecialize(job::CompilerJob), mod::LLVM.Modu
                                  entry::LLVM.Function, nmarkers::Int)
     kinds, _ = texture_binding_parameters(job)
     any(!=(0), kinds) || return nothing
-    params = collect(LLVM.parameters(entry))
+    params = collect(entry.parameters)
     offset = leading_offset(length(params), nmarkers)
     textures = LLVM.Value[params[i + offset] for i in eachindex(kinds) if kinds[i] == 1]
     samplers = LLVM.Value[params[i + offset] for i in eachindex(kinds) if kinds[i] == 2]
@@ -226,20 +226,20 @@ function lower_texture_bindings!(@nospecialize(job::CompilerJob), mod::LLVM.Modu
 
     for (name, bound, what) in ((AIR_TEXTURE_PLACEHOLDER, textures, "texture"),
                                 (AIR_SAMPLER_PLACEHOLDER, samplers, "sampler"))
-        haskey(LLVM.functions(mod), name) || continue
-        f = LLVM.functions(mod)[name]
-        for use in collect(uses(f))
-            call = user(use)
+        f = get(mod.functions, name, nothing)
+        f === nothing && continue
+        for use in collect(f.uses)
+            call = use.user
             call isa LLVM.CallInst ||
                 error("$name is referenced by something other than a call: $call")
-            LLVM.parent(LLVM.parent(call)) === entry || error("""
-                a $what binding is named from `$(LLVM.name(LLVM.parent(LLVM.parent(call))))`,
+            call.parent.parent === entry || error("""
+                a $what binding is named from `$(call.parent.parent.name)`,
                 which is not the stage entry. The replacement is an entry PARAMETER, so
                 the call has to have been inlined into the entry — every shader is, by
                 the time `finish_ir!` runs. A function this did not reach is one the
                 optimiser kept out of line, and sampling from it needs the parameter
                 threaded through instead.""")
-            b = LLVM.operands(call)[1]
+            b = call.operands[1]
             b isa LLVM.ConstantInt || error("""
                 the $what binding of a `sample_texture_2d` call is not a constant. It
                 names an encoder slot, and the stage's parameter list is fixed at
@@ -254,7 +254,7 @@ function lower_texture_bindings!(@nospecialize(job::CompilerJob), mod::LLVM.Modu
             replace_uses!(call, bound[i + 1])
             erase!(call)
         end
-        @assert isempty(uses(f)) "$name still has uses after replacement"
+        @assert isempty(f.uses) "$name still has uses after replacement"
         erase!(f)
     end
     return nothing
@@ -317,8 +317,8 @@ same context is a DIFFERENT type named `struct._texture_2d_t.0`, and a stage wit
 textures would then declare two unrelated pointee types.
 """
 function air_named_struct(mod::LLVM.Module, name::String)
-    ref = LLVM.API.LLVMGetTypeByName2(LLVM.context(mod), name)
-    return ref == C_NULL ? LLVM.StructType(name) : LLVM.LLVMType(ref)
+    T = get(mod.context.types, name, nothing)
+    return T === nothing ? LLVM.StructType(name) : T
 end
 
 """
@@ -343,7 +343,7 @@ function name_texture_pointees!(mod::LLVM.Module, entry::LLVM.Function,
             samp === nothing && (samp = air_named_struct(mod, "struct._sampler_t"))
             T = samp
         end
-        push!(parameter_attributes(entry, i + offset), TypeAttribute("byref", T))
+        push!(entry.parameter_attributes[i + offset], TypeAttribute(:byref, T))
     end
     strip_debuginfo_for_byref!(mod)
     return nothing
@@ -375,19 +375,19 @@ function strip_debuginfo_for_byref!(mod::LLVM.Module)
     # …and the FLAG with it. `strip_debuginfo!` removes the compile unit and every
     # `!dbg` attachment but leaves `!{i32 2, "Debug Info Version", i32 3}` behind, and
     # that flag alone is what `UpgradeDebugInfo` reads to decide whether to verify.
-    md = LLVM.metadata(mod)
+    md = mod.metadata
     haskey(md, "llvm.module.flags") || return nothing
     flags = md["llvm.module.flags"]
     kept = LLVM.MDNode[]
-    for node in collect(LLVM.operands(flags))
-        ops = collect(LLVM.operands(node))
+    for node in collect(flags.operands)
+        ops = collect(node.operands)
         isversion = length(ops) >= 2 && ops[2] isa LLVM.MDString &&
-                    string(ops[2]) == "Debug Info Version"
+                    convert(String, ops[2]) == "Debug Info Version"
         isversion || push!(kept, node)
     end
-    empty!(flags)
+    empty!(flags.operands)
     for node in kept
-        push!(flags, node)
+        push!(flags.operands, node)
     end
     return nothing
 end

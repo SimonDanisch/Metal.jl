@@ -34,7 +34,7 @@ if you want to use it. PRs are very [welcome](#contributing)!
 
 -  Mac device with M-series chip
 -  Julia 1.10-1.13
--  macOS 14-27
+-  macOS 15-27
 
 These requirements are fairly strict, and are due to our limited development
 resources (manpower, hardware). Supported OS versions follow Apple's support,
@@ -71,17 +71,13 @@ Toolchain:
 - Metal: 4.1 (MSL), 2.9 (AIR), 1.2.9 (metallib)
 
 Julia packages:
-- Metal.jl: 1.11.0
+- Metal.jl: 1.11.1
 - GPUArrays: 11.5.14
-- GPUCompiler: 2.7.0
+- GPUCompiler: 2.8.1
 - KernelAbstractions: 0.9.42
 - ObjectiveC: 6.0.1
 - LLVM: 9.13.1
-- LLVMDowngrader_jll: 0.10.0+1
-
-Kernel cache:
-- binary archives: enabled
-  (0 hits, 0 misses this session)
+- LLVMDowngrader_jll: 0.11.0+0
 
 1 device:
 - Apple M2 Max (30 GPU cores, 64.000 KiB allocated; Apple8, Metal4 family)
@@ -97,11 +93,11 @@ without writing your own kernels:
 
 ```julia-repl
 julia> a = MtlArray([1])
-1-element MtlVector{Int64, Metal.PrivateStorage}:
+1-element MtlVector{Int64, Metal.SharedStorage}:
  1
 
 julia> a .+ 1
-1-element MtlVector{Int64, Metal.PrivateStorage}:
+1-element MtlVector{Int64, Metal.SharedStorage}:
  2
 ```
 

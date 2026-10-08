@@ -299,10 +299,10 @@ Returns the new entry. `f` is erased and the new function takes its name, so
 callers must re-look-up the entry afterwards.
 """
 function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function)
-    ft = function_type(f)
-    params = collect(LLVM.parameters(ft))
+    ft = f.function_type
+    params = collect(ft.parameters)
     isempty(params) &&
-        error("a graphics stage needs a trailing output pointer argument; `$(LLVM.name(f))` has none")
+        error("a graphics stage needs a trailing output pointer argument; `$(f.name)` has none")
     outparam = last(params)
     outparam isa LLVM.PointerType ||
         error("the last argument of a graphics stage must be the output pointer, got $outparam")
@@ -324,15 +324,15 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
 
     new_ft = LLVM.FunctionType(T_out, params[1:(end - 1)])
     new_f = LLVM.Function(mod, "", new_ft)
-    linkage!(new_f, linkage(f))
-    for (arg, new_arg) in zip(LLVM.parameters(f), LLVM.parameters(new_f))
-        LLVM.name!(new_arg, LLVM.name(arg))
+    new_f.linkage = f.linkage
+    for (arg, new_arg) in zip(f.parameters, new_f.parameters)
+        new_arg.name = arg.name
     end
 
     slot = nothing
     @dispose builder = IRBuilder() begin
         entry = BasicBlock(new_f, "conversion")
-        position!(builder, entry)
+        position!(builder, LLVM.at_end(entry))
 
         # The body keeps writing to a pointer; it just points at a stack slot now.
         # Cast into the address space the old parameter had, so nothing in the
@@ -340,31 +340,31 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
         # The slot keeps JULIA's layout, because that is what the cloned body
         # stores into; the conversion to AIR's vector form happens at the `ret`.
         slot = alloca!(builder, convert(LLVMType, T_jl), "stage_out")
-        as = addrspace(outparam)
+        as = outparam.addrspace
         outptr = as == 0 ? slot : addrspacecast!(builder, slot, outparam)
 
-        new_args = LLVM.Value[LLVM.parameters(new_f)[i] for i in 1:(length(params) - 1)]
-        for i in 1:(length(params) - 1), attr in collect(parameter_attributes(f, i))
-            push!(parameter_attributes(new_f, i), attr)
+        new_args = LLVM.Value[new_f.parameters[i] for i in 1:(length(params) - 1)]
+        for i in 1:(length(params) - 1), attr in collect(f.parameter_attributes[i])
+            push!(new_f.parameter_attributes[i], attr)
         end
         push!(new_args, outptr)
 
         value_map = Dict{LLVM.Value, LLVM.Value}(
-            param => new_args[i] for (i, param) in enumerate(LLVM.parameters(f))
+            param => new_args[i] for (i, param) in enumerate(f.parameters)
         )
         value_map[f] = new_f
         clone_into!(new_f, f; value_map,
-                    changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
+                    changes = LLVM.CloneFunctionChangeType.GlobalChanges)
 
-        br!(builder, blocks(new_f)[2])
+        br!(builder, new_f.blocks[2])
     end
 
     # Every exit now returns the slot's contents.
-    for bb in blocks(new_f), inst in collect(instructions(bb))
+    for bb in new_f.blocks, inst in collect(bb.instructions)
         inst isa LLVM.RetInst || continue
-        isempty(collect(operands(inst))) || continue      # already returns something
+        isempty(inst.operands) || continue      # already returns something
         @dispose builder = IRBuilder() begin
-            position!(builder, inst)
+            position!(builder, LLVM.before(inst))
             jl = load!(builder, convert(LLVMType, T_jl), slot)
             ret!(builder, T_out isa LLVM.StructType ?
                           to_air_output(builder, jl, T_jl, T_out) :
@@ -374,12 +374,12 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
         erase!(inst)
     end
 
-    fn = LLVM.name(f)
-    GPUCompiler.prune_constexpr_uses!(f)
-    @assert isempty(uses(f)) "graphics entry $(fn) still has uses after cloning"
+    fn = f.name
+    remove_dead_constant_users!(f)
+    @assert isempty(f.uses) "graphics entry $(fn) still has uses after cloning"
     replace_metadata_uses!(f, new_f)
     erase!(f)
-    LLVM.name!(new_f, fn)
+    new_f.name = fn
     return new_f
 end
 
@@ -408,8 +408,8 @@ legitimately take one and guessing would silently change the ABI.
 """
 function stage_values!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                        f::LLVM.Function)
-    params = collect(LLVM.parameters(function_type(f)))
-    args   = collect(LLVM.parameters(f))
+    params = collect(f.function_type.parameters)
+    args   = collect(f.parameters)
 
     # What each parameter is worth as a value, or `nothing` to leave it alone.
     #
@@ -438,33 +438,33 @@ function stage_values!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
         end
         # Past the declared arguments: an appended builtin, whose type is
         # whatever it is loaded as.
-        us = [user(u) for u in uses(arg)]
+        us = [u.user for u in arg.uses]
         isempty(us) && continue
         all(u -> u isa LLVM.LoadInst, us) || continue
-        ts = unique(LLVMType[value_type(u) for u in us])
+        ts = unique(LLVMType[u.value_type for u in us])
         length(ts) == 1 || continue
         pointee[i] = only(ts)
     end
     all(isnothing, pointee) && return f
 
-    new_ft = LLVM.FunctionType(LLVM.return_type(function_type(f)),
+    new_ft = LLVM.FunctionType(f.function_type.return_type,
                                LLVMType[pointee[i] === nothing ? params[i] : pointee[i]
                                         for i in eachindex(params)])
     new_f = LLVM.Function(mod, "", new_ft)
-    linkage!(new_f, linkage(f))
-    for (arg, new_arg) in zip(args, LLVM.parameters(new_f))
-        LLVM.name!(new_arg, LLVM.name(arg))
+    new_f.linkage = f.linkage
+    for (arg, new_arg) in zip(args, new_f.parameters)
+        new_arg.name = arg.name
     end
 
     @dispose builder = IRBuilder() begin
-        position!(builder, BasicBlock(new_f, "byvalue"))
+        position!(builder, LLVM.at_end(BasicBlock(new_f, "byvalue")))
         new_args = LLVM.Value[]
         for (i, ty) in enumerate(pointee)
-            np = LLVM.parameters(new_f)[i]
+            np = new_f.parameters[i]
             if ty === nothing
                 # Carried through untouched, attributes and all.
-                for attr in collect(parameter_attributes(f, i))
-                    push!(parameter_attributes(new_f, i), attr)
+                for attr in collect(f.parameter_attributes[i])
+                    push!(new_f.parameter_attributes[i], attr)
                 end
                 push!(new_args, np)
                 continue
@@ -473,9 +473,9 @@ function stage_values!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
             # whatever it was compiled to load — the same 32 bits under a
             # different name when the body reinterprets. `stage_cleanup!`
             # promotes the slot away and the bitcast with it.
-            slot = alloca!(builder, ty, LLVM.name(args[i]))
+            slot = alloca!(builder, ty, args[i].name)
             store!(builder, np, slot)
-            as = addrspace(params[i])
+            as = params[i].addrspace
             push!(new_args, as == 0 ? slot : addrspacecast!(builder, slot, params[i]))
         end
 
@@ -483,16 +483,16 @@ function stage_values!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
             param => new_args[i] for (i, param) in enumerate(args))
         value_map[f] = new_f
         clone_into!(new_f, f; value_map,
-                    changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
-        br!(builder, blocks(new_f)[2])
+                    changes = LLVM.CloneFunctionChangeType.GlobalChanges)
+        br!(builder, new_f.blocks[2])
     end
 
-    fn = LLVM.name(f)
-    GPUCompiler.prune_constexpr_uses!(f)
-    @assert isempty(uses(f)) "visible function $(fn) still has uses after cloning"
+    fn = f.name
+    remove_dead_constant_users!(f)
+    @assert isempty(f.uses) "visible function $(fn) still has uses after cloning"
     replace_metadata_uses!(f, new_f)
     erase!(f)
-    LLVM.name!(new_f, fn)
+    new_f.name = fn
     return new_f
 end
 
@@ -617,8 +617,8 @@ LEADING operand of the node is the parameter position and is deliberately left
 alone: a parameter does not move because a binding does.
 """
 function shift_buffer_location(node::LLVM.MDNode, by::Integer)
-    ops = collect(LLVM.operands(node))
-    i = findfirst(o -> o isa LLVM.MDString && string(o) == "air.location_index", ops)
+    ops = collect(node.operands)
+    i = findfirst(o -> o isa LLVM.MDString && convert(String, o) == "air.location_index", ops)
     i === nothing && return node
     i < length(ops) ||
         error("air.location_index is the last operand of an argument node; " *
@@ -636,26 +636,26 @@ Move `entry` from `air.kernel` to the stage's own named metadata, with outputs.
 function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                       entry::LLVM.Function, stage::Symbol, @nospecialize(T_out::Type),
                       markers::Vector{Union{Nothing,Type}} = Union{Nothing,Type}[])
-    md = LLVM.metadata(mod)
+    md = mod.metadata
     haskey(md, "air.kernel") ||
         error("no air.kernel metadata to convert — did GPUCompiler's finish_ir! run?")
 
     # The node for THIS entry. A module can hold several after deferred codegen.
-    kernel_nodes = collect(LLVM.operands(md["air.kernel"]))
+    kernel_nodes = collect(md["air.kernel"].operands)
     # The operand is the function wrapped as metadata, so the comparison has to
     # be made on that side — `Metadata(entry)` — rather than by unwrapping. By
     # now `replace_metadata_uses!` has already repointed the node at the
     # rewritten function, so this matches the NEW entry.
     want = Metadata(entry)
     idx = findfirst(kernel_nodes) do node
-        ops = LLVM.operands(node)
+        ops = node.operands
         !isempty(ops) && ops[1] == want
     end
     idx === nothing &&
-        error("entry $(LLVM.name(entry)) has no air.kernel node to convert")
+        error("entry $(entry.name) has no air.kernel node to convert")
 
-    ops = collect(LLVM.operands(kernel_nodes[idx]))
-    arg_infos = collect(LLVM.operands(ops[3]))
+    ops = collect(kernel_nodes[idx].operands)
+    arg_infos = collect(ops[3].operands)
 
     # GPUCompiler described the ORIGINAL Julia signature. Two things happened to
     # it since: `stage_return!` dropped the trailing output pointer, and
@@ -666,7 +666,7 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     # A mesh stage keeps every parameter it started with: nothing was dropped,
     # because there was no output pointer to drop.
     stage === :mesh || pop!(arg_infos)                # the output pointer
-    nparams = length(collect(LLVM.parameters(function_type(entry))))
+    nparams = length(entry.function_type.parameters)
     while length(arg_infos) < nparams
         # A placeholder per appended builtin; `stage_input_metadata!` replaces it
         # with the real tag below, since every one of them is a marked input.
@@ -692,7 +692,7 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     # Until then this emits a well-formed `PROGRAM_VISIBLE` function with the
     # right output type that cannot yet be CALLED with a value signature.
     if isvisiblestage(stage)
-        ptys = collect(LLVM.parameters(function_type(entry)))
+        ptys = collect(entry.function_type.parameters)
         # Named from the JULIA types where there are any, because LLVM cannot
         # tell `uint` from `int` — both are `i32`, and Apple's own visible
         # functions spell the unsigned one `uint`. `air_visible_type_name` is the
@@ -756,7 +756,7 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     node = MDNode(Metadata[Metadata(entry),
                            MDNode(stage_outputs(stage, T_out)),
                            MDNode(arg_infos)])
-    push!(md[stage_metadata_key(stage)], node)
+    push!(get!(md, stage_metadata_key(stage)).operands, node)
 
     # …and it must stop being a kernel. Leaving the old node behind would leave
     # `air.kernel` pointing at a function that now returns a struct, which is not
@@ -764,9 +764,9 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     # list is emptied and the OTHER entries — deferred codegen can leave several
     # in one module — are pushed back.
     kept = [n for (i, n) in enumerate(kernel_nodes) if i != idx]
-    empty!(md["air.kernel"])
+    empty!(md["air.kernel"].operands)
     for n in kept
-        push!(md["air.kernel"], n)
+        push!(md["air.kernel"].operands, n)
     end
     return nothing
 end
@@ -836,8 +836,8 @@ mismatch is a link failure with no diagnostic rather than a wrong answer.
 function air_visible_type_name(t::LLVMType)
     t isa LLVM.PointerType && return "void*"
     if t isa LLVM.VectorType
-        base = air_visible_type_name(LLVM.eltype(t))
-        return "$base$(Int(length(t)))"
+        base = air_visible_type_name(t.element_type)
+        return "$base$(Int(t.length))"
     end
     t == LLVM.FloatType()  && return "float"
     t == LLVM.HalfType()   && return "half"
@@ -1054,8 +1054,8 @@ function stage_inputs!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                        f::LLVM.Function, markers::Vector{Union{Nothing,Type}})
     any(!isnothing, markers) || return f
 
-    ft = function_type(f)
-    params = collect(LLVM.parameters(ft))
+    ft = f.function_type
+    params = collect(ft.parameters)
     # GPUCompiler prepends the kernel-state pointer (`kernel_state_to_reference!`),
     # which has no Julia argument, so the markers are right-aligned against the
     # parameter list rather than starting at 1.
@@ -1063,59 +1063,60 @@ function stage_inputs!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
 
     # A parameter that ALREADY has the scalar type is one `stage_builtins!`
     # appended — those arrive as values, not as buffer pointers, so there is
-    # nothing to convert and marking them again would try to `addrspace` an
-    # `i32`. Only the marker-typed Julia arguments need the rewrite.
+    # nothing to convert and marking them again would try to read the
+    # `.addrspace` of an `i32`. Only the marker-typed Julia arguments need the
+    # rewrite.
     needs = [markers[i] !== nothing && params[i] != stage_input_llvmtype(markers[i])
              for i in eachindex(params)]
     any(needs) || return f          # nothing left to convert
     new_types = LLVMType[needs[i] ? stage_input_llvmtype(markers[i]) : params[i]
                          for i in eachindex(params)]
-    new_ft = LLVM.FunctionType(LLVM.return_type(ft), new_types)
+    new_ft = LLVM.FunctionType(ft.return_type, new_types)
     new_f = LLVM.Function(mod, "", new_ft)
-    linkage!(new_f, linkage(f))
-    for (arg, new_arg) in zip(LLVM.parameters(f), LLVM.parameters(new_f))
-        LLVM.name!(new_arg, LLVM.name(arg))
+    new_f.linkage = f.linkage
+    for (arg, new_arg) in zip(f.parameters, new_f.parameters)
+        new_arg.name = arg.name
     end
 
     @dispose builder = IRBuilder() begin
         entry = BasicBlock(new_f, "stage_inputs")
-        position!(builder, entry)
+        position!(builder, LLVM.at_end(entry))
 
         new_args = LLVM.Value[]
         for (i, param) in enumerate(params)
-            arg = LLVM.parameters(new_f)[i]
+            arg = new_f.parameters[i]
             if !needs[i]
                 push!(new_args, arg)
-                for attr in collect(parameter_attributes(f, i))
-                    push!(parameter_attributes(new_f, i), attr)
+                for attr in collect(f.parameter_attributes[i])
+                    push!(new_f.parameter_attributes[i], attr)
                 end
             else
                 # The body was compiled against a pointer to the marker struct,
                 # which is a one-field wrapper around the scalar — so a slot
                 # holding the scalar has the same layout, and a cast to the old
                 # parameter's address space keeps every load in the body valid.
-                slot = alloca!(builder, value_type(arg))
+                slot = alloca!(builder, arg.value_type)
                 store!(builder, arg, slot)
-                as = addrspace(param)
+                as = param.addrspace
                 push!(new_args, as == 0 ? slot : addrspacecast!(builder, slot, param))
             end
         end
 
         value_map = Dict{LLVM.Value, LLVM.Value}(
-            p => new_args[i] for (i, p) in enumerate(LLVM.parameters(f))
+            p => new_args[i] for (i, p) in enumerate(f.parameters)
         )
         value_map[f] = new_f
         clone_into!(new_f, f; value_map,
-                    changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
-        br!(builder, blocks(new_f)[2])
+                    changes = LLVM.CloneFunctionChangeType.GlobalChanges)
+        br!(builder, new_f.blocks[2])
     end
 
-    fn = LLVM.name(f)
-    GPUCompiler.prune_constexpr_uses!(f)
-    @assert isempty(uses(f)) "stage entry $(fn) still has uses after cloning"
+    fn = f.name
+    remove_dead_constant_users!(f)
+    @assert isempty(f.uses) "stage entry $(fn) still has uses after cloning"
     replace_metadata_uses!(f, new_f)
     erase!(f)
-    LLVM.name!(new_f, fn)
+    new_f.name = fn
     return new_f
 end
 
@@ -1204,14 +1205,15 @@ The pass list is GPUCompiler's own from `add_parameter_address_spaces!`, which
 introduces the same shape and cleans up after itself the same way.
 """
 function stage_cleanup!(@nospecialize(job::CompilerJob), mod::LLVM.Module)
-    @dispose pb = NewPMPassBuilder() begin
-        add!(pb, NewPMFunctionPassManager()) do fpm
-            add!(fpm, SimplifyCFGPass())
-            add!(fpm, SROAPass())
-            add!(fpm, EarlyCSEPass())
-            add!(fpm, InstCombinePass())
+    # (the pass vocabulary, `LLVM.Passes`, is not imported by this package)
+    @dispose pb = LLVM.PassBuilder() begin
+        add!(pb, LLVM.FunctionPassManager()) do fpm
+            add!(fpm, LLVM.SimplifyCFGPass())
+            add!(fpm, LLVM.SROAPass())
+            add!(fpm, LLVM.EarlyCSEPass())
+            add!(fpm, LLVM.InstCombinePass())
         end
-        run!(pb, mod)
+        LLVM.run!(pb, mod)
     end
     return nothing
 end
@@ -1234,24 +1236,24 @@ Run BEFORE `stage_cleanup!`, so the now-empty function is inlined away rather
 than left as a call in the shader's hot path.
 """
 function stage_drop_exception_signal!(mod::LLVM.Module)
-    haskey(functions(mod), "gpu_signal_exception") || return false
-    f = functions(mod)["gpu_signal_exception"]
+    f = get(mod.functions, "gpu_signal_exception", nothing)
+    f === nothing && return false
     isdeclaration(f) && return false
     empty!(f)
     @dispose builder = IRBuilder() begin
-        position!(builder, BasicBlock(f, "entry"))
+        position!(builder, LLVM.at_end(BasicBlock(f, "entry")))
         ret!(builder)
     end
     # It does nothing now, and saying so lets the inliner and DCE treat it as
     # the no-op it is instead of a call that might write memory.
-    push!(function_attributes(f), EnumAttribute("alwaysinline", 0))
+    push!(f.function_attributes, EnumAttribute(:alwaysinline))
     # …and PRIVATE, so it is not exported. A stage compiled on its own never
     # noticed: its metallib is linked with nothing. A VISIBLE function is linked
     # INTO a kernel's pipeline, and that kernel carries its own
     # `gpu_signal_exception` — two external definitions of the same name, which
     # the Metal linker refuses with "symbol multiply defined" and no hint that an
     # emptied helper is what collided.
-    linkage!(f, LLVM.API.LLVMPrivateLinkage)
+    f.linkage = LLVM.Linkage.Private
     return true
 end
 
@@ -1318,15 +1320,15 @@ function stage_builtins!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
         # error, no diagnostic, and a traversal that commits nothing.
         alwayson = job.config.params.stage === :candidate &&
                    startswith(name, "__air_candidate_")
-        if !haskey(globals(mod), name)
+        if !haskey(mod.globals, name)
             alwayson || continue
             # Declare it so there is something to turn into a parameter. With no
             # uses the rewrite below simply drops the load, which is what an
             # unread builtin should cost.
             GlobalVariable(mod, stage_input_llvmtype(marker), name)
         end
-        gv = globals(mod)[name]
-        (alwayson || !isempty(uses(gv))) || continue
+        gv = mod.globals[name]
+        (alwayson || !isempty(gv.uses)) || continue
         push!(used, (name, marker, gv))
     end
     isempty(used) && return (f, Type[])
@@ -1334,34 +1336,34 @@ function stage_builtins!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     # order IS the argument-metadata order, so it must not vary between runs.
     sort!(used; by = first)
 
-    ft = function_type(f)
-    params = collect(LLVM.parameters(ft))
+    ft = f.function_type
+    params = collect(ft.parameters)
     extra = LLVMType[stage_input_llvmtype(m) for (_, m, _) in used]
-    new_ft = LLVM.FunctionType(LLVM.return_type(ft), vcat(params, extra))
+    new_ft = LLVM.FunctionType(ft.return_type, vcat(params, extra))
     new_f = LLVM.Function(mod, "", new_ft)
-    linkage!(new_f, linkage(f))
-    for (arg, new_arg) in zip(LLVM.parameters(f), LLVM.parameters(new_f))
-        LLVM.name!(new_arg, LLVM.name(arg))
+    new_f.linkage = f.linkage
+    for (arg, new_arg) in zip(f.parameters, new_f.parameters)
+        new_arg.name = arg.name
     end
     for (i, (name, _, _)) in enumerate(used)
-        LLVM.name!(LLVM.parameters(new_f)[length(params) + i], name)
+        new_f.parameters[length(params) + i].name = name
     end
 
     value_map = Dict{LLVM.Value, LLVM.Value}(
-        p => LLVM.parameters(new_f)[i] for (i, p) in enumerate(LLVM.parameters(f))
+        p => new_f.parameters[i] for (i, p) in enumerate(f.parameters)
     )
     value_map[f] = new_f
     clone_into!(new_f, f; value_map,
-                changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
+                changes = LLVM.CloneFunctionChangeType.GlobalChanges)
 
     # Every load of the builtin becomes a use of the new parameter. The load is
     # what the `llvmcall` in the intrinsic emitted; there is nothing else the
     # global can appear in, since it has no definition to store into.
     for (i, (name, _, _)) in enumerate(used)
-        gv = globals(mod)[name]
-        arg = LLVM.parameters(new_f)[length(params) + i]
-        for use in collect(uses(gv))
-            u = user(use)
+        gv = mod.globals[name]
+        arg = new_f.parameters[length(params) + i]
+        for use in collect(gv.uses)
+            u = use.user
             u isa LLVM.LoadInst ||
                 error("stage builtin @$name is used by $(typeof(u)); only a load is expected")
             replace_uses!(u, arg)
@@ -1369,18 +1371,18 @@ function stage_builtins!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
         end
     end
 
-    fn = LLVM.name(f)
-    GPUCompiler.prune_constexpr_uses!(f)
-    @assert isempty(uses(f)) "stage entry $(fn) still has uses after cloning"
+    fn = f.name
+    remove_dead_constant_users!(f)
+    @assert isempty(f.uses) "stage entry $(fn) still has uses after cloning"
     replace_metadata_uses!(f, new_f)
     erase!(f)
-    LLVM.name!(new_f, fn)
+    new_f.name = fn
 
     # The globals are dead now; leaving them behind would make the module
     # declare an undefined symbol the loader has to resolve.
     for (name, _, _) in used
-        gv = globals(mod)[name]
-        isempty(uses(gv)) && erase!(gv)
+        gv = mod.globals[name]
+        isempty(gv.uses) && erase!(gv)
     end
 
     return (new_f, Type[m for (_, m, _) in used])
@@ -1413,31 +1415,31 @@ The output pointer was last until `stage_builtins!` appended to the signature.
 """
 function rotate_output_last!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                              f::LLVM.Function, ntrailing::Int)
-    ft = function_type(f)
-    params = collect(LLVM.parameters(ft))
+    ft = f.function_type
+    params = collect(ft.parameters)
     out_idx = length(params) - ntrailing
     order = vcat(1:(out_idx - 1), (out_idx + 1):length(params), out_idx)
 
-    new_ft = LLVM.FunctionType(LLVM.return_type(ft), LLVMType[params[i] for i in order])
+    new_ft = LLVM.FunctionType(ft.return_type, LLVMType[params[i] for i in order])
     new_f = LLVM.Function(mod, "", new_ft)
-    linkage!(new_f, linkage(f))
+    new_f.linkage = f.linkage
     for (new_pos, old_pos) in enumerate(order)
-        LLVM.name!(LLVM.parameters(new_f)[new_pos], LLVM.name(LLVM.parameters(f)[old_pos]))
+        new_f.parameters[new_pos].name = f.parameters[old_pos].name
     end
 
     value_map = Dict{LLVM.Value, LLVM.Value}(
-        LLVM.parameters(f)[old_pos] => LLVM.parameters(new_f)[new_pos]
+        f.parameters[old_pos] => new_f.parameters[new_pos]
         for (new_pos, old_pos) in enumerate(order)
     )
     value_map[f] = new_f
     clone_into!(new_f, f; value_map,
-                changes = LLVM.API.LLVMCloneFunctionChangeTypeGlobalChanges)
+                changes = LLVM.CloneFunctionChangeType.GlobalChanges)
 
-    fn = LLVM.name(f)
-    GPUCompiler.prune_constexpr_uses!(f)
-    @assert isempty(uses(f)) "stage entry $(fn) still has uses after reordering"
+    fn = f.name
+    remove_dead_constant_users!(f)
+    @assert isempty(f.uses) "stage entry $(fn) still has uses after reordering"
     replace_metadata_uses!(f, new_f)
     erase!(f)
-    LLVM.name!(new_f, fn)
+    new_f.name = fn
     return new_f
 end

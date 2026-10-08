@@ -4,16 +4,15 @@ using GPUArrays
 using Adapt
 using GPUCompiler
 using GPUToolbox
-using LLVM
+using LLVM, LLVM.IR, LLVM.Build
 using LLVM.Interop
 import LLVMDowngrader_jll
 using Preferences: @load_preference, load_preference
-using Scratch: @get_scratch!
 using ExprTools: splitdef, combinedef
 using ObjectiveC, .CoreFoundation, .Foundation, .Dispatch, .OS
 import ObjectiveC: is_macos
-import KernelAbstractions
 import KernelInterface
+import UnsafeAtomics
 using BFloat16s: BFloat16
 using ScopedValues
 
@@ -77,7 +76,6 @@ include("array.jl")
 
 # compiler implementation
 include("compiler/library.jl")
-include("compiler/archive.jl")
 include("compiler/compilation.jl")
 include("compiler/graphics.jl")
 # The mesh stage, after `graphics.jl`: it reuses `mangle_varying`, `air_stage_name`
@@ -106,24 +104,22 @@ include("linalg.jl")
 include("utilities.jl")
 include("profiling.jl")
 include("broadcast.jl")
-include("mapreduce.jl")
 include("accumulate.jl")
 include("sorting.jl")
-include("indexing.jl")
 include("random.jl")
 include("fft.jl")
 
-# KernelAbstractions
-include("MetalKernelsOld.jl")
+# KernelInterface
+include("MetalKernels.jl")
 import .MetalKernels: MetalBackend
 export MetalBackend
 
-# KernelInterface - NOT PUBLIC. Use KernelInterface.get_backend on an MtlArray to get the backend
-include("MetalKernels.jl")
-import .MetalInterface
-
 include("deprecated.jl")
-if @load_preference("precompile", true)
+should_precompile = is_macos(v"15") &&
+                      Sys.ARCH === :aarch64 &&
+                      @load_preference("precompile", true) &&
+                      !isempty(devices())
+if should_precompile
     include("precompile.jl")
 end
 

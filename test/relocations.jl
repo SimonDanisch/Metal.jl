@@ -2,7 +2,7 @@ using GPUCompiler
 using LLVM: LLVM
 
 # Metal selects the `:table` relocation-lowering strategy so kernels stay byte-stable across
-# sessions (restoring pkgimage persistence and content-keyed binary archives) whether or not
+# sessions (restoring pkgimage persistence and hits in Metal's shader cache) whether or not
 # they carry relocations. See `GPUCompiler.relocation_lowering(::MetalCompilerJob)`; on
 # LLVM < 17 (Julia < 1.12) it falls back to session-local `:bake` resolution.
 
@@ -33,8 +33,9 @@ end
 # inspect the relocation records a kernel would carry (before any lowering)
 kernel_relocations(@nospecialize(f), @nospecialize(tt)) =
     GPUCompiler.JuliaContext() do ctx
-        _, meta = GPUCompiler.compile_unhooked(:llvm, kernel_job(f, tt);
-                                               resolve_relocations=false)
+        ir, meta = GPUCompiler.compile_unhooked(:llvm, kernel_job(f, tt);
+                                                resolve_relocations=false)
+        LLVM.dispose(ir)
         meta.relocations
     end
 

@@ -39,12 +39,13 @@ end
 
 `N`-dimensional Metal array with storage mode `S` and elements of type `T`.
 
-`S` can be `Metal.PrivateStorage` (default), `Metal.SharedStorage`.
+`S` can be `Metal.SharedStorage` (default), `Metal.PrivateStorage`. The default
+storage mode can be changed by setting `default_storage` in LocalPreferences.toml.
 
 See the Array Programming section of the Metal.jl docs for more details.
 """
 mutable struct MtlArray{T,N,S} <: AbstractGPUArray{T,N}
-    data::DataRef{MTLBuffer}
+    data::DataRef{Managed}
 
     maxsize::Int  # maximum data size in bytes; excluding any selector bytes
     offset::Int   # offset of the data in the buffer, in bytes
@@ -54,40 +55,35 @@ mutable struct MtlArray{T,N,S} <: AbstractGPUArray{T,N}
         check_eltype(T)
         maxsize::Int = prod(dims) * sizeof(T)
 
-        bufsize = Ref(Base.isbitsunion(T) ? (maxsize + prod(dims)) : maxsize)
+        bufsize::Int = Base.isbitsunion(T) ? (maxsize + prod(dims)) : maxsize
 
         dev = device()
-        if bufsize[] == 0
-            # Metal doesn't support empty allocations. For simplicity (i.e., the ability to get
-            # a pointer, query the buffer's properties, etc), we use a 1-byte buffer instead.
-            bufsize[] = 1
-        end
-        data = GPUArrays.cached_alloc((MtlArray, dev, bufsize[], S)) do
-            buf = alloc(dev, bufsize[]; storage = S)
-            DataRef(buf) do buf
-                free(buf)
+        data = GPUArrays.cached_alloc((MtlArray, dev, bufsize, S)) do
+            buf = alloc(dev, bufsize; storage = S)
+            DataRef(Managed(buf)) do managed
+                free(managed.buffer)
             end
         end
-        @label! data[] "MtlArray{$(T),$(N),$(S)}(dims=$dims)"
+        @label! data[].buffer "MtlArray{$(T),$(N),$(S)}(dims=$dims)"
 
         obj = new{T,N,S}(data, maxsize, 0, dims)
         finalizer(unsafe_free!, obj)
     end
 
-    function MtlArray{T,N,S}(data::DataRef{<:MTLBuffer}, dims::Dims{N};
+    function MtlArray{T,N,S}(data::DataRef{Managed}, dims::Dims{N};
                              maxsize::Int=prod(dims) * sizeof(T), offset::Int=0) where {T,N,S}
         check_eltype(T)
         storagemode = convert(MTL.MTLStorageMode, S)
-        if storagemode != data[].storageMode
-            error("Storage mode mismatch: expected $S, got $(data[].storageMode)")
+        if storagemode != data[].buffer.storageMode
+            error("Storage mode mismatch: expected $S, got $(data[].buffer.storageMode)")
         end
         obj = new{T, N, S}(copy(data), maxsize, offset, dims)
         finalizer(unsafe_free!, obj)
     end
-    function MtlArray{T,N}(data::DataRef{<:MTLBuffer}, dims::Dims{N};
+    function MtlArray{T,N}(data::DataRef{Managed}, dims::Dims{N};
                            maxsize::Int=prod(dims) * sizeof(T), offset::Int=0) where {T,N}
         check_eltype(T)
-        storagemode = data[].storageMode
+        storagemode = data[].buffer.storageMode
         obj = if storagemode == MTL.MTLStorageModeShared
             new{T,N,SharedStorage}(copy(data), maxsize, offset, dims)
         elseif storagemode == MTL.MTLStorageModeManaged
@@ -104,10 +100,15 @@ end
 
 # Create MtlArray from MTLBuffer
 function MtlArray{T,N}(buf::B, dims::Dims{N}; kwargs...) where {B<:MTLBuffer,T,N}
-    data = DataRef(buf) do buf
-        free(buf)
+    data = DataRef(Managed(buf)) do managed
+        free(managed.buffer)
     end
-    return MtlArray{T,N}(data, dims; kwargs...)
+    try
+        return MtlArray{T,N}(data, dims; kwargs...)
+    finally
+        # the array holds its own reference; if constructing it failed, this frees the buffer
+        unsafe_free!(data)
+    end
 end
 
 GPUArrays.storage(a::MtlArray) = a.data
@@ -117,7 +118,7 @@ GPUArrays.storage(a::MtlArray) = a.data
 
 Get the Metal device for an MtlArray.
 """
-device(A::MtlArray) = A.data[].device
+device(A::MtlArray) = A.data[].buffer.device
 
 storagemode(x::MtlArray) = storagemode(typeof(x))
 storagemode(::Type{<:MtlArray{<:Any,<:Any,S}}) where {S} = S
@@ -185,15 +186,25 @@ See also `VecOrMat`(@ref) for examples.
 """
 const MtlVecOrMat{T,S} = Union{MtlVector{T,S},MtlMatrix{T,S}}
 
-# default to private memory
-const DefaultStorageMode = let str = @load_preference("default_storage", "private")
-    if str == "private"
-        PrivateStorage
-    elseif str == "shared"
+# default to shared memory
+const DefaultStorageMode = let str = @load_preference("default_storage", "shared")
+    if str == "shared"
         SharedStorage
+    elseif str == "private"
+        PrivateStorage
     else
         error("unknown default storage mode: $str")
     end
+end
+
+@public allowscalar
+function allowscalar(allow::Bool)
+    if !allow && DefaultStorageMode == SharedStorage
+        @warn """Metal.jl uses unified memory by default, so scalar indexing will still be allowed on arrays that use it.
+                 To ensure operations run on the GPU, set `default_storage` to "private" in your LocalPreferences.toml,
+                 or use `Metal.PrivateStorage` when creating your `MtlArray`s.""" maxlog=1
+    end
+    GPUArrays.allowscalar(allow)
 end
 
 MtlArray{T,N}(::UndefInitializer, dims::Dims{N}) where {T,N} =
@@ -254,26 +265,33 @@ end
 
 
 function Base.unsafe_convert(::Type{MtlPtr{T}}, x::MtlArray) where {T}
-    buf = x.data[]
-    MtlPtr{T}(buf, x.offset)
+    MtlPtr{T}(x.data[], x.offset)
 end
 
+# accessing memory from the CPU: wait for the GPU to finish using it
 function Base.unsafe_convert(::Type{Ptr{S}}, x::MtlArray{T}) where {S,T}
-    synchronize()
-    buf = x.data[]
-    convert(Ptr{S}, buf) + x.offset
+    convert(Ptr{S}, MtlPtr{T}(x.data[], x.offset))
 end
 
 
 ## indexing
-function Base.getindex(x::MtlArray{T,N,SharedStorage}, I::Int) where {T,N}
+
+# arrays in shared memory can be accessed directly by the CPU. this is meant to be fast, as
+# it is used to iterate arrays on the CPU, so bypass the checks for scalar iteration and
+# only synchronize when the GPU may still be using the array.
+@inline function Base.getindex(x::MtlArray{T,N,SharedStorage}, I::Int) where {T,N}
     @boundscheck checkbounds(x, I)
-    unsafe_load(pointer(x, I; storage=SharedStorage))
+    managed = x.data[]
+    maybe_synchronize(managed)
+    unsafe_load(convert(Ptr{T}, managed.host_ptr + x.offset), I)
 end
 
-function Base.setindex!(x::MtlArray{T,N,SharedStorage}, v, I::Int) where {T,N}
+@inline function Base.setindex!(x::MtlArray{T,N,SharedStorage}, v, I::Int) where {T,N}
     @boundscheck checkbounds(x, I)
-    unsafe_store!(pointer(x, I; storage=SharedStorage), v)
+    managed = x.data[]
+    maybe_synchronize(managed)
+    unsafe_store!(convert(Ptr{T}, managed.host_ptr + x.offset), v, I)
+    return x
 end
 
 
@@ -317,12 +335,19 @@ Base.convert(::Type{T}, x::T) where T <: MtlArray = x
 
 ## interop with C libraries
 
-Base.unsafe_convert(::Type{MTL.MTLBuffer}, x::MtlArray) = x.data[]
+# passing an array's buffer to Metal (e.g., to encode an MPS kernel) uses it on the GPU.
+# the use is registered when the current task submits its next command buffer. note that
+# MPS objects wrapping an array (e.g., `MPSMatrix`) only do so when they are constructed.
+function Base.unsafe_convert(::Type{MTL.MTLBuffer}, x::MtlArray)
+    managed = x.data[]
+    push!(pending_ownership(), managed)
+    return managed.buffer
+end
 
 
 ## interop with ObjC libraries
 
-Base.cconvert(::Type{<:id}, x::MtlArray) = x.data[]
+Base.cconvert(::Type{<:id}, x::MtlArray) = Base.unsafe_convert(MTL.MTLBuffer, x)
 
 
 ## interop with CPU arrays
@@ -384,8 +409,6 @@ Base.copyto!(dest::MtlArray{T}, src::MtlArray{T}) where {T} =
 
 # CPU -> GPU
 function Base.unsafe_copyto!(dev::MTLDevice, dest::MtlArray{T}, doffs, src::Array{T}, soffs, n) where T
-    # these copies are implemented using pure memcpy's, not API calls, so aren't ordered.
-    synchronize()
     GC.@preserve src dest unsafe_copyto!(dev, pointer(dest, doffs), pointer(src, soffs), n)
     if Base.isbitsunion(T)
         # copy selector bytes
@@ -396,8 +419,6 @@ end
 
 # GPU -> CPU
 function Base.unsafe_copyto!(dev::MTLDevice, dest::Array{T}, doffs, src::MtlArray{T}, soffs, n) where T
-    # these copies are implemented using pure memcpy's, not API calls, so aren't ordered.
-    synchronize()
     GC.@preserve src dest unsafe_copyto!(dev, pointer(dest, doffs), pointer(src, soffs), n)
     if Base.isbitsunion(T)
         # copy selector bytes
@@ -408,8 +429,6 @@ end
 
 # GPU -> GPU
 function Base.unsafe_copyto!(dev::MTLDevice, dest::MtlArray{T}, doffs, src::MtlArray{T}, soffs, n) where T
-    # these copies are implemented using pure memcpy's, not API calls, so aren't ordered.
-    synchronize()
     GC.@preserve src dest unsafe_copyto!(dev, pointer(dest, doffs), pointer(src, soffs), n)
     if Base.isbitsunion(T)
         # copy selector bytes
@@ -470,9 +489,9 @@ function Adapt.adapt_storage(to::MtlArrayAdaptor{S}, xs::AbstractArray{T,N}) whe
 end
 
 """
-    mtl(A; storage=Metal.PrivateStorage)
+    mtl(A; storage=$(DefaultStorageMode))
 
-`storage` can be `Metal.PrivateStorage` (default) or `Metal.SharedStorage`.
+`storage` can be `Metal.SharedStorage` or `Metal.PrivateStorage`.
 
 Opinionated GPU array adaptor, which may alter the element type `T` of arrays:
 * For `T<:AbstractFloat`, it makes a `MtlArray{Float32}` for performance and compatibility
@@ -490,7 +509,7 @@ Uses Adapt.jl to act inside some wrapper structs.
 
 ```jldoctest
 julia> mtl(ones(3)')
-1×3 adjoint(::MtlVector{Float32, Metal.PrivateStorage}) with eltype Float32:
+1×3 adjoint(::MtlVector{Float32, Metal.SharedStorage}) with eltype Float32:
  1.0  1.0  1.0
 
 julia> mtl(zeros(1,3); storage=Metal.SharedStorage)
@@ -501,7 +520,7 @@ julia> mtl(1:3)
 1:3
 
 julia> MtlArray(1:3)
-3-element MtlVector{Int64, Metal.PrivateStorage}:
+3-element MtlVector{Int64, Metal.SharedStorage}:
  1
  2
  3
@@ -584,6 +603,23 @@ Base.unsafe_convert(::Type{MTL.MTLBuffer}, A::PermutedDimsArray) =
 
 ## unsafe_wrap
 
+"""
+    unsafe_wrap(Array, arr::MtlArray, [dims])
+
+Wrap a Julia `Array` around the memory that backs `arr`, without copying. This is only
+possible for arrays with `SharedStorage`, including host memory that was itself wrapped
+using `unsafe_wrap(MtlArray, ...)`.
+
+!!! warning
+
+    The returned `Array` does **not** keep `arr` alive. The caller has to keep a reference
+    to `arr` for as long as the `Array`, or anything derived from it, is used; otherwise
+    the `Array` may end up referring to freed memory.
+
+Wrapping waits for pending GPU operations on `arr`. GPU operations execute asynchronously,
+so synchronize again (e.g., using `Metal.synchronize()`) before accessing the returned array
+after using `arr` on the GPU.
+"""
 function Base.unsafe_wrap(
         ::Union{Type{Array}, Type{Array{T}}, Type{Array{T, N}}},
         arr::MtlArray{T, N}, dims = size(arr);
@@ -609,19 +645,140 @@ function Base.unsafe_wrap(::Type{<:MtlArray}, ptr::MtlPtr{T},
                           dims::NTuple{N,<:Integer}) where {T,N}
     # use a non-owning `DataRef` (no finalizer) so we never free a buffer we
     # don't own; the original array remains responsible for the allocation.
-    data = DataRef(ptr.buffer)
+    # share the original's managed state so that both are synchronized alike.
+    managed = something(ptr.managed, Managed(ptr.buffer))
+    data = DataRef(managed)
     return MtlArray{T,N}(data, Dims(dims); offset=convert(Int, ptr.offset))
 end
 function Base.unsafe_wrap(t::Type{<:MtlArray}, ptr::MtlPtr, dim::Integer)
     return unsafe_wrap(t, ptr, (dim,))
 end
 
-function Base.unsafe_wrap(A::Type{<:MtlArray{T,N}}, arr::Array, dims=size(arr);
-                          dev=device(), kwargs...) where {T,N}
-    GC.@preserve arr begin
-        buf = MTLBuffer(dev, prod(dims) * sizeof(T), pointer(arr); nocopy=true, kwargs...)
-        return A(buf, Dims(dims))
+"""
+    unsafe_wrap(MtlArray, a::Array; [storage/hazard/cache options...])
+    unsafe_wrap(MtlArray, ptr::Ptr{T}, dims; ...)
+    unsafe_wrap(MtlArray{T,N}, a::Array, [dims]; ...)
+
+Wrap an `MtlArray` around host memory, without copying, so that it can be used on the GPU,
+e.g., in kernels or broadcasts. Apple silicon has unified memory, so the GPU operates
+directly on the original memory, and changes are visible from both sides.
+
+When wrapping an `Array`, the returned `MtlArray` keeps it alive, until the GPU is done
+using it. When wrapping a pointer, the caller has to make sure the memory stays valid for
+as long as the `MtlArray` is used. In both cases, the memory must not be freed or
+reallocated while it is wrapped (e.g., by calling `resize!` on the original array), and
+resizing the wrapper detaches it from the original memory.
+
+GPU operations execute asynchronously, so synchronize (e.g., using `Metal.synchronize()`)
+before accessing the original memory on the host.
+
+```julia
+a = rand(Float32, 1024)
+b = unsafe_wrap(MtlArray, a)
+b .= sin.(b)        # executes on the GPU, updating `a`
+Metal.synchronize()
+```
+"""
+# the element type, dimensionality and storage mode requested by an `unsafe_wrap` call,
+# falling back to defaults for parameters that were not specified
+wrap_eltype(::Type{<:MtlArray}, default) = default
+wrap_eltype(::Type{<:MtlArray{T}}, default) where {T} = T
+wrap_ndims(::Type{<:MtlArray}, default) = default
+wrap_ndims(::Type{<:MtlArray{<:Any,N}}, default) where {N} = N
+wrap_storage(::Type{<:MtlArray}) = SharedStorage
+wrap_storage(::Type{<:MtlArray{<:Any,<:Any,S}}) where {S} = S
+
+function Base.unsafe_wrap(A::Type{<:MtlArray}, arr::Array, dims=size(arr); kwargs...)
+    T = wrap_eltype(A, eltype(arr))
+    dims = Dims(dims)
+    N = wrap_ndims(A, length(dims))
+    length(dims) == N ||
+        throw(ArgumentError("Cannot wrap memory as a $N-dimensional array with dimensions $dims"))
+    isbitstype(T) || throw(ArgumentError("Can only wrap memory containing bits types"))
+    nbytes = checked_bytesize(T, dims)
+    nbytes <= sizeof(arr) ||
+        throw(ArgumentError("Cannot wrap $(sizeof(arr)) bytes of memory as a $(nbytes)-byte MtlArray"))
+    return wrap_host_memory(MtlArray{T,N,wrap_storage(A)}, reinterpret(Ptr{T}, pointer(arr)),
+                            dims, arr; kwargs...)
+end
+
+function Base.unsafe_wrap(A::Type{<:MtlArray}, ptr::Ptr{T}, dims::NTuple{N,<:Integer};
+                          kwargs...) where {T,N}
+    wrap_eltype(A, T) == T ||
+        throw(ArgumentError("Cannot wrap a pointer to $T as an array of $(wrap_eltype(A, T))"))
+    wrap_ndims(A, N) == N ||
+        throw(ArgumentError("Cannot wrap memory as a $(wrap_ndims(A, N))-dimensional array with dimensions $dims"))
+    return wrap_host_memory(MtlArray{T,N,wrap_storage(A)}, ptr, Dims(dims), nothing;
+                            kwargs...)
+end
+Base.unsafe_wrap(t::Type{<:MtlArray}, ptr::Ptr, dim::Integer; kwargs...) =
+    unsafe_wrap(t, ptr, (dim,); kwargs...)
+
+function checked_bytesize(::Type{T}, dims::Dims) where {T}
+    all(>=(0), dims) || throw(ArgumentError("Invalid dimensions $dims"))
+    return Base.checked_mul(foldl(Base.checked_mul, dims; init=1), sizeof(T))
+end
+
+# returns an async condition that keeps `owner` alive until it is signalled. we use this
+# to keep host memory alive until Metal is done with it, which may be later than when the
+# MtlArray is freed (e.g., when a command buffer that uses the buffer is still executing);
+# the buffer's deallocator signals that moment.
+#
+# the callback task roots `owner`, and it is rooted itself while waiting for the condition,
+# as libuv keeps the condition alive. Julia also creates it outside of the current
+# cancellation scope, so it cannot be cancelled before the condition is signalled.
+function root_until_signalled(owner)
+    return Base.AsyncCondition() do cond
+        GC.@preserve owner close(cond)
     end
+end
+
+function wrap_host_memory(::Type{MtlArray{T,N,S}}, ptr::Ptr{T}, dims::Dims{N}, owner;
+                          dev::MTLDevice=device(), storage=S, kwargs...) where {T,N,S}
+    # the GPU accesses the host memory directly, which requires shared storage
+    S === storage === SharedStorage ||
+        throw(ArgumentError("Host memory can only be wrapped as an array with SharedStorage"))
+    isbitstype(T) || throw(ArgumentError("Can only wrap memory containing bits types"))
+    check_eltype(T)
+    nbytes = checked_bytesize(T, dims)
+    if nbytes == 0
+        return MtlArray{T,N,SharedStorage}(undef, dims)
+    end
+    ptr == C_NULL && throw(ArgumentError("Cannot wrap a NULL pointer"))
+    iszero(UInt(ptr) % Base.datatype_alignment(T)) ||
+        throw(ArgumentError("Pointer $ptr is not sufficiently aligned for elements of type $T"))
+
+    # Metal can only wrap whole pages of memory, so wrap the pages that contain the
+    # requested memory, and use an offset. any other data on those pages is left alone.
+    ps = MTL.page_size()
+    first_page = UInt(ptr) & ~UInt(ps - 1)
+    last_page = Base.checked_add(UInt(ptr), UInt(nbytes - 1)) & ~UInt(ps - 1)
+    bufsize = Base.checked_add(Int(last_page - first_page), ps)
+    bufsize <= MTL.max_buffer_length(dev) ||
+        throw(ArgumentError("Cannot wrap $(Base.format_bytes(nbytes)) of memory; Metal buffers are limited to $(Base.format_bytes(MTL.max_buffer_length(dev)))"))
+
+    buf = if owner === nothing
+        MTLBuffer(dev, bufsize, Ptr{Cvoid}(first_page); nocopy=true, storage=SharedStorage,
+                  kwargs...)
+    else
+        cond = root_until_signalled(owner)
+        deallocator = nil
+        try
+            # the block only signals `cond` without running Julia code, so it is safe for
+            # Metal to invoke it from any thread, or from a finalizer that frees the buffer.
+            deallocator = @objcasyncblock(cond)
+            MTLBuffer(dev, bufsize, Ptr{Cvoid}(first_page); nocopy=true, deallocator,
+                      storage=SharedStorage, kwargs...)
+        catch
+            ccall(:uv_async_send, Cint, (Ptr{Cvoid},), cond.handle)
+            rethrow()
+        finally
+            # Metal keeps its own copy of the block
+            deallocator === nil || release(deallocator)
+        end
+    end
+    # frees the buffer (which releases the owner) if constructing the array fails
+    return MtlArray{T,N}(buf, dims; offset=Int(UInt(ptr) - first_page))
 end
 
 ## resizing
@@ -643,21 +800,16 @@ function Base.resize!(A::MtlVector{T}, n::Integer) where T
         maxsize + n
     end
 
-    # Metal doesn't support empty allocations: the constructor uses a 1-byte
-    # buffer for a zero-length array, and a resize DOWN to zero has to as well,
-    # or `alloc` trips its `0 < bytesize` assertion.
-    bufsize == 0 && (bufsize = 1)
-
     # replace the data with a new one. this 'unshares' the array.
     # as a result, we can safely support resizing unowned buffers.
     buf = alloc(device(A), bufsize; storage=storagemode(A))
-    ptr = MtlPtr{T}(buf)
+    managed = Managed(buf)
     m = min(length(A), n)
     if m > 0
-        unsafe_copyto!(device(A), ptr, pointer(A), m)
+        unsafe_copyto!(device(A), MtlPtr{T}(managed), pointer(A), m)
     end
-    new_data = DataRef(buf) do buf
-        free(buf)
+    new_data = DataRef(managed) do managed
+        free(managed.buffer)
     end
     unsafe_free!(A)
 

@@ -20,38 +20,23 @@ kernel wants several, so the IR says which is which.
 end
 
 # get a pointer to threadgroup memory, with known (static) or zero length (dynamic)
-@generated function emit_threadgroup_memory(::Type{T}, ::Val{len} = Val(0),
-                                            ::Val{id} = Val(0)) where {T, len, id}
-    Context() do ctx
-        # XXX: as long as LLVMPtr is emitted as i8*, it doesn't make sense to type the GV
-        eltyp = convert(LLVMType, LLVM.Int8Type())
-        T_ptr = convert(LLVMType, Core.LLVMPtr{T,AS.ThreadGroup})
+@llvmgenerated builder function emit_threadgroup_memory(::Type{T}, ::Val{len}=Val(0),
+                                                        ::Val{id}=Val(0)
+                                                        )::Core.LLVMPtr{T,AS.ThreadGroup} where {T,len,id}
+    # XXX: as long as LLVMPtr is emitted as i8*, it doesn't make sense to type the GV
+    eltyp = LLVM.Int8Type()
+    T_ptr = convert(LLVMType, Core.LLVMPtr{T,AS.ThreadGroup})
 
-        # create a function
-        llvm_f, _ = create_function(T_ptr)
-
-        # create the global variable
-        mod = LLVM.parent(llvm_f)
-        gv_typ = LLVM.ArrayType(eltyp, len * sizeof(T))
-        gv = GlobalVariable(mod, gv_typ, "threadgroup_memory_$id", AS.ThreadGroup)
-        if len > 0
-            linkage!(gv, LLVM.API.LLVMInternalLinkage)
-            initializer!(gv, UndefValue(gv_typ))
-        end
-        alignment!(gv, Base.datatype_alignment(T))
-
-        # generate IR
-        IRBuilder() do builder
-            entry = BasicBlock(llvm_f, "entry")
-            position!(builder, entry)
-
-            ptr = gep!(builder, gv_typ, gv, [ConstantInt(0), ConstantInt(0)])
-
-            untyped_ptr = bitcast!(builder, ptr, T_ptr)
-
-            ret!(builder, untyped_ptr)
-        end
-
-        call_function(llvm_f, Core.LLVMPtr{T,AS.ThreadGroup})
+    # create the global variable. align and pad it to 4 bytes, so that GPUCompiler can
+    # implement 8- and 16-bit atomics on the containing 32-bit word.
+    gv_typ = LLVM.ArrayType(eltyp, cld(len * sizeof(T), 4) * 4)
+    gv = GlobalVariable(current_module(builder), gv_typ, "threadgroup_memory_$id", AS.ThreadGroup)
+    if len > 0
+        gv.linkage = LLVM.Linkage.Internal
+        gv.initializer = UndefValue(gv_typ)
     end
+    gv.alignment = max(Base.datatype_alignment(T), 4)
+
+    ptr = gep!(builder, gv_typ, gv, [ConstantInt(0), ConstantInt(0)])
+    bitcast!(builder, ptr, T_ptr)
 end

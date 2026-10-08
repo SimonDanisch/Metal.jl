@@ -111,7 +111,7 @@ end
     queue = MTLi.MTLCommandQueue(dev)
     mbuf, _ = Metal.malloc_buffer_and_gpu_address(dev)
     ebuf, _ = Metal.exception_info_buffer_and_gpu_address(dev)
-    res = (argbuf, mbuf, ebuf, out.data[])
+    res = (argbuf, mbuf, ebuf, out.data[].buffer)
 
     # Encoded ONCE, above. Each replay runs it again with nothing re-encoded, which
     # is the property the whole recording path rests on.
@@ -139,7 +139,7 @@ end
     out = Metal.MtlVector{Float32}(undef, 64); fill!(out, 0f0); Metal.synchronize()
     argbuf = icb_pack(dev, out, 1f0)
     icb = icb_encode(dev, pip, argbuf, n; barrier = true)
-    icb_replay!(queue, icb, n, (argbuf, mbuf, ebuf, out.data[]))
+    icb_replay!(queue, icb, n, (argbuf, mbuf, ebuf, out.data[].buffer))
     @test all(==(Float32(n)), Array(out))
 
     # WITHOUT: the same 32 commands race, and the sum comes out short. Asserted rather
@@ -148,7 +148,7 @@ end
     out2 = Metal.MtlVector{Float32}(undef, 64); fill!(out2, 0f0); Metal.synchronize()
     argbuf2 = icb_pack(dev, out2, 1f0)
     icb2 = icb_encode(dev, pip, argbuf2, n; barrier = false)
-    icb_replay!(queue, icb2, n, (argbuf2, mbuf, ebuf, out2.data[]))
+    icb_replay!(queue, icb2, n, (argbuf2, mbuf, ebuf, out2.data[].buffer))
     @test maximum(Array(out2)) < Float32(n)
 
     GC.@preserve lib nothing
@@ -184,7 +184,7 @@ end
 
     cb = MTLi.MTLCommandBuffer(queue)
     enc = MTLi.MTLComputeCommandEncoder(cb)
-    for r in (argbuf, mbuf, ebuf, out.data[])
+    for r in (argbuf, mbuf, ebuf, out.data[].buffer)
         MTLi.use!(enc, r, MTLi.ReadWriteUsage)
     end
     for i in 1:n
@@ -260,7 +260,7 @@ end
         MTLi.set_barrier!(g)
     end
 
-    resources = (argbuf, mbuf, ebuf, out.data[], range.data[], flag.data[])
+    resources = (argbuf, mbuf, ebuf, out.data[].buffer, range.data[].buffer, flag.data[].buffer)
     function gated_replay!()
         cb = MTLi.MTLCommandBuffer(queue)
         enc = MTLi.MTLComputeCommandEncoder(cb)
@@ -268,7 +268,7 @@ end
             MTLi.use!(enc, r, MTLi.ReadWriteUsage)
         end
         MTLi.execute_commands!(enc, icb, 1:1)                        # write the range
-        MTLi.execute_commands_indirect!(enc, icb, range.data[], range.offset)
+        MTLi.execute_commands_indirect!(enc, icb, range.data[].buffer, range.offset)
         MTLi.endEncoding!(enc)
         MTLi.commit!(cb)
         MTLi.wait_completed(cb)
@@ -345,7 +345,7 @@ end
         MTLi.dispatch_threadgroups!(c, Metal.MTLSize(1), Metal.MTLSize(1))
         cb = MTLi.MTLCommandBuffer(queue)
         enc = MTLi.MTLComputeCommandEncoder(cb)
-        for r in (argbuf, mbuf, ebuf, a.data[])
+        for r in (argbuf, mbuf, ebuf, a.data[].buffer)
             MTLi.use!(enc, r, MTLi.ReadWriteUsage)
         end
         MTLi.execute_commands!(enc, icb, 1:1)

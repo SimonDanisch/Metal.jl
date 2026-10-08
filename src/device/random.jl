@@ -10,37 +10,22 @@ import RandomNumbers
 # for `threads_per_threadgroup()`, so we can have 64 simdgroups per threadgroup
 const max_simdgroups_per_threadgroup = 64
 
-@inline @generated function emit_global_random_values(::Val{name}) where name
-    @dispose ctx=Context() begin
-        T_val = convert(LLVMType, UInt32)
-        T_ptr = convert(LLVMType, LLVMPtr{UInt32,AS.ThreadGroup})
+@llvmgenerated builder function emit_global_random_values(::Val{name}
+                                                          )::LLVMPtr{UInt32,AS.ThreadGroup} where name
+    T_val = convert(LLVMType, UInt32)
+    T_ptr = convert(LLVMType, LLVMPtr{UInt32,AS.ThreadGroup})
 
-        # define function and get LLVM module
-        llvm_f, _ = create_function(T_ptr)
-        mod = LLVM.parent(llvm_f)
+    # create a global memory global variable
+    T_global = LLVM.ArrayType(T_val, max_simdgroups_per_threadgroup)
+    gv = GlobalVariable(current_module(builder), T_global, "global_random_$(name)",
+                        AS.ThreadGroup)
+    gv.linkage = LLVM.Linkage.LinkOnceAny
+    gv.initializer = null(T_global)
+    gv.unnamed_addr = LLVM.UnnamedAddr.Global
+    gv.alignment = 4
 
-        # create a global memory global variable
-        T_global = LLVM.ArrayType(T_val, max_simdgroups_per_threadgroup)
-        gv = GlobalVariable(mod, T_global, "global_random_$(name)", AS.ThreadGroup)
-        linkage!(gv, LLVM.API.LLVMLinkOnceAnyLinkage)
-        initializer!(gv, LLVM.null(T_global))
-        unnamed_addr!(gv, true)
-        alignment!(gv, 4)
-
-        # generate IR
-        @dispose builder=IRBuilder() begin
-            entry = BasicBlock(llvm_f, "entry")
-            position!(builder, entry)
-
-            ptr = gep!(builder, T_global, gv, [ConstantInt(0), ConstantInt(0)])
-
-            untyped_ptr = bitcast!(builder, ptr, T_ptr)
-
-            ret!(builder, untyped_ptr)
-        end
-
-        call_function(llvm_f, LLVMPtr{UInt32,AS.ThreadGroup})
-    end
+    ptr = gep!(builder, T_global, gv, [ConstantInt(0), ConstantInt(0)])
+    bitcast!(builder, ptr, T_ptr)
 end
 
 # shared memory with the actual seed, per simdgroup, loaded lazily or overridden by calling `seed!`
@@ -165,10 +150,15 @@ end
 
 # normally distributed
 
+# Signature of Random's generic `AbstractFloat` fallbacks. Kept as a constant because
+# spelling it inline (e.g. with `@invoke`) constructs the `UnionAll` at run time, which
+# inference no longer folds away as of Julia 1.14 (JuliaLang/julia#62001).
+const AbstractFloatFallback = Tuple{AbstractRNG, Type{<:AbstractFloat}}
+
 # use the AbstractFloat fallback from Base, which doesn't widen and only relies on `rand()`.
 # the Ziggurat method used by other back-ends relies on Float64 support.
 @device_override @inline function Random.randn(rng::Philox2x32, ::Type{T}) where {T <: AbstractFloat}
-    @invoke Random.randn(rng::AbstractRNG, T::Type{<:AbstractFloat})
+    invoke(Random.randn, AbstractFloatFallback, rng, T)
 end
 
 
@@ -177,8 +167,11 @@ end
 # use the AbstractFloat fallback from Base, which doesn't widen and only relies on `rand()`.
 # the Ziggurat method used by other back-ends relies on Float64 support.
 @device_override @inline function Random.randexp(rng::Philox2x32, ::Type{T}) where {T <: AbstractFloat}
-    @invoke Random.randexp(rng::AbstractRNG, T::Type{<:AbstractFloat})
+    invoke(Random.randexp, AbstractFloatFallback, rng, T)
 end
 
-@device_override Random.Sampler(::Type{<:AbstractRNG}, r::AbstractUnitRange{T},
+# NOTE: not a consistent overlay (as used by `@device_override`), as this returns a different
+#       sampler than the host method: concrete evaluation would otherwise substitute the
+#       latter, which our overlaid `rand` methods then fail to handle.
+Base.Experimental.@overlay method_table Random.Sampler(::Type{<:AbstractRNG}, r::AbstractUnitRange{T},
                                 ::Random.Repetition) where {T<:Union{Int64, UInt64}} = Random.SamplerRangeFast(r)

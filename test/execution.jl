@@ -50,6 +50,16 @@ end
     kernel(a) = return
     bar(a) = @metal kernel(a)
     @inferred bar(MtlArray([1]))
+
+    # keyword-argument handling relies on concrete evaluation of helpers that grow
+    # arrays, which our overlays of error paths must not inhibit
+    function range_kernel(a)
+        a[1] = last(range(1; step=2, length=3))
+        return
+    end
+    a = MtlArray([0])
+    @metal range_kernel(a)
+    @test Array(a) == [5]
 end
 
 
@@ -160,18 +170,18 @@ end
                        sprint(io->Metal.code_llvm(io, dummy, Tuple{}; macos=v"16.2.1",
                                                       dump_module=true, kernel=true)))
 
-        # targeting macOS < 14, or the AIR versions that come with it, is not supported
-        @test_throws "Metal.jl requires AIR 2.6" begin
-            Metal.code_llvm(devnull, dummy, Tuple{}; macos=v"13")
+        # targeting macOS < 15, or the AIR versions that come with it, is not supported
+        @test_throws "Metal.jl requires AIR 2.7" begin
+            Metal.code_llvm(devnull, dummy, Tuple{}; macos=v"14")
         end
-        @test_throws "Metal.jl requires AIR 2.6" begin
-            Metal.code_llvm(devnull, dummy, Tuple{}; air=v"2.5")
+        @test_throws "Metal.jl requires AIR 2.7" begin
+            Metal.code_llvm(devnull, dummy, Tuple{}; air=v"2.6")
         end
 
         # The offline compiler raises AIR to the floor required by the selected MSL
         # language version, even when the deployment target supports an older AIR.
-        @test Metal.compiler_config(device(); macos=v"14", metal=v"4.0").target.air == v"2.8"
-        @test Metal.compiler_config(device(); macos=v"14", metal=v"4.1").target.air == v"2.9"
+        @test Metal.compiler_config(device(); macos=v"15", metal=v"4.0").target.air == v"2.8"
+        @test Metal.compiler_config(device(); macos=v"15", metal=v"4.1").target.air == v"2.9"
         @test_throws "Metal 4.1.0 requires AIR 2.9.0" begin
             Metal.code_llvm(devnull, dummy, Tuple{}; metal=v"4.1", air=v"2.8")
         end
@@ -188,7 +198,7 @@ end
         @test_throws "Apple GPU family from 1 to 10" Metal.parse_target_gpufamily(11, "pref")
         @test Metal.parse_target_macos("15", "env") == v"15"
         @test Metal.parse_target_macos("16.1", "env") == v"26.1"  # a compatibility version
-        @test_throws "requires macOS 14" Metal.parse_target_macos("13", "env")
+        @test_throws "requires macOS 15" Metal.parse_target_macos("14", "env")
         @test_throws "newer than this system" Metal.parse_target_macos("99", "env")
         @test_throws "macOS version" Metal.parse_target_macos("tahoe", "env")
 
@@ -497,6 +507,252 @@ end
     @test all(vecA .== Int(5))
 end
 
+@testset "synchronization after a task finished" begin
+    # work left behind by a finished task, in its own queue, is committed and waited for
+    # by the next synchronization of any other task
+    for spawn in (f -> @async(f()), f -> Threads.@spawn(f()))
+        a = Metal.zeros(Float32, 16; storage=Metal.PrivateStorage)
+        synchronize()
+        t = spawn() do
+            a .= 1f0
+            global_queue(device())
+        end
+        queue = fetch(t)
+        @test Array(a) == ones(Float32, 16)
+        @test queue.cmdbuf === nothing
+        @test isempty(queue.cleanups)
+        @test MTL.last_committed(queue.queue).status == MTL.MTLCommandBufferStatusCompleted
+    end
+
+    # host reads of shared memory
+    b = Metal.zeros(Float32, 16; storage=Metal.SharedStorage)
+    synchronize()
+    wait(@async b .= 2f0)
+    @test Metal.@allowscalar b[end] == 2f0
+end
+
+@testset "handing off arrays between tasks" begin
+    n = 1 << 16
+
+    # accessing an array waits for the work of the task that last used it, even if that
+    # task is still running and hasn't synchronized
+    @testset "$S" for S in (Metal.PrivateStorage, Metal.SharedStorage)
+        a = Metal.zeros(Float32, n; storage=S)
+        synchronize()
+        used = Channel{Nothing}(1)
+        release = Channel{Nothing}(1)
+        t = @async begin
+            a .= 1f0
+            put!(used, nothing)
+            take!(release)
+        end
+        take!(used)
+        @test Array(a) == ones(Float32, n)
+        S === Metal.SharedStorage && @test a[1] == 1f0
+        put!(release, nothing)
+        wait(t)
+    end
+
+    # using an array on the GPU waits for the task that last used it
+    a = Metal.zeros(Float32, n)
+    to_t1, to_t2 = Channel{Int}(1), Channel{Int}(1)
+    t1 = @async for i in 1:10
+        take!(to_t1)
+        a .+= 1f0
+        put!(to_t2, i)
+    end
+    t2 = @async for i in 1:10
+        take!(to_t2)
+        a .*= 2f0
+        i < 10 && put!(to_t1, i)
+    end
+    put!(to_t1, 0)
+    wait(t1)
+    wait(t2)
+    @test Array(a) == fill(Float32(foldl((x, _) -> 2(x + 1), 1:10; init=0)), n)
+
+    # MPS operations register the arrays they use
+    A, B = Metal.rand(Float32, 64, 64), Metal.rand(Float32, 64, 64)
+    C = similar(A)
+    wait(@async MPS.matmul!(C, A, B))
+    @test Array(C) ≈ Array(A) * Array(B)
+end
+
+# a gate that keeps a command buffer from completing until it is opened. this keeps the
+# cooperative synchronization tests independent of timing: waiting for that command buffer
+# can only return after whoever opens the gate has run.
+#
+# the GPU aborts command buffers that wait on an event for more than a few seconds, so the
+# command buffer waits for a sequence of values, which a watchdog on a foreign thread signals
+# one by one while the gate is closed, and all at once when it is opened. if the test does
+# not finish in time (e.g., because the thread that should open the gate is blocked by the
+# wait, or a task never gets to run), the watchdog opens the gate instead of letting the
+# test hang, and records that it timed out.
+mutable struct SyncGate
+    const event::MTL.MTLSharedEvent     # what the command buffer waits for
+    const control::MTL.MTLSharedEvent   # GATE_OPEN or GATE_DONE, set by the test
+    const watchdog_done::Base.Event
+    @atomic timed_out::Bool
+end
+
+const GATE_OPEN = 1
+const GATE_DONE = 2
+const GATE_TICK_MS = 1_000
+const GATE_TICKS = 60       # the timeout, in ticks
+
+function gate_watchdog(ptr::Ptr{Cvoid})
+    gate = unsafe_pointer_to_objref(ptr)::SyncGate
+    opened = finished = false
+    for tick in 1:GATE_TICKS
+        if !opened
+            if MTL.waitUntilSignaledValue(gate.control, GATE_OPEN, GATE_TICK_MS)
+                opened = true
+                gate.event.signaledValue = GATE_TICKS + 1
+            else
+                gate.event.signaledValue = tick
+                continue
+            end
+        end
+        if MTL.waitUntilSignaledValue(gate.control, GATE_DONE, GATE_TICK_MS)
+            finished = true
+            break
+        end
+    end
+    finished || @atomic gate.timed_out = true
+    gate.event.signaledValue = GATE_TICKS + 1
+    notify(gate.watchdog_done)
+    return
+end
+
+open_gate!(gate::SyncGate) =
+    gate.control.signaledValue < GATE_OPEN && (gate.control.signaledValue = GATE_OPEN)
+gate_is_open(gate::SyncGate) = gate.control.signaledValue >= GATE_OPEN
+gate_timed_out(gate::SyncGate) = @atomic gate.timed_out
+
+# run `f(gate)` after committing a command buffer to the current task's queue that only
+# completes once the gate is opened, returning whether `f` finished before the timeout.
+function gated(f)
+    dev = device()
+    gate = SyncGate(MTL.MTLSharedEvent(dev), MTL.MTLSharedEvent(dev), Base.Event(), false)
+    cmdbuf = MTL.MTLCommandBuffer(Metal.global_queue(dev))
+    for value in 1:GATE_TICKS+1
+        MTL.encode_wait!(cmdbuf, gate.event, value)
+    end
+    GC.@preserve gate begin
+        # run the watchdog on a thread from libdispatch's pool, which Julia adopts
+        dispatch_queue = ccall(:dispatch_get_global_queue, Ptr{Cvoid}, (Clong, Culong), 0, 0)
+        ccall(:dispatch_async_f, Cvoid, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+              dispatch_queue, pointer_from_objref(gate),
+              @cfunction(gate_watchdog, Cvoid, (Ptr{Cvoid},)))
+        try
+            # this also commits pending work, which thus completes before the gate opens
+            MTL.commit!(cmdbuf)
+            f(gate)
+        finally
+            gate.control.signaledValue = GATE_DONE
+            wait(gate.watchdog_done)
+            cmdbuf.status == MTL.MTLCommandBufferStatusNotEnqueued || MTL.wait_completed(cmdbuf)
+        end
+    end
+    return !gate_timed_out(gate)
+end
+
+# run `f` while another task on the same thread opens the gate, but only after it got to run
+# many more times than the polling at the start of a wait yields (so that the wait is likely
+# handed to a worker thread). returns whether `f` only returned after the gate was opened.
+function open_gate_during(f, gate::SyncGate)
+    opener = @async begin
+        for _ in 1:10_000
+            yield()
+        end
+        open_gate!(gate)
+    end
+    try
+        f()
+        gate_is_open(gate)
+    finally
+        wait(opener)
+    end
+end
+
+gated_oob_kernel(a) = (a[2] = 1f0; return)  # out-of-bounds store on a length-1 array
+
+@testset "cooperative synchronization" begin
+    a = Metal.zeros(Float32, 1)
+
+    # with blocking synchronization, nothing else can run on the thread while waiting
+    if Metal.use_nonblocking_synchronization
+        for sync in (synchronize, device_synchronize)
+            # other tasks can run while waiting for the GPU
+            @test gated() do gate
+                open_gate_during(sync, gate)
+            end
+
+            # errors are still reported after a wait that was handed to a worker thread
+            @metal threads=1 gated_oob_kernel(a)
+            @test gated() do gate
+                open_gate_during(gate) do
+                    @test_throws Metal.KernelException sync()
+                end
+            end
+        end
+
+        # waiting does not keep other tasks from using Metal, and they cannot starve the
+        # wait: another task keeps launching kernels and synchronizing until the wait
+        # returns, and the gate is only opened once it has done so while we were waiting.
+        @test gated() do gate
+            waiting = Ref(false)
+            returned = Ref(false)
+            started = Base.Event()
+            iterated = Base.Event()
+            other = @async try
+                while !returned[] && !gate_timed_out(gate)
+                    @metal dummy()
+                    synchronize()
+                    notify(started)
+                    waiting[] && notify(iterated)
+                end
+            finally
+                notify(started)
+                notify(iterated)
+            end
+            opener = @async begin
+                wait(iterated)
+                open_gate!(gate)
+            end
+            try
+                wait(started)
+                waiting[] = true
+                synchronize()
+                gate_is_open(gate)
+            finally
+                returned[] = true
+                wait(other)
+                wait(opener)
+            end
+        end
+    end
+
+    # `device_synchronize` only cleans up after completed work, as other tasks may commit
+    # while it waits (simulated here by bypassing the submission tracking)
+    event = MTL.MTLSharedEvent(device())
+    queue = MTL.MTLCommandQueue(device())
+    bq = Metal.batched_queue(queue)
+    cmdbuf = MTL.MTLCommandBuffer(queue)
+    MTL.encode_wait!(cmdbuf, event, 1)
+    @objc [cmdbuf::id{MTL.MTLCommandBuffer} commit]::Nothing
+    Metal.defer_cleanup!(bq, cmdbuf, Any[])
+    try
+        device_synchronize()
+        @test Metal.pending_cleanup_count(bq) == 1
+    finally
+        event.signaledValue = 1
+        MTL.wait_completed(cmdbuf)
+    end
+    device_synchronize()
+    @test Metal.pending_cleanup_count(bq) == 0
+end
+
 @testset "REPL task synchronization" begin
     synchronize()
 
@@ -749,6 +1005,50 @@ end
         sum_kernel(T, S, a) = (a[1] = one(T) + one(S); return)
         @metal sum_kernel(Int, Int32, a)
         @test Array(a)[] == 2
+    end
+
+    @testset "argument converting to a ghost type" begin
+        # `Base.Fix1` capturing a type converts to a closure without fields,
+        # so it doesn't occupy a parameter slot, unlike its unconverted form
+        function kernel(f, ptr, val)
+            unsafe_store!(ptr, f(val))
+            return
+        end
+
+        a = MtlArray([0f0])
+        @metal kernel(Base.Fix1(convert, Float32), pointer(a), 42)
+        @test Array(a)[] == 42f0
+    end
+
+    @testset "wrong number of arguments" begin
+        kernel(ptr) = return
+        a = MtlArray([0])
+        k = @metal launch=false kernel(pointer(a))
+        @test_throws ArgumentError k()
+    end
+
+    @testset "captured arrays" begin
+        # arrays captured by the kernel function are converted at launch, like arguments,
+        # so that their buffers are declared to the encoder (as shader validation requires)
+        let a = MtlArray(Float32[1, 2, 3, 4]), b = Metal.zeros(Float32, 4)
+            kernel = () -> (i = thread_position_in_grid().x; @inbounds b[i] = 2f0 * a[i]; nothing)
+            @metal threads=4 kernel()
+            @test Array(b) == Float32[2, 4, 6, 8]
+        end
+
+        # the kernel object keeps the arrays it captures alive
+        function captured_kernel(b)
+            a = MtlArray([42])
+            kernel = @metal launch=false (() -> (@inbounds b[1] = a[1]; nothing))()
+            kernel, WeakRef(a)
+        end
+        let b = MtlArray([0])
+            kernel, a = captured_kernel(b)
+            GC.gc(true)
+            @test a.value !== nothing
+            kernel()
+            @test Array(b) == [42]
+        end
     end
 end
 

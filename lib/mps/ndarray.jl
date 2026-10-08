@@ -40,10 +40,8 @@ export MPSNDArray
 
 # @objcwrapper managed = true MPSNDArray <: NSObject
 
-@static if Metal.is_macos(v"15")
-    function userBuffer(ndarr::MPSNDArrayLike)::Union{Nothing, MTLBuffer}
-        return @objc [ndarr::id{MPSNDArray} userBuffer]::Union{Nothing,MTLBuffer}
-    end
+function userBuffer(ndarr::MPSNDArrayLike)::Union{Nothing, MTLBuffer}
+    return @objc [ndarr::id{MPSNDArray} userBuffer]::Union{Nothing,MTLBuffer}
 end
 
 function resourceSize(ndarr::MPSNDArrayLike)
@@ -83,23 +81,17 @@ function MPSNDArray(device::MTLDevice, scalar)
                                                scalar:scalar::Float64]::MPSNDArray
 end
 
-@static if Metal.is_macos(v"15")
-    function MPSNDArray(buffer::MTLBuffer, offset::UInt, descriptor::MPSNDArrayDescriptor)
-        return @objc [[MPSNDArray alloc]::id{MPSNDArray} initWithBuffer:buffer::id{MTLBuffer}
-                                                   offset:offset::NSUInteger
-                                                   descriptor:descriptor::id{MPSNDArrayDescriptor}]::MPSNDArray
-    end
-else
-    function MPSNDArray(_::MTLBuffer, _::UInt, _::MPSNDArrayDescriptor)
-        @assert false "Creating an MPSNDArray that shares data with user-provided MTLBuffer is only supported in macOS v15+"
-    end
+function MPSNDArray(buffer::MTLBuffer, offset::UInt, descriptor::MPSNDArrayDescriptor)
+    return @objc [[MPSNDArray alloc]::id{MPSNDArray} initWithBuffer:buffer::id{MTLBuffer}
+                                                offset:offset::NSUInteger
+                                                descriptor:descriptor::id{MPSNDArrayDescriptor}]::MPSNDArray
 end
 
 function MPSNDArray(arr::MtlArray{T,N}) where {T,N}
     arrsize = size(arr)
     @assert arrsize[1] * sizeof(T) % 16 == 0 "First dimension of input MtlArray must have a byte size divisible by 16"
     desc = MPSNDArrayDescriptor(T, arrsize)
-    return MPSNDArray(arr.data[], UInt(arr.offset), desc)
+    return MPSNDArray(Base.unsafe_convert(MTLBuffer, arr), UInt(arr.offset), desc)
 end
 
 function Metal.MtlArray(ndarr::MPSNDArray; storage = Metal.DefaultStorageMode, async = false)
@@ -116,8 +108,10 @@ function exportToMtlArray!(arr::MtlArray{T}, ndarr::MPSNDArrayLike; async=false)
     # own runs BEFORE whatever is still open that produced `ndarr`. See
     # `Metal.batchbuffer`. `async` then means what it says — the work sits in the batch and
     # goes with it — where before it meant one extra submission.
-    exportDataWithCommandBuffer(ndarr, Metal.batchbuffer(ndarr, arr),
-                                arr.data[], T, arr.offset)
+    #
+    # The buffer is taken before `batchbuffer`, which claims it for the batch.
+    buf = Base.unsafe_convert(MTLBuffer, arr)
+    exportDataWithCommandBuffer(ndarr, Metal.batchbuffer(ndarr, arr), buf, T, arr.offset)
 
     async || synchronize(global_queue(dev))
     return arr

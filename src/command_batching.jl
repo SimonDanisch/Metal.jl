@@ -77,14 +77,17 @@ buffers are kept in flight — `command_batching_inflight()` initially, and sett
 per queue with [`inflight!`](@ref) — and further submissions block until the GPU
 drains one. Obtain the current task's batched queue with [`global_queue`](@ref).
 
-`BatchedCommandQueue`s are task-local and mutated lock-free by their owning task.
-Sharing a raw `MTLCommandQueue` across tasks is unsupported. [`device_synchronize`](@ref)
-may flush batches owned by other tasks after those tasks have yielded or completed,
-which supports `@async` work and the REPL synchronization hook.
+`BatchedCommandQueue`s are task-local, but are only mutated while holding a global lock,
+so that other tasks can flush them too. Sharing a raw `MTLCommandQueue` across tasks is
+unsupported. Once the owning task has finished, any task's [`synchronize`](@ref) flushes
+and waits for the work it left behind, so results of a task are visible after `wait`ing
+for it. [`device_synchronize`](@ref) flushes the batches of all tasks, which supports
+`@async` work and the REPL synchronization hook.
 """
 mutable struct BatchedCommandQueue
     queue::MTLCommandQueue
     device::MTLDevice
+    owner::Task
     cmdbuf::Union{Nothing,MTLCommandBuffer}
     encoder::Union{Nothing,MTLComputeCommandEncoder,MTLBlitCommandEncoder}
     kind::EncoderKind
@@ -117,7 +120,7 @@ end
 function BatchedCommandQueue(queue::MTLCommandQueue)
     dev = queue.device
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
-    BatchedCommandQueue(queue, dev, nothing, nothing, NoEncoder,
+    BatchedCommandQueue(queue, dev, current_task(), nothing, nothing, NoEncoder,
                         Any[], nothing, 0, 0, Any[], PendingCommand[],
                         Vector{Any}[], true, command_batching_inflight(), UInt[])
 end
@@ -165,6 +168,28 @@ end
 
 has_active_batched_queues() =
     Base.@lock batched_queues_lock !isempty(batched_queues)
+
+# batched queues are mutated (e.g., encoding operations or committing the open batch), and
+# managed buffers change ownership, only while holding this lock. that makes it possible
+# for any task to flush any queue, e.g., to wait for the work of another task before
+# accessing memory it uses. waiting for the GPU should happen without holding this lock.
+const submission_lock = ReentrantLock()
+
+# batched queues whose owning task has finished, but that still have an open batch or
+# in-flight work. nobody else will ever flush or synchronize these, so `synchronize`
+# adopts them.
+
+function orphaned_batched_queues()
+    Base.@lock batched_queues_lock begin
+        bqs = nothing
+        for bq in keys(batched_queues)
+            istaskdone(bq.owner) || continue
+            bqs === nothing && (bqs = BatchedCommandQueue[])
+            push!(bqs, bq)
+        end
+        bqs
+    end
+end
 
 batched_queue(bq::BatchedCommandQueue) = bq
 
@@ -219,11 +244,49 @@ function MTL.MTLCommandBuffer(f::Base.Callable, bq::BatchedCommandQueue,
     return cmdbuf
 end
 
-function flush_open_batch(cmdbuf)
+# submit a command buffer that was encoded outside of the batch (e.g., by MPS). this first
+# commits the open batch, preserving program order, and registers the use of buffers that
+# were passed to Metal since the previous submission.
+function submit_command_buffer(f, cmdbuf)
     queue = cmdbuf.commandQueue
     bq = adopted_batch(queue)
     bq === nothing && (bq = get(task_local_storage(), batched_queue_key(queue), nothing))
     bq === nothing || flush!(bq)
+
+    pending = pending_ownership()
+    # creating a batched queue takes the autorelease pool lock, so do so before locking
+    !isempty(pending) && bq === nothing && (bq = batched_queue(queue))
+    while true
+        conflict = Base.@lock submission_lock begin
+            if isempty(pending)
+                f()
+                return
+            end
+            i = findfirst(managed -> !can_take_ownership(managed, bq), pending)
+            if i === nothing
+                foreach(managed -> take_ownership!(managed, bq), pending)
+                empty!(pending)
+                f()
+                return
+            end
+            pending[i]
+        end
+        # another queue started using the buffer since it was passed to Metal
+        synchronize(conflict)
+    end
+end
+
+# buffers that were passed to Metal by the current task, and will be used by the next
+# command buffer it submits
+pending_ownership() =
+    get!(() -> Managed[], task_local_storage(), :MetalPendingOwnership)::Vector{Managed}
+
+# for operations that use the buffers passed to Metal, but are submitted and completed by
+# Metal itself: wait for other queues that may still be using those buffers instead.
+function synchronize_pending!()
+    pending = pending_ownership()
+    foreach(synchronize, pending)
+    empty!(pending)
     return
 end
 
@@ -293,15 +356,33 @@ not a commit, so the batch stays open and [`flush!`](@ref) still decides when it
 `roots` are kept alive until the buffer retires — an `MPSMatrix` wrapper or a kernel object
 that nothing else references once the encoding call returns.
 
+The buffers passed to Metal since the task's last submission (`pending_ownership`, filled
+by `Base.unsafe_convert(MTLBuffer, ::MtlArray)`) are claimed for this queue here, as
+`submit_command_buffer` does for a command buffer of a library's own, so that host access
+to them waits for this batch. Wrap the operands BEFORE calling this.
+
 The buffer is NOT committed here. Whoever owns the frame commits it, which is the whole
 point.
 """
 function batchbuffer(roots...)
     bq = global_queue(device())
-    end_encoder!(bq)
-    cmdbuf = ensure_cmdbuf!(bq)
-    record_operation!(bq, roots...)
-    return cmdbuf
+    pending = pending_ownership()
+    while true
+        conflict = Base.@lock submission_lock begin
+            i = findfirst(managed -> !can_take_ownership(managed, bq), pending)
+            if i === nothing
+                foreach(managed -> take_ownership!(managed, bq), pending)
+                empty!(pending)
+                end_encoder!(bq)
+                cmdbuf = ensure_cmdbuf!(bq)
+                record_operation!(bq, roots...)
+                return cmdbuf
+            end
+            pending[i]
+        end
+        # another queue may still be using the buffer: wait for it, without the lock
+        synchronize(conflict)
+    end
 end
 
 """
@@ -327,9 +408,13 @@ its own submissions sees one more and nothing else.
 """
 function joingraph!(bq::BatchedCommandQueue, graph; limit::Int = 16)
     p = UInt(pointer(graph))
-    p in bq.graphs && return
-    length(bq.graphs) >= limit && flush!(bq)
-    push!(bq.graphs, p)
+    full = Base.@lock submission_lock begin
+        p in bq.graphs && return
+        length(bq.graphs) >= limit
+    end
+    # `flush!` may wait for the GPU, so not with the lock held
+    full && flush!(bq)
+    Base.@lock submission_lock push!(bq.graphs, p)
     return
 end
 
@@ -440,8 +525,10 @@ end
 
 function defer_cleanup!(bq::BatchedCommandQueue, cmdbuf::MTL.MTLCommandBufferLike,
                         roots::Vector{Any})
-    push!(bq.cleanups, PendingCommand(cmdbuf, roots))
-    register_queue!(bq)
+    Base.@lock submission_lock begin
+        push!(bq.cleanups, PendingCommand(cmdbuf, roots))
+        register_queue!(bq)
+    end
     return
 end
 
@@ -456,47 +543,46 @@ defer_cleanup!(queue, cmdbuf::MTL.MTLCommandBufferLike, roots::Vector{Any}) =
 # allocating.
 completed(cmdbuf) = cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
 
-function drain_cleanups!(bq::BatchedCommandQueue; force::Bool=false)
-    n = 0
-    for cleanup in bq.cleanups
-        if !(force || completed(cleanup.cmdbuf))
-            break
+# release the roots of completed command buffers. `until` treats the entries up to and
+# including it as completed, e.g., because a command buffer committed later has completed.
+function drain_cleanups!(bq::BatchedCommandQueue;
+                         until::Union{Nothing,PendingCommand}=nothing)
+    Base.@lock submission_lock begin
+        nforced = until === nothing ? 0 :
+                  something(findfirst(cleanup -> cleanup === until, bq.cleanups), 0)
+        n = 0
+        for cleanup in bq.cleanups
+            if !(n < nforced || completed(cleanup.cmdbuf))
+                break
+            end
+            n += 1
         end
-        n += 1
-    end
-    n == 0 && return
+        n == 0 && return
 
-    # In place, then one `deleteat!`. `bq.cleanups[1:n]` COPIED the prefix into a
-    # fresh vector purely to iterate it, which is an allocation a frame for a
-    # list that is about to be deleted anyway.
-    for i in 1:n
-        recycle_roots!(bq, bq.cleanups[i].roots)
-    end
-    deleteat!(bq.cleanups, 1:n)
+        # In place, then one `deleteat!`. `bq.cleanups[1:n]` COPIED the prefix into a
+        # fresh vector purely to iterate it, which is an allocation a frame for a
+        # list that is about to be deleted anyway.
+        for i in 1:n
+            recycle_roots!(bq, bq.cleanups[i].roots)
+        end
+        deleteat!(bq.cleanups, 1:n)
 
-    unregister_queue_if_idle!(bq)
+        unregister_queue_if_idle!(bq)
+    end
     return
 end
 
-function drain_cleanups!(queue; force::Bool=false)
+function drain_cleanups!(queue)
     queue = raw_queue(queue)
     for bq in active_batched_queues()
         bq.queue === queue || continue
-        drain_cleanups!(bq; force)
+        drain_cleanups!(bq)
     end
     return
 end
 
 function pending_cleanup_count(bq::BatchedCommandQueue)
     return length(bq.cleanups)
-end
-
-function wait_oldest_cleanup!(bq::BatchedCommandQueue)
-    isempty(bq.cleanups) && return
-    cmdbuf = first(bq.cleanups).cmdbuf
-    wait_cmdbuf!(cmdbuf)
-    drain_cleanups!(bq)
-    return
 end
 
 """
@@ -520,17 +606,23 @@ of a deeper pipeline is that more command buffers, and the Julia roots they keep
 alive, are retained before cleanup.
 """
 function inflight!(bq::BatchedCommandQueue, n::Integer)
-    was = bq.inflight
-    bq.inflight = max(1, Int(n))
-    return was
+    Base.@lock submission_lock begin
+        was = bq.inflight
+        bq.inflight = max(1, Int(n))
+        return was
+    end
 end
 
+# wait until fewer than `bq.inflight` command buffers are in flight
 function limit_inflight!(bq::BatchedCommandQueue)
-    drain_cleanups!(bq)
-    while pending_cleanup_count(bq) >= bq.inflight
-        wait_oldest_cleanup!(bq)
+    while true
+        cmdbuf = Base.@lock submission_lock begin
+            drain_cleanups!(bq)
+            pending_cleanup_count(bq) < bq.inflight && return
+            first(bq.cleanups).cmdbuf
+        end
+        wait_cmdbuf!(cmdbuf)
     end
-    return
 end
 
 """
@@ -594,35 +686,46 @@ to survive it rather than check for it.
 """
 function adopt_continued!(bq::BatchedCommandQueue, old, new)
     pointer(old) == pointer(new) && return
-    bq.encoder === nothing || error(
-        "adopt_continued!: an encoder is still open on a command buffer the library " *
-        "has committed. End it before handing the buffer over.")
-    register_operations!(bq, old)
-    roots = bq.roots
-    # Already committed, by the library. Only the bookkeeping the commit would have
-    # done is missing: the pending list `synchronize` waits on, and the profiler.
-    MTL.record_committed!(old, pointer(bq.queue))
-    hook = MTL.profile_hook[]
-    hook === nothing || hook(old)
-    defer_cleanup!(bq, old, roots)
-    reset_open_cmdbuf!(bq, old)
+    Base.@lock submission_lock begin
+        bq.encoder === nothing || error(
+            "adopt_continued!: an encoder is still open on a command buffer the library " *
+            "has committed. End it before handing the buffer over.")
+        register_operations!(bq, old)
+        roots = bq.roots
+        # Already committed, by the library. Only the bookkeeping the commit would have
+        # done is missing: the pending list `synchronize` waits on, and the profiler.
+        MTL.record_committed!(old, pointer(bq.queue))
+        hook = MTL.profile_hook[]
+        hook === nothing || hook(old)
+        defer_cleanup!(bq, old, roots)
+        reset_open_cmdbuf!(bq, old)
+        bq.cmdbuf = new
+        register_queue!(bq)
+    end
+    # waits for the GPU, so not with the lock held
     limit_inflight!(bq)
-    bq.cmdbuf = new
-    register_queue!(bq)
     return
 end
 
 function flush!(bq::BatchedCommandQueue)
-    cmdbuf = bq.cmdbuf
-    cmdbuf === nothing && return
-
-    end_encoder!(bq)
-    register_operations!(bq, cmdbuf)
-    roots = bq.roots
-    MTL.commit_with_queue_key!(cmdbuf, pointer(bq.queue))
-    defer_cleanup!(bq, cmdbuf, roots)
-    reset_open_cmdbuf!(bq, cmdbuf)
+    commit_batch!(bq)
     limit_inflight!(bq)
+    return
+end
+
+# commit the open batch, if any. this may be another task's queue.
+function commit_batch!(bq::BatchedCommandQueue)
+    Base.@lock submission_lock begin
+        cmdbuf = bq.cmdbuf
+        cmdbuf === nothing && return
+
+        end_encoder!(bq)
+        register_operations!(bq, cmdbuf)
+        roots = bq.roots
+        MTL.commit_with_queue_key!(cmdbuf, pointer(bq.queue))
+        defer_cleanup!(bq, cmdbuf, roots)
+        reset_open_cmdbuf!(bq, cmdbuf)
+    end
     return
 end
 

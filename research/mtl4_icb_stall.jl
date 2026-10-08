@@ -123,7 +123,7 @@ icb = icbs[1]
 
 lq = Metal.global_queue(dev).queue
 rs = Metal.install_queue_residency!(lq, dev)
-for r in (argbuf, arr.data[]); MTL.add_allocation!(rs, r); end
+for r in (argbuf, arr.data[].buffer); MTL.add_allocation!(rs, r); end
 for b in icbs; MTL.add_allocation!(rs, b); end
 MTL.commit!(rs)
 

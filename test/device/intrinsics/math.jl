@@ -34,19 +34,21 @@ const INT_TYPES = [(Int8, "i8", "s"), (UInt8, "i8", "u"), (Int16, "i16", "s"),
 # floating-point
 
 # Group A: `Base.f(::Float32/::Float16)` -> `air.f.{f32,f16}`, and the fast-math variant
-# `FastMath.f_fast(::Float32)` -> `air.fast_f.f32`.
+# `FastMath.f_fast(::Float32)` -> `air.fast_f.f32`. Float16 `sin`/`cos` go through Float32
+# instead: the half builtins are inaccurate on M1-class GPUs (JuliaGPU/Metal.jl#985).
 FLOAT_A = [acos, acosh, asin, asinh, atan, atanh, cos, cosh,
            exp, exp2, exp10, log, log2, log10, sin, sinh, tan, tanh]
 @testset "$f" for f in FLOAT_A
     root = string(f)
     fast = getfield(FastMath, Symbol(root, "_fast"))
+    half = f in (sin, cos) ? "f32" : "f16"
     @eval begin
         @test @filecheck begin
             @check $("@air.$root.f32")
             Metal.code_llvm(x -> $f(x), Tuple{Float32})
         end
         @test @filecheck begin
-            @check $("@air.$root.f16")
+            @check $("@air.$root.$half")
             Metal.code_llvm(x -> $f(x), Tuple{Float16})
         end
         @test @filecheck begin
@@ -197,7 +199,7 @@ end
             Metal.code_llvm(x -> sincos(x), Tuple{Float32})
         end
         @test @filecheck begin
-            @check "@air.sincos.f16"
+            @check "@air.sincos.f32"
             Metal.code_llvm(x -> sincos(x), Tuple{Float16})
         end
         @test @filecheck begin
@@ -684,17 +686,14 @@ end
         N = 4
         arr = rand(T, N)
 
-        # test the intrinsic (macOS >= v14)
-        if metal_support() >= v"3.1"
-            buffer1 = MtlArray(arr)
-            Metal.@sync @metal threads = N nextafter_test(buffer1, typemax(T))
-            @test Array(buffer1) == nextfloat.(arr)
-            Metal.@sync @metal threads = N nextafter_test(buffer1, typemin(T))
-            @test Array(buffer1) == arr
+        buffer1 = MtlArray(arr)
+        Metal.@sync @metal threads = N nextafter_test(buffer1, typemax(T))
+        @test Array(buffer1) == nextfloat.(arr)
+        Metal.@sync @metal threads = N nextafter_test(buffer1, typemin(T))
+        @test Array(buffer1) == arr
 
-            ir = sprint(io->(@device_code_llvm io=io dump_module=true @metal nextafter_out_test()))
-            @test occursin(Regex("@air\\.nextafter\\.f$(8*sizeof(T))"), ir)
-        end
+        ir = sprint(io->(@device_code_llvm io=io dump_module=true @metal nextafter_out_test()))
+        @test occursin(Regex("@air\\.nextafter\\.f$(8*sizeof(T))"), ir)
     end
 
     let # hypot/abs of complex values, which lower to scalar hypot (JuliaGPU/Metal.jl#932)
@@ -898,6 +897,79 @@ end
         as = MtlArray([Complex{Float32}(2.0e20, 2.0e20), Complex{Float32}(1.0e-25, 1.0e-25)])
         @test all(Array(as ./ as) .≈ Complex{Float32}(1.0, 0.0))
     end
+
+    # Base performs these in double precision (JuliaGPU/Metal.jl#871)
+    let
+        x = ComplexF32[1 + 2im, -3 + 4im, 2 - 0.5im, 1f30 + 1im, 1f-30 - 1f-30im]
+        dx = MtlArray(x)
+        @test Array(inv.(dx)) ≈ inv.(x)
+        @test Array(3 ./ dx) ≈ 3 ./ x
+        @test Array(atan.(dx)) ≈ atan.(x)
+        @test Array(dx[1:3] .^ -2) ≈ x[1:3] .^ -2
+        @test Array(dx ./ dx) ≈ ones(ComplexF32, length(x))
+        dz = MtlArray([2f38 + 2f38im])
+        @test Array(dz ./ dz) == [1]
+    end
+end
+
+# Base methods that compute single-precision results in double precision, replaced by
+# GPUToolbox.Overlays.float64_overrides
+@testset "Float64-free fallbacks" begin
+    x = Float32[7, -7, 1, 6, 3, 514, 1f7, 270.00122, 45, 135.5, -89.99, 179.99, 1000]
+    y = Float32[2, 2, 0.1, 0.1, 0.3, 0.75, 3, 0.25, 7, -0.3, 1.5, 9, 0.1]
+    dx, dy = MtlArray(x), MtlArray(y)
+
+    # JuliaGPU/Metal.jl#972
+    @testset "$f" for f in (div, fld, cld, rem, mod, ÷)
+        @test Array(f.(dx, dy)) == f.(x, y)
+    end
+    @test Array(div.(dx, dy, RoundNearest)) == div.(x, y, RoundNearest)
+    @test Array(first.(divrem.(dx, dy))) == first.(divrem.(x, y))
+
+    # JuliaGPU/Metal.jl#973
+    @testset "$f" for f in (sind, cosd, tand, secd, cotd)
+        @test Array(f.(dx)) ≈ f.(x)
+    end
+    @test Array(last.(sincosd.(dx))) ≈ last.(sincosd.(x))
+    @test Array(sind.(MtlArray(Float16[30, 45, 180]))) ≈ sind.(Float16[30, 45, 180])
+
+    @test Array(first.(sincospi.(dy))) ≈ first.(sincospi.(y))
+    @test Array(cispi.(dy)) ≈ cispi.(y)
+
+    # mixed Float32/Int32 comparisons and integer powers
+    i = Int32[7, -7, 16777217, typemax(Int32), 0, 514, 10000000, 270, 45, 136, -90, 180, 1000]
+    di = MtlArray(i)
+    @test Array(dx .< di) == (x .< i)
+    @test Array(dx .== di) == (x .== i)
+    @test Array(Float16.(dx) .<= di) == (Float16.(x) .<= i)
+    @test Array(MtlArray(fill(-1f0, 3)) .^ MtlArray([16777217, 16777216, -3])) == [-1, 1, -1]
+end
+
+# Float16 sin/cos must match the CPU, which computes them in Float32 (JuliaGPU/Metal.jl#985).
+# The CPU and GPU Float32 results can differ in the last bit, which flips the rounding to
+# Float16 near ties, so allow 1 ulp.
+@testset "Float16 $f" for f in (sin, cos, first ∘ sincos, last ∘ sincos)
+    x = filter(isfinite, reinterpret(Float16, collect(typemin(UInt16):typemax(UInt16))))
+    y, ref = Array(f.(MtlArray(x))), f.(x)
+    @test all(abs.(Float32.(y) .- Float32.(ref)) .<= eps.(ref))
+    @test signbit.(y) == signbit.(ref)
+end
+
+# `@fastmath x^n` with an integer `n` emits `llvm.powi`, which AIR lacks. GPUCompiler expands
+# it into multiplies in the same order as the CPU does, so the results should be identical.
+@testset "fastmath integer power" begin
+    pow(x, n) = @fastmath x^n
+    pow_const(x) = @fastmath x^-5
+
+    xs = Float32[0, -0.0, 1, -1, 0.5, -1.5, 3.7, -3.7, Inf, -Inf, NaN]
+    ns = Int32[-7:7; typemin(Int32); typemax(Int32)]
+    x, n = vec([x for x in xs, n in ns]), vec([n for x in xs, n in ns])
+    @test isequal(Array(pow.(MtlArray(x), MtlArray(n))), pow.(x, n))
+    @test isequal(Array(pow_const.(MtlArray(xs))), pow_const.(xs))
+
+    # the CPU computes Float16 powers in Float32
+    h, m = Float16[0.5, -1.5, 3, -3, 1.25], Int32[-3, 2, 5, -4, 7]
+    @test Array(pow.(MtlArray(h), MtlArray(m))) ≈ pow.(h, m)
 end
 
 end

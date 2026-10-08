@@ -1,6 +1,6 @@
 using PrecompileTools: @setup_workload, @compile_workload
 
-Sys.isapple() && Sys.ARCH === :aarch64 && @setup_workload begin
+@setup_workload begin
     metallib_file = joinpath(dirname(@__DIR__), "test", "dummy.metallib")
 
     @compile_workload begin
@@ -12,7 +12,7 @@ Sys.isapple() && Sys.ARCH === :aarch64 && @setup_workload begin
         # the compiled kernel (inference results and metallib bytes, attached to its
         # CodeInstance) in the package image, so that loading Metal.jl can launch it
         # without invoking the compiler. session-local state (pipeline handles,
-        # kernel instances) is kept out of the image below and by `mtlfunction`.
+        # relocation tables) is kept out of the image below and by `mtlfunction`.
         # NOTE: only compile and link; actually launching a kernel (committing a
         #       command buffer and waiting for it) hangs during precompilation.
         mtlfunction(identity, Tuple{Nothing})
@@ -61,14 +61,15 @@ Sys.isapple() && Sys.ARCH === :aarch64 && @setup_workload begin
     # the package image yields dangling pointers when the image is loaded. Drop
     # the entries before precompilation finalizes.
     Base.@lock compiler_configs_lock empty!(_compiler_configs)
-    empty!(kernel_instances)
     Base.@lock global_queues_lock empty!(global_queues)
     Base.@lock batched_queues_lock empty!(batched_queues)
     empty!(queue_residency_sets)
+    empty!(residency_attached_queues)
+    empty!(residency_members)
+    empty!(pending_residency_drops)
     Base.@lock memory_pressure_stats_lock empty!(_memory_pressure_stats)
     empty!(device_malloc_bufs)
     empty!(MTL.last_committed_per_queue)
     empty!(MTL.submission_state_per_queue)
     empty!(device_exception_info)
-    reset_binary_archives!()
 end

@@ -35,17 +35,28 @@ function gfx_fragment(pos::FragCoord, out::Core.LLVMPtr{GfxFOut,1})
     return nothing
 end
 
-"""Compile `f` as `stage` and hand back the LLVM module for inspection."""
-function compile_stage(f, tt, stage::Symbol; name = string(nameof(f)))
+"""
+Compile `f` as `stage` and call `check` on the LLVM module.
+
+Inside the context the module was compiled in: it belongs to the caller of
+`compile` and is freed with that context, so it cannot be returned.
+"""
+function compile_stage(check, f, tt, stage::Symbol; name = string(nameof(f)))
     cfg = compiler_config(Metal.device(); stage, name)
     job = Metal.GPUCompiler.CompilerJob(Metal.methodinstance(typeof(f), tt), cfg)
-    return Metal.GPUCompiler.JuliaContext() do _
-        Metal.GPUCompiler.compile(:llvm, job)[1]
+    Metal.GPUCompiler.JuliaContext() do _
+        mod = Metal.GPUCompiler.compile(:llvm, job)[1]
+        try
+            check(mod)
+        finally
+            LLVM.dispose(mod)
+        end
     end
+    return
 end
 
-nodes(mod, key) = haskey(LLVM.metadata(mod), key) ?
-                  collect(LLVM.operands(LLVM.metadata(mod)[key])) : LLVM.MDNode[]
+nodes(mod, key) = haskey(mod.metadata, key) ?
+                  collect(mod.metadata[key].operands) : LLVM.MDNode[]
 
 @testset "the varying linkage tag" begin
     # A varying is matched between stages by THIS STRING and nothing else — not
@@ -67,89 +78,88 @@ nodes(mod, key) = haskey(LLVM.metadata(mod), key) ?
 end
 
 @testset "a Julia function compiles to an AIR vertex program" begin
-    mod = compile_stage(gfx_vertex,
-                        Tuple{Core.LLVMPtr{NTuple{4,Float32},1}, VertexID,
-                              Core.LLVMPtr{GfxVOut,1}},
-                        :vertex)
+    compile_stage(gfx_vertex,
+                  Tuple{Core.LLVMPtr{NTuple{4,Float32},1}, VertexID,
+                        Core.LLVMPtr{GfxVOut,1}},
+                  :vertex) do mod
+        @test length(nodes(mod, "air.vertex")) == 1
+        # …and it must STOP being a kernel: leaving the old node would leave
+        # `air.kernel` naming a function that now returns a struct.
+        @test isempty(nodes(mod, "air.kernel"))
 
-    @test length(nodes(mod, "air.vertex")) == 1
-    # …and it must STOP being a kernel: leaving the old node would leave
-    # `air.kernel` naming a function that now returns a struct.
-    @test isempty(nodes(mod, "air.kernel"))
+        entry = only(f for f in mod.functions
+                     if !LLVM.isdeclaration(f) && f.name == "gfx_vertex")
+        ft = entry.function_type
 
-    entry = only(f for f in LLVM.functions(mod)
-                 if !LLVM.isdeclaration(f) && LLVM.name(f) == "gfx_vertex")
-    ft = LLVM.function_type(entry)
+        # The return type is the whole point. `convert(LLVMType, NTuple{4,Float32})`
+        # is `[4 x float]`, an ARRAY; AIR wants `<4 x float>` in a PACKED struct, and
+        # the loader rejects the other one.
+        rt = ft.return_type
+        @test rt isa LLVM.StructType
+        @test LLVM.ispacked(rt)
+        @test length(rt.elements) == 2
+        @test all(e -> e isa LLVM.VectorType, rt.elements)
+        @test string(rt) == "<{ <4 x float>, <4 x float> }>"
 
-    # The return type is the whole point. `convert(LLVMType, NTuple{4,Float32})`
-    # is `[4 x float]`, an ARRAY; AIR wants `<4 x float>` in a PACKED struct, and
-    # the loader rejects the other one.
-    rt = LLVM.return_type(ft)
-    @test rt isa LLVM.StructType
-    @test LLVM.ispacked(rt)
-    @test length(LLVM.elements(rt)) == 2
-    @test all(e -> e isa LLVM.VectorType, LLVM.elements(rt))
-    @test string(rt) == "<{ <4 x float>, <4 x float> }>"
+        # The trailing output pointer is gone, and the vertex id is a VALUE — the
+        # kernel ABI would have passed it as another buffer pointer.
+        params = collect(ft.parameters)
+        @test string(last(params)) == "i32"
 
-    # The trailing output pointer is gone, and the vertex id is a VALUE — the
-    # kernel ABI would have passed it as another buffer pointer.
-    params = collect(LLVM.parameters(ft))
-    # Compared as text: CONSTRUCTING an LLVM type needs an active context, and
-    # the module outlives the one it was compiled in.
-    @test string(last(params)) == "i32"
+        ops = only(nodes(mod, "air.vertex")).operands
+        outs = [string(o) for o in ops[2].operands]
+        @test occursin("air.position", outs[1])
+        @test occursin("\"position\"", outs[1])
+        @test occursin("air.vertex_output", outs[2])
+        @test occursin("generated(5colorDv4_f)", outs[2])
 
-    ops = LLVM.operands(only(nodes(mod, "air.vertex")))
-    outs = [string(o) for o in LLVM.operands(ops[2])]
-    @test occursin("air.position", outs[1])
-    @test occursin("\"position\"", outs[1])
-    @test occursin("air.vertex_output", outs[2])
-    @test occursin("generated(5colorDv4_f)", outs[2])
-
-    ins = [string(o) for o in LLVM.operands(ops[3])]
-    @test any(s -> occursin("air.vertex_id", s), ins)
-    # The buffer arguments keep GPUCompiler's description verbatim: a buffer is
-    # described the same way whichever stage reads it, so re-deriving sizes and
-    # address spaces here would only be a chance to get them wrong.
-    @test any(s -> occursin("air.buffer", s) && occursin("air.address_space", s), ins)
+        ins = [string(o) for o in ops[3].operands]
+        @test any(s -> occursin("air.vertex_id", s), ins)
+        # The buffer arguments keep GPUCompiler's description verbatim: a buffer is
+        # described the same way whichever stage reads it, so re-deriving sizes and
+        # address spaces here would only be a chance to get them wrong.
+        @test any(s -> occursin("air.buffer", s) && occursin("air.address_space", s), ins)
+    end
 end
 
 @testset "a Julia function compiles to an AIR fragment program" begin
-    mod = compile_stage(gfx_fragment,
-                        Tuple{FragCoord, Core.LLVMPtr{GfxFOut,1}},
-                        :fragment)
+    compile_stage(gfx_fragment,
+                  Tuple{FragCoord, Core.LLVMPtr{GfxFOut,1}},
+                  :fragment) do mod
+        @test length(nodes(mod, "air.fragment")) == 1
+        @test isempty(nodes(mod, "air.kernel"))
 
-    @test length(nodes(mod, "air.fragment")) == 1
-    @test isempty(nodes(mod, "air.kernel"))
+        entry = only(f for f in mod.functions
+                     if !LLVM.isdeclaration(f) && f.name == "gfx_fragment")
+        @test string(entry.function_type.return_type) == "<{ <4 x float> }>"
 
-    entry = only(f for f in LLVM.functions(mod)
-                 if !LLVM.isdeclaration(f) && LLVM.name(f) == "gfx_fragment")
-    @test string(LLVM.return_type(LLVM.function_type(entry))) == "<{ <4 x float> }>"
+        ops = only(nodes(mod, "air.fragment")).operands
+        # A fragment's outputs are render targets, indexed from zero.
+        outs = [string(o) for o in ops[2].operands]
+        @test occursin("air.render_target", outs[1])
+        @test occursin("i32 0", outs[1])
 
-    ops = LLVM.operands(only(nodes(mod, "air.fragment")))
-    # A fragment's outputs are render targets, indexed from zero.
-    outs = [string(o) for o in LLVM.operands(ops[2])]
-    @test occursin("air.render_target", outs[1])
-    @test occursin("i32 0", outs[1])
-
-    # The interpolated position arrives as a value, and declares how it is
-    # sampled — the reference pairs `air.position` with `air.center` and
-    # `air.no_perspective`.
-    ins = [string(o) for o in LLVM.operands(ops[3])]
-    pos = only(filter(s -> occursin("air.position", s), ins))
-    @test occursin("air.center", pos)
-    @test occursin("air.no_perspective", pos)
+        # The interpolated position arrives as a value, and declares how it is
+        # sampled — the reference pairs `air.position` with `air.center` and
+        # `air.no_perspective`.
+        ins = [string(o) for o in ops[3].operands]
+        pos = only(filter(s -> occursin("air.position", s), ins))
+        @test occursin("air.center", pos)
+        @test occursin("air.no_perspective", pos)
+    end
 end
 
 @testset "a kernel is left alone" begin
     # The stage passes must not touch ordinary compute compilation.
     knl(a::Core.LLVMPtr{Float32,1}) = (Base.unsafe_store!(a, 1f0); nothing)
-    mod = compile_stage(knl, Tuple{Core.LLVMPtr{Float32,1}}, :kernel)
-    @test length(nodes(mod, "air.kernel")) == 1
-    @test isempty(nodes(mod, "air.vertex"))
-    @test isempty(nodes(mod, "air.fragment"))
-    entry = only(f for f in LLVM.functions(mod)
-                 if !LLVM.isdeclaration(f) && LLVM.name(f) == "knl")
-    @test string(LLVM.return_type(LLVM.function_type(entry))) == "void"
+    compile_stage(knl, Tuple{Core.LLVMPtr{Float32,1}}, :kernel) do mod
+        @test length(nodes(mod, "air.kernel")) == 1
+        @test isempty(nodes(mod, "air.vertex"))
+        @test isempty(nodes(mod, "air.fragment"))
+        entry = only(f for f in mod.functions
+                     if !LLVM.isdeclaration(f) && f.name == "knl")
+        @test string(entry.function_type.return_type) == "void"
+    end
 end
 
 @testset "Metal itself accepts the stage" begin
@@ -1016,39 +1026,39 @@ vis_ref(i) = (1f0, 1f0*0.5f0 + 2f0*0.25f0 + 3f0*0.125f0 + Float32(i), 0.25f0, 0.
     lib = read(IOBuffer(res.metallib), Metal.MetalLib)
     @test only(lib.functions).program_type == Metal.PROGRAM_VISIBLE
 
-    mod = compile_stage(vis_candidate, VIS_TT, :visible; name = "vis_candidate")
+    compile_stage(vis_candidate, VIS_TT, :visible; name = "vis_candidate") do mod
+        # BY VALUE, and returning the value BARE. Both are the ABI a caller links
+        # against and neither is what a stage gets: the kernel ABI passes every
+        # argument as `ptr addrspace(1)`, and every other stage returns a packed
+        # struct because it has several outputs to name. Left either way this still
+        # compiles, links, dispatches and completes — and the caller reads zeros.
+        @test string(mod.functions["vis_candidate"].function_type) ==
+              "<4 x float> (i32, float, float, float, float, float, float, float)"
 
-    # BY VALUE, and returning the value BARE. Both are the ABI a caller links
-    # against and neither is what a stage gets: the kernel ABI passes every
-    # argument as `ptr addrspace(1)`, and every other stage returns a packed
-    # struct because it has several outputs to name. Left either way this still
-    # compiles, links, dispatches and completes — and the caller reads zeros.
-    @test string(LLVM.function_type(LLVM.functions(mod)["vis_candidate"])) ==
-          "<4 x float> (i32, float, float, float, float, float, float, float)"
+        # …and the AIR metadata, whose shape is Apple's: `air.visible` holding
+        # `{ptr @fn, outputs, inputs}`, the output carrying only a TYPE — no index
+        # and no name, unlike a render target or a varying. Read out of
+        # `CC_InlineCompositing32x32` in CoreComposite's shipped `default-cc.metallib`.
+        vis = nodes(mod, "air.visible")
+        @test length(vis) == 1
+        ops = collect(vis[1].operands)
+        @test length(ops) == 3
+        outs = collect(ops[2].operands)
+        @test length(outs) == 1
+        @test occursin("air.visible_output", string(outs[1]))
+        @test occursin("float4", string(outs[1]))
+        ins = collect(ops[3].operands)
+        @test length(ins) == 8
+        @test all(i -> occursin("air.visible_input", string(ins[i])), 1:length(ins))
+        # `uint`, from the JULIA type: LLVM cannot tell it from `int` — both are
+        # `i32` — and Apple's own visible functions spell the unsigned one `uint`.
+        @test occursin("!\"uint\"", string(ins[1]))
+        @test occursin("!\"float\"", string(ins[2]))
 
-    # …and the AIR metadata, whose shape is Apple's: `air.visible` holding
-    # `{ptr @fn, outputs, inputs}`, the output carrying only a TYPE — no index
-    # and no name, unlike a render target or a varying. Read out of
-    # `CC_InlineCompositing32x32` in CoreComposite's shipped `default-cc.metallib`.
-    vis = nodes(mod, "air.visible")
-    @test length(vis) == 1
-    ops = collect(LLVM.operands(vis[1]))
-    @test length(ops) == 3
-    outs = collect(LLVM.operands(ops[2]))
-    @test length(outs) == 1
-    @test occursin("air.visible_output", string(outs[1]))
-    @test occursin("float4", string(outs[1]))
-    ins = collect(LLVM.operands(ops[3]))
-    @test length(ins) == 8
-    @test all(i -> occursin("air.visible_input", string(ins[i])), 1:length(ins))
-    # `uint`, from the JULIA type: LLVM cannot tell it from `int` — both are
-    # `i32` — and Apple's own visible functions spell the unsigned one `uint`.
-    @test occursin("!\"uint\"", string(ins[1]))
-    @test occursin("!\"float\"", string(ins[2]))
-
-    # It is no longer a kernel: leaving `air.kernel` behind would point it at a
-    # function that now returns a value.
-    @test isempty(nodes(mod, "air.kernel"))
+        # It is no longer a kernel: leaving `air.kernel` behind would point it at a
+        # function that now returns a value.
+        @test isempty(nodes(mod, "air.kernel"))
+    end
 
     # …and Metal agrees.
     vislib = Metal.MTL.MTLLibraryFromData(dev, res.metallib)
@@ -1107,7 +1117,7 @@ end
     cb  = Metal.MTL.MTLCommandBuffer(GFX_QUEUE)
     enc = Metal.MTL.MTLComputeCommandEncoder(cb)
     Metal.MTL.set_function!(enc, pipe)
-    Metal.MTL.set_buffer!(enc, out.data[], 0, 1)
+    Metal.MTL.set_buffer!(enc, out.data[].buffer, 0, 1)
     Metal.MTL.set_visible_function_table!(enc, tbl, 1)
     Metal.MTL.append_current_function!(enc, Metal.MTL.MTLSize(1,1,1), Metal.MTL.MTLSize(n,1,1))
     Metal.MTL.endEncoding!(enc)

@@ -27,6 +27,8 @@ end
 
 function run(graph::MPSGraph, commandQueue, feeds::MPSGraphTensorDataDictionary, targetTensors::NSArray)
     Metal.flush!(commandQueue)
+    # this executes synchronously, without going through Metal.jl's submission hook
+    Metal.synchronize_pending!()
     obj = @objc [graph::id{MPSGraph} runWithMTLCommandQueue:commandQueue::id{MTLCommandQueue}
                                                     feeds:feeds::id{MPSGraphTensorDataDictionary}
                                             targetTensors:targetTensors::id{NSArray}
@@ -97,7 +99,7 @@ end
 
 An array's bytes as MPS sees them, HONOURING its offset.
 
-`MPSGraphTensorData(::MtlArray)` binds `arr.data[]` — the whole buffer — and the
+`MPSGraphTensorData(::MtlArray)` binds the array's whole buffer, and the
 offset is silently dropped, which is correct only for an array that starts one. A
 suballocated array (every transient of a render graph is a slice of a 64 MiB block)
 reads and writes the wrong bytes. `MPSNDArray` takes the offset, so the route
@@ -112,10 +114,10 @@ through it is the one that works for both.
 # reshaped in the graph, which is the only way to hand MPS a `7x7x3x96` half weight at
 # a nonzero offset at all.
 function tensordata(arr::Metal.MtlArray, shape::Tuple = size(arr))
-    arr.offset == 0 && return MPSGraphTensorData(arr.data[],
+    arr.offset == 0 && return MPSGraphTensorData(Base.unsafe_convert(MTLBuffer, arr),
         convert(MPSShape, reverse(shape)), eltype(arr))
     desc = MPS.MPSNDArrayDescriptor(eltype(arr), collect(shape))
-    return MPSGraphTensorData(MPS.MPSNDArray(arr.data[], UInt(arr.offset), desc))
+    return MPSGraphTensorData(MPS.MPSNDArray(Base.unsafe_convert(MTLBuffer, arr), UInt(arr.offset), desc))
 end
 
 """

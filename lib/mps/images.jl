@@ -57,11 +57,11 @@ function blur(image, kernel; pixelFormat=MTL.MTLPixelFormatRGBA8Unorm)
 
     textDesc1 = MTLTextureDescriptor(pixelFormat, w, h)
     textDesc1.usage = MTL.MTLTextureUsageShaderRead | MTL.MTLTextureUsageShaderWrite
-    text1 = MTL.MTLTexture(image.data.rc.obj, textDesc1, 0, bytesPerRow)
+    text1 = MTL.MTLTexture(Base.unsafe_convert(MTLBuffer, image), textDesc1, 0, bytesPerRow)
 
     textDesc2 = MTLTextureDescriptor(pixelFormat, w, h)
     textDesc2.usage = MTL.MTLTextureUsageShaderRead | MTL.MTLTextureUsageShaderWrite
-    text2 = MTL.MTLTexture(res.data.rc.obj, textDesc2, 0, bytesPerRow)
+    text2 = MTL.MTLTexture(Base.unsafe_convert(MTLBuffer, res), textDesc2, 0, bytesPerRow)
 
     # The batch's buffer, not one of this call's own — see `Metal.batchbuffer`. The two
     # textures and the kernel are held until it retires; nothing else references them once

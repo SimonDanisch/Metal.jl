@@ -4,7 +4,7 @@ export @metal
 ## high-level @metal interface
 
 const MACRO_KWARGS = [:launch]
-const COMPILER_KWARGS = [:kernel, :name, :always_inline, :debug_level, :opt_level, :macos, :air, :metal, :gpufamily]
+const COMPILER_KWARGS = [:kernel, :name, :fastmath, :always_inline, :debug_level, :opt_level, :macos, :air, :metal, :gpufamily]
 const LAUNCH_KWARGS = [:groups, :threads, :queue, :submit]
 
 """
@@ -86,7 +86,8 @@ macro metal(ex...)
                 $kernel_f = $mtlconvert($f_var)
                 $kernel_args = map($mtlconvert, ($(var_exprs...),))
                 $kernel_tt = Tuple{map(Core.Typeof, $kernel_args)...}
-                $kernel = $mtlfunction($kernel_f, $kernel_tt; $(compiler_kwargs...))
+                $kernel = $mtlfunction($kernel_f, $kernel_tt;
+                                       source=$f_var, $(compiler_kwargs...))
                 if $launch
                     $kernel($(var_exprs...); $(call_kwargs...))
                 end
@@ -104,9 +105,23 @@ end
 
 ## argument conversion
 
+# thrown when encoding a kernel argument whose memory may still be in use by another
+# queue. the launch is retried after waiting for that queue, without holding any locks.
+struct OwnershipConflict <: Exception
+    managed::Managed
+end
+
+function claim!(ptr::MtlPtr, bq::BatchedCommandQueue)
+    conflict = try_take_ownership!(bq, ptr)
+    conflict === nothing || throw(OwnershipConflict(conflict))
+    return
+end
+
 struct Adaptor
     # the current command encoder, if any.
     cce::Union{Nothing,MTLComputeCommandEncoder}
+    # the queue the encoder belongs to, if any.
+    queue::Union{Nothing,BatchedCommandQueue}
 end
 
 """
@@ -166,6 +181,7 @@ function Adapt.adapt_storage(to::Adaptor, buf::MTLBuffer)
     reinterpret(Core.LLVMPtr{Nothing,AS.Device}, buf.gpuAddress)
 end
 function Adapt.adapt_storage(to::Adaptor, ptr::MtlPtr{T}) where {T}
+    to.queue === nothing || claim!(ptr, to.queue)
     reinterpret(Core.LLVMPtr{T,AS.Device}, adapt(to, ptr.buffer)) + ptr.offset
 end
 
@@ -192,12 +208,20 @@ Adapt.adapt_structure(::Adaptor, r::Base.RefValue{<:Union{DataType, Type}}) =
     MtlRefType{r[]}()
 
 # case where type is the function being broadcasted
+# (on Julia 1.14, the function type parameter is `Core.TypeEgal{T} <: Type{T}`)
 Adapt.adapt_structure(to::Adaptor,
-                      bc::Broadcast.Broadcasted{Style, <:Any, Type{T}}) where {Style, T} =
+                      bc::Broadcast.Broadcasted{Style, <:Any, <:Type{T}}) where {Style, T} =
     Broadcast.Broadcasted{Style}((x...) -> T(x...), adapt(to, bc.args), bc.axes)
 
+# functions that capture a type, e.g., `Base.Fix1(convert, T)` as used by LinearAlgebra,
+# which isn't a valid kernel argument either
+Adapt.adapt_structure(to::Adaptor, f::Base.Fix1{<:Any, <:Type{T}}) where {T} =
+    let g = adapt(to, f.f); (x...) -> g(T, x...) end
+Adapt.adapt_structure(to::Adaptor, f::Base.Fix2{<:Any, <:Type{T}}) where {T} =
+    let g = adapt(to, f.f); (x...) -> g(x..., T) end
+
 """
-    mtlconvert(x, [cce])
+    mtlconvert(x, [cce, [queue]])
 
 This function is called for every argument to be passed to a kernel, allowing it to be
 converted to a GPU-friendly format. By default, the function does nothing and returns the
@@ -206,13 +230,17 @@ input object `x` as-is.
 Do not add methods to this function, but instead extend the underlying Adapt.jl package and
 register methods for the the `Metal.Adaptor` type.
 """
-mtlconvert(arg, cce=nothing) = adapt(Adaptor(cce), arg)
+mtlconvert(arg, cce=nothing, queue=nothing) = adapt(Adaptor(cce, queue), arg)
 
 
 ## host-side kernel API
 
-struct HostKernel{F,TT}
+struct HostKernel{F,S,TT}
     f::F
+    # the callable before conversion, which is converted again at every launch: only then
+    # can the buffers it captures be declared to the command encoder, and holding on to it
+    # keeps those buffers alive for as long as the kernel object and its launches need them.
+    source::S
     pipeline::MTLComputePipelineState
     loggingEnabled::Bool
     device::MTLDevice
@@ -244,20 +272,24 @@ The following keyword arguments are supported:
    `JULIA_METAL_TARGET_GPUFAMILY`, e.g. `7` to compile as for an M1), and without one to
    the highest family the device supports.
 - `indirect`: build a pipeline an `MTLIndirectCommandBuffer` command may name. The
-   compiled code is the same and is cached the same; only the pipeline differs, and
-   it is not cached, because a caller who asks for one holds it.
+   compiled code is the same and is cached the same; only the pipeline differs, and it is
+   cached separately from the one a `@metal` launch uses.
+- `source`: the callable before [`mtlconvert`](@ref) turned it into `f`, which is what
+  gets converted again at every launch (so it should convert to an object of the same type
+  as `f`). Defaults to `f`, but should be set when `f` captures GPU arrays, so that their
+  buffers are made available to the GPU and kept alive as long as the kernel is in use.
 
 The output of this function is automatically cached, i.e. you can simply call `mtlfunction`
 in a hot path without degrading performance. New code will be generated automatically when
 the function changes, or when different types or keyword arguments are provided.
 """
-function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, indirect::Bool=false,
+function mtlfunction(f::F, tt::TT=Tuple{}; source=f, name=nothing, indirect::Bool=false,
                      kwargs...) where {F,TT}
     Base.@lock mtlfunction_lock begin
         dev = device()
         config = compiler_config(dev; name, kwargs...)::MetalCompilerConfig
-        source = methodinstance(F, tt)
-        job = CompilerJob(source, config)
+        mi = methodinstance(F, tt)
+        job = CompilerJob(mi, config)
 
         res = compile_or_lookup(job)::MetalResults
 
@@ -311,17 +343,12 @@ function mtlfunction(f::F, tt::TT=Tuple{}; name=nothing, indirect::Bool=false,
             end
         end
 
-        h = hash(pipeline[], hash(f, hash(tt)))
-        get!(kernel_instances, h) do
-            local dev = pipeline[].device
-            HostKernel{F,tt}(f, pipeline[], res.loggingEnabled::Bool,
-                             dev,
-                             Int(pipeline[].maxTotalThreadsPerThreadgroup),
-                             Int(pipeline[].staticThreadgroupMemoryLength),
-                             Int(pipeline[].threadExecutionWidth),
-                             can_use_residency_sets(dev),
-                             reloc_table)
-        end::HostKernel{F,tt}
+        HostKernel{F,typeof(source),tt}(f, source, pipeline[], res.loggingEnabled::Bool, dev,
+                                        Int(pipeline[].maxTotalThreadsPerThreadgroup),
+                                        Int(pipeline[].staticThreadgroupMemoryLength),
+                                        Int(pipeline[].threadExecutionWidth),
+                                        can_use_residency_sets(dev),
+                                        reloc_table)
     end
 end
 
@@ -331,9 +358,10 @@ end
 #
 # `metallib === nothing` identifies a `MetalResults` that hasn't been compiled yet —
 # either freshly created, or (on 1.11+) loaded from a package image whose precompile
-# workload only inferred the kernel without compiling it. The `compile_hook` check
-# additionally forces the compile path so reflection-style consumers (`@device_code_*`)
-# observe the compilation even on a cache hit.
+# workload only inferred the kernel without compiling it. Every lookup is reported to
+# the `@device_code_*` hook, so reflection observes cached kernels without recompiling
+# them.
+#
 # How often a kernel was served from the compile cache, and how often it had to be
 # built. The same two numbers Lava reports for its frozen SPIR-V, so that Mantle's
 # `kernelcompiles` reads alike on both backends rather than each inventing a shape.
@@ -356,10 +384,11 @@ compile_stats() = (; hits = COMPILE_HITS[], misses = COMPILE_MISSES[])
 reset_compile_stats!() = (COMPILE_HITS[] = 0; COMPILE_MISSES[] = 0; nothing)
 
 # Specialize on the target/parameter types so callers can avoid boxing CompilerJob.
-# Keep the body out of callers that specialize per kernel. (Upstream #967.)
+# Keep the body out of callers that specialize per kernel.
 @noinline function compile_or_lookup(job::CompilerJob)::MetalResults
+    GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(MetalResults, job)
-    if res === nothing || res.metallib === nothing || GPUCompiler.compile_hook[] !== nothing
+    if res === nothing || res.metallib === nothing
         COMPILE_MISSES[] += 1
         artifacts = compile_to_metallib(job)
         res = @something res GPUCompiler.cached_results(MetalResults, job)
@@ -374,52 +403,43 @@ reset_compile_stats!() = (COMPILE_HITS[] = 0; COMPILE_MISSES[] = 0; nothing)
     return res
 end
 
-# cache of kernel instances
-const kernel_instances = Dict{UInt, Any}()
-
-
 ## kernel launching and argument encoding
 
-# `args::Tuple` and not `Vararg`: splatting one to reach this built a NEW tuple on
-# every launch — 1176 of 8256 sampled bytes in a 400-launch profile, attributed to the
-# splat in `encode_arguments_nospec!`. A generated function reads the field types of a
-# tuple exactly as it reads a vararg's, so nothing about the generated code changes.
-@inline @generated function encode_arguments!(cce, kernel, kernel_state, f, args::Tuple)
+# Encode the kernel state, the callable and the arguments, in that order. Which of those
+# values occupy a parameter slot is decided by the kernel's compiled signature, which holds
+# their converted types: the unconverted ones don't tell, e.g., a `Base.Fix1` capturing a
+# type converts to a ghost closure, and a type-valued argument is a `DataType` here but a
+# ghost `Type{T}` in the signature.
+#
+# `args::Tuple` and not `Vararg`: splatting one to reach this built a new tuple on every
+# launch.
+@inline @generated function encode_arguments!(cce, bq, kernel::HostKernel{F,S,TT}, kernel_state,
+                                              f, args::Tuple) where {F,S,TT}
+    sig = (KernelState, F, TT.parameters...)
+    vals = (:kernel_state, :f, (:(args[$i]) for i in 1:fieldcount(args))...)
+    typs = (kernel_state, f, fieldtypes(args)...)
+    if length(sig) != length(typs)
+        msg = "Kernel expects $(length(TT.parameters)) arguments, got $(fieldcount(args))"
+        return :(throw(ArgumentError($msg)))
+    end
+
+    # the callable and arguments passed into this function have not been `mtlconvert`ed:
+    # top-level MTLBuffer and MtlPtr objects are bound directly, and everything else is
+    # converted here, with the encoder, so that the buffers it contains are declared to it.
     ex = quote end
-
-    # the arguments passed into this function have not been `mtlconvert`ed, because we need
-    # to retain the top-level MTLBuffer and MtlPtr objects. eager conversion of nested
-    # such objects to LLVMPtr seems fine, somehow.
-    # TODO: can we just convert everything eagerly and support top-level LLVMPtrs?
-
-    # The kernel state and the function come first and by name; everything after them
-    # is read out of the argument TUPLE. Splicing all three into one tuple to iterate
-    # uniformly is what the caller used to do, and building it allocated on every
-    # launch — 2872 of 7432 sampled bytes in a 400-launch profile, the largest site
-    # left. Here nothing is spliced: `kernel_state` and `f` are parameters.
     idx = 1
-    for (argidx, argtyp) in enumerate((kernel_state, f, fieldtypes(args)...))
-        argex = argidx == 1 ? :(kernel_state) :
-                argidx == 2 ? :(f) : :(args[$(argidx - 2)])
-        if argtyp <: MTLBuffer
+    for (dt, val, typ) in zip(sig, vals, typs)
+        (isghosttype(dt) || Core.Compiler.isconstType(dt)) && continue
+        if typ <: MTLBuffer
             # top-level buffers are passed as a pointer-valued argument
-            push!(ex.args, :(set_buffer!(cce, $argex, 0, $idx)))
-        elseif argtyp <: MtlPtr
+            push!(ex.args, :(set_buffer!(cce, $val, 0, $idx)))
+        elseif typ <: MtlPtr
             # the same as a buffer, but with an offset
-            push!(ex.args, :(set_buffer!(cce, $argex.buffer, $argex.offset, $idx)))
-        elseif isghosttype(argtyp) || Core.Compiler.isconstType(argtyp) || argtyp <: Type
-            # `argtyp <: Type`: a type-valued argument read out of the TUPLE is a
-            # `DataType` (or `UnionAll`, `Union`), never the `Type{T}` that
-            # `isconstType` recognises. The kernel was compiled at `Core.Typeof`,
-            # which makes it `Type{T}`, a ghost with no slot; binding one here
-            # shifted every later argument by one, and `@metal k(Int, pointer(a))`
-            # stored nowhere.
-            continue
+            push!(ex.args, :(claim!($val, bq)))
+            push!(ex.args, :(set_buffer!(cce, $val.buffer, $val.offset, $idx)))
         else
             # everything else is passed by reference, copied into Metal's transient buffer
-            append!(ex.args, (quote
-                set_argument!(cce, mtlconvert($(argex), cce), $idx)
-            end).args)
+            push!(ex.args, :(set_argument!(cce, mtlconvert($val, cce, bq), $idx)))
         end
         idx += 1
     end
@@ -455,13 +475,29 @@ end
     return
 end
 
+# `indirect` is `(buffer, byte offset)` of three `UInt32` threadgroup counts the device
+# wrote, for a `dispatchThreadgroupsIndirect`; `groups` is then only a bound.
+function (kernel::HostKernel)(args...; groups=1, threads=1, queue=nothing,
+                              submit::Bool=false, indirect=nothing)
+    gs, ts = MTLSize(groups), MTLSize(threads)
+    while true
+        conflict = try_launch(kernel, queue, gs, ts, args, submit, indirect)
+        conflict === nothing && return
+        synchronize(conflict)
+    end
+end
+
 # wraps a single function call, keeping its closure body small.
-@autoreleasepool function (kernel::HostKernel)(args...; groups=1, threads=1,
-                                               queue=nothing, submit::Bool=false,
-                                               indirect=nothing)
+#
+# Not `@nospecialize`: a `@nospecialize`d kernel or argument tuple makes the calls below
+# dynamic, which boxes `kernel_state`, the arguments and every field read of the kernel
+# on each launch. `HostKernel{F,S,TT}` is one type per kernel and the generated encoder
+# specializes per argument list anyway, so specializing here partitions nothing further.
+@autoreleasepool function try_launch(kernel::HostKernel, queue,
+                                     gs::MTLSize, ts::MTLSize, args::Tuple,
+                                     submit::Bool, indirect=nothing)
     # function barrier to avoid capturing the `@autoreleasepool` in the generated code
-    launch_with_queue(kernel, queue, MTLSize(groups), MTLSize(threads), args, submit,
-                      indirect)
+    launch_with_queue(kernel, queue, gs, ts, args, submit, indirect)
 end
 
 @inline function launch_with_queue(kernel::HostKernel, ::Nothing,
@@ -487,9 +523,6 @@ function launch_logging!(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
                          kernel_state, buf, exc)
     flush!(bq)
     queue = bq.queue
-
-    is_macos(v"15") ||
-        error("Capturing GPU log output requires macOS 15 or higher.")
 
     if is_virtual(queue.device)
         # `MTLLogState` needs a residency set, which the paravirtualized GPU driver
@@ -521,25 +554,31 @@ function launch_logging!(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
         md === nothing || MTL.note_operation!(md, cmdbuf, kernel_operation(kernel, gs, ts))
     end
 
-    cce = MTLComputeCommandEncoder(cmdbuf)
-    try
-        MTL.set_function!(cce, kernel.pipeline)
-        if !kernel.use_residency_sets
-            # DROP-MACOS14: per-launch residency for macOS 14 / virtual GPUs.
-            MTL.use!(cce, buf, MTL.ReadWriteUsage)
-            MTL.use!(cce, exc, MTL.ReadWriteUsage)
+    Base.@lock submission_lock begin
+        cce = MTLComputeCommandEncoder(cmdbuf)
+        try
+            MTL.set_function!(cce, kernel.pipeline)
+            if !kernel.use_residency_sets
+                MTL.use!(cce, buf, MTL.ReadWriteUsage)
+                MTL.use!(cce, exc, MTL.ReadWriteUsage)
+            end
+            let reloc = kernel.reloc_table
+                reloc === nothing || MTL.use!(cce, reloc, MTL.ReadUsage)
+            end
+            encode_arguments!(cce, bq, kernel, kernel_state, kernel.source, args)
+            MTL.append_current_function!(cce, gs, ts)
+        catch err
+            err isa OwnershipConflict && return err.managed
+            rethrow()
+        finally
+            close(cce)
         end
-        let reloc = kernel.reloc_table
-            reloc === nothing || MTL.use!(cce, reloc, MTL.ReadUsage)
-        end
-        encode_arguments_nospec!(cce, kernel, kernel_state, kernel.f, args)
-        MTL.append_current_function!(cce, gs, ts)
-    finally
-        close(cce)
-    end
 
-    commit!(cmdbuf, queue)
-    defer_cleanup!(bq, cmdbuf, Any[kernel.f, args])
+        # the batch was flushed above, so commit directly instead of via the submission
+        # hook, which may wait for the GPU and must not be called with the lock held
+        MTL.commit_with_queue_key!(cmdbuf, pointer(queue))
+        defer_cleanup!(bq, cmdbuf, Any[kernel.source, args])
+    end
     track_logging_cmdbuf!(queue, cmdbuf)
     return
 end
@@ -566,8 +605,6 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
     (gs.depth * ts.depth) > typemax(UInt32) &&
         throw(ArgumentError("Total threads per grid in a dimension (threads.depth($(gs.depth)) * groups.depth($(ts.depth)) = $(gs.depth * ts.depth)) must not exceed $(typemax(UInt32))"))
 
-    f = kernel.f
-    pipeline = kernel.pipeline
     dev = kernel.device
     tgmem = kernel.tgmem
 
@@ -585,10 +622,28 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
 
     if kernel.loggingEnabled
         precompiling && return
-        launch_logging!(kernel, gs, ts, bq, args, kernel_state, buf, exc)
-        return
+        return launch_logging!(kernel, gs, ts, bq, args, kernel_state, buf, exc)
     end
 
+    conflict = Base.@lock submission_lock begin
+        encode_launch!(kernel, gs, ts, bq, args, kernel_state, buf, exc, precompiling,
+                       indirect)
+    end
+    conflict === nothing || return conflict
+    precompiling && return
+
+    submit ? flush!(bq) : maybe_autoflush!(bq)
+    return
+end
+
+# encode a kernel launch into the open batch of `bq`. returns the memory of an argument
+# that is still in use by another queue, if any, without encoding anything.
+function encode_launch!(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
+                        bq::BatchedCommandQueue, args::Tuple,
+                        kernel_state, buf, exc, precompiling::Bool, indirect=nothing)
+    source = kernel.source
+    pipeline = kernel.pipeline
+    reloc = kernel.reloc_table
     try
         cce = compute_encoder(bq)
         set_pipeline!(bq, cce, pipeline)
@@ -597,7 +652,6 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
         # allocator, exception mailbox) that aren't otherwise bound to the encoder. Declare
         # them so Metal Shader Validation tracks the accesses instead of dropping them.
         if !kernel.use_residency_sets
-            # DROP-MACOS14: per-launch residency for macOS 14 / virtual GPUs.
             MTL.use!(cce, buf, MTL.ReadWriteUsage)
             MTL.use!(cce, exc, MTL.ReadWriteUsage)
         end
@@ -605,7 +659,7 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
         # (which only holds the per-device scratch buffers): declare it every launch.
         reloc === nothing || MTL.use!(cce, reloc, MTL.ReadUsage)
 
-        encode_arguments_nospec!(cce, kernel, kernel_state, f, args)
+        encode_arguments!(cce, bq, kernel, kernel_state, source, args)
         # `indirect` is `(buffer, byte offset)` holding three `UInt32` threadgroup
         # counts the DEVICE wrote. `gs` is then a bound the caller supplied for its
         # own bookkeeping and the driver reads the real size at execution — which is
@@ -620,7 +674,7 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
             MTL.use!(cce, indirect[1], MTL.ReadUsage)
             MTL.dispatchThreadgroupsIndirect!(cce, indirect[1], indirect[2], ts)
         end
-    catch
+    catch err
         # The failing launch has not been recorded yet. Keep any earlier
         # operations in this batch, but close encoder state dirtied by the
         # failed encode and drop an otherwise empty command buffer.
@@ -629,57 +683,22 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
             cmdbuf = bq.cmdbuf
             cmdbuf === nothing || discard_open_cmdbuf!(bq, cmdbuf)
         end
+        err isa OwnershipConflict && return err.managed
         rethrow()
     end
 
     # The command buffer retains explicitly encoded buffers, but that doesn't keep other
     # resources alive for which we've encoded the GPU address ourselves.
     op = MTL.profile_metadata[] === nothing ? nothing : kernel_operation(kernel, gs, ts)
-    record_operation!(bq, f, args, op)
+    record_operation!(bq, source, args, op)
 
     if precompiling
         cmdbuf = bq.cmdbuf
         end_encoder!(bq)
         cmdbuf === nothing || discard_open_cmdbuf!(bq, cmdbuf)
-        return
     end
-
-    submit ? flush!(bq) : maybe_autoflush!(bq)
-    return
+    return nothing
 end
-
-# Force specialization on f, args AND the kernel.
-#
-# This only buys anything if the CALLER has them concretely: `launch` used to declare
-# `@nospecialize(args::Tuple)`, which made every call here a runtime dispatch, and a
-# runtime dispatch BOXES the isbits arguments it passes — `kernel_state` and the
-# varargs. Measured on this exact call: 0 bytes when the tuple's type is known against
-# 128 for one argument and 176 for four, per launch, which is what a still Hikari frame
-# was paying hundreds of times over. `launch` now takes `args::Tuple` unannotated; the
-# kernel stays `@nospecialize`d, which is where the compile-time saving actually is.
-#
-# A/B on one still Hikari frame, 250 warm samples then the best of 5 x 50:
-# `@nospecialize(args)` 5.2 ms and 549200 B per sample, without it 4.4 ms and 536224 B.
-# The specialization is not just cheaper to run, it is cheaper to launch.
-#
-# `launch` and `launch_with_queue` dropped `@nospecialize(kernel::HostKernel)` for the
-# same reason. A `@nospecialize`d struct is read through a dynamic `getfield`, so every
-# `kernel.maxthreads`, `kernel.tgmem` and `kernel.loggingEnabled` in `launch` BOXED its
-# `Int` or `Bool` — several per launch, and they are the sites a 400-launch profile
-# attributed to `launch` itself. `HostKernel{F,TT}` is one type per kernel and the
-# generated encoder already specializes per argument list, so this partitions nothing
-# further than what was already there.
-#
-# The KERNEL is specialized on too, for the same reason. `encode_arguments!` is
-# `@generated`, so it specializes on every argument type INCLUDING the kernel's;
-# reaching it with a `@nospecialize`d kernel made that call dynamic as well, and a
-# dynamic call boxes the isbits `KernelState` and the varargs it passes — measured
-# 176 bytes for a four-argument kernel, per launch, against 0 once the type is
-# known. Nothing is saved by hiding it: `HostKernel{F,TT}` is already one type per
-# kernel, and the generated encoder was going to specialize per argument list
-# anyway, which is the same partition.
-@inline encode_arguments_nospec!(cce, kernel, kernel_state, f, args::Tuple) =
-    encode_arguments!(cce, kernel, kernel_state, f, args)
 
 ## Intra-warp Helpers
 

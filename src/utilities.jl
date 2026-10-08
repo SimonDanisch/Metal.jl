@@ -29,11 +29,16 @@ function versioninfo(io::IO=stdout; verbose=false)
 
     println(io, "Julia packages:")
     println(io, "- Metal.jl: $(Base.pkgversion(Metal))")
-    for name in [:GPUArrays, :GPUCompiler, :KernelAbstractions, :KernelInterface, :ObjectiveC,
+    for name in [:GPUArrays, :GPUCompiler, :KernelInterface, :ObjectiveC,
                  :LLVM, :LLVMDowngrader_jll]
         mod = getfield(Metal, name)
         println(io, "- $(name): $(Base.pkgversion(mod))")
     end
+    # KernelAbstractions is an optional dependency
+    ka = get(Base.loaded_modules,
+             Base.PkgId(Base.UUID("63c18a36-062a-441e-b654-da1e3ab1ce7c"), "KernelAbstractions"),
+             nothing)
+    ka === nothing || println(io, "- KernelAbstractions: $(Base.pkgversion(ka))")
     println(io)
 
     env = filter(var->startswith(var, "JULIA_METAL") || startswith(var, "MTL") || startswith(var, "METAL"), keys(ENV))
@@ -54,8 +59,6 @@ function versioninfo(io::IO=stdout; verbose=false)
         "command_batching_bytes" => load_preference(Metal, "command_batching_bytes"),
         "command_batching_inflight" => load_preference(Metal, "command_batching_inflight"),
         "precompile" => load_preference(Metal, "precompile"),
-        "binary_archives" => load_preference(Metal, "binary_archives"),
-        "binary_archives_max_size" => load_preference(Metal, "binary_archives_max_size"),
         "target_macos" => load_preference(Metal, "target_macos"),
         "target_gpufamily" => load_preference(Metal, "target_gpufamily"),
     ]
@@ -68,18 +71,6 @@ function versioninfo(io::IO=stdout; verbose=false)
         end
         println(io)
     end
-
-    println(io, "Kernel cache:")
-    if binary_archives_enabled()
-        print(io, "- binary archives: enabled")
-        verbose && print(io, ", in $(binary_archive_dir())")
-        println(io, "\n  ($(archive_hits[]) hits, $(archive_misses[]) misses this session)")
-    else
-        print(io, "- binary archives: disabled")
-        shader_validation_enabled() && print(io, " (incompatible with shader validation)")
-        println(io)
-    end
-    println(io)
 
     devs = devices()
     if isempty(devs)

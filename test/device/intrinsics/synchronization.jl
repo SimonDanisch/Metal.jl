@@ -59,7 +59,8 @@
         end
 
         orders = [Metal.memory_order_relaxed, Metal.memory_order_seq_cst]
-        macos_version() >= v"27" && append!(orders, [Metal.memory_order_acquire, Metal.memory_order_release, Metal.memory_order_acq_rel])
+        # (before MSL 4.1, GPUCompiler makes these sequentially consistent)
+        Metal.metal_target() >= v"3.2" && append!(orders, [Metal.memory_order_acquire, Metal.memory_order_release, Metal.memory_order_acq_rel])
         for order in orders
             buf = Metal.zeros(Int32, 1)
             @metal fence_kernel(buf, Val(order),
@@ -74,25 +75,64 @@
                                         Metal.thread_scope_simdgroup)
             return
         end
+        # an LLVM fence, with the flags in its scope
         ir = sprint(io -> Metal.code_llvm(io, fence_abi,
                                             Tuple{Core.LLVMPtr{Int32,Metal.AS.Device}};
-                                            kernel=true, metal=v"3.2", dump_module=true))
-        @test occursin("@air.atomic.fence(i32, i32, i32)", ir)
-        @test occursin("i32 5, i32 5, i32 4", ir)
+                                            kernel=true, metal=v"3.2"))
+        @test occursin("fence syncscope(\"subgroup-mem-global+image\") seq_cst", ir)
+        ir = sprint(io -> Metal.code_air(io, fence_abi,
+                                           Tuple{Core.LLVMPtr{Int32,Metal.AS.Device}};
+                                           kernel=true, metal=v"3.2", air=v"2.7"))
+        @test occursin("@air.atomic.fence(i32 5, i32 5, i32 4)", ir)
+    end
 
-        function unavailable_fence(buf)
-            Metal.atomic_thread_fence(Metal.MemoryFlagDevice, Metal.memory_order_relaxed)
+    # Core.Intrinsics.atomic_fence emits LLVM fences, which crash the macOS 27 back-end
+    # unless GPUCompiler lowers them to air.atomic.fence (#968).
+    @testset "LLVM fence" begin
+        # message passing: thread 1 publishes data guarded by a flag, with release/acquire
+        # fences; every observer that sees the flag must see the data
+        # UnsafeAtomics emits a bare LLVM fence through Julia's `atomic_fence` intrinsic, or
+        # through `llvmcall` where inference deletes that intrinsic (Julia < 1.12, before
+        # JuliaLang/julia#57806)
+        @inline llvm_fence(::Val{order}) where {order} =
+            Metal.UnsafeAtomics.fence(getfield(Metal.UnsafeAtomics, order))
+        function fence_kernel(data, flag, observed)
+            i = thread_position_in_grid_1d()
+            @inbounds if i == 1
+                data[1] = Int32(42)
+                llvm_fence(Val(:release))
+                Metal.atomic_store_explicit(pointer(flag, 1), Int32(1))
+            else
+                f = Metal.atomic_load_explicit(pointer(flag, 1))
+                llvm_fence(Val(:acquire))
+                observed[i] = f == Int32(1) ? data[1] : Int32(-1)
+            end
             return
         end
-        err = try
-            @metal launch=false metal=v"3.1" unavailable_fence(Metal.zeros(Int32, 1))
-            nothing
-        catch err
-            err
+
+        data = Metal.zeros(Int32, 1)
+        flag = Metal.zeros(Int32, 1)
+        observed = Metal.zeros(Int32, 1024)
+        compiled = @metal launch=false fence_kernel(data, flag, observed)
+        threads = min(length(observed), compiled.maxthreads)
+        compiled(data, flag, observed; threads)
+        @test Array(data) == Int32[42]
+        @test Array(flag) == Int32[1]
+        @test all(x -> x == -1 || x == 42, Array(observed)[2:threads])
+
+        ir = sprint(io -> Metal.code_native(io, fence_kernel,
+                                            Tuple{MtlDeviceVector{Int32,1}, MtlDeviceVector{Int32,1}, MtlDeviceVector{Int32,1}};
+                                            kernel=true, dump_module=true))
+        metal = Metal.metal_target()
+        if metal >= v"3.2"
+            @test !occursin(r"^\s*fence "m, ir)
+            release, acquire = metal >= v"4.1" ? (3, 2) : (5, 5)
+            @test occursin("@air.atomic.fence(i32 3, i32 $release, i32 2)", ir)
+            @test occursin("@air.atomic.fence(i32 3, i32 $acquire, i32 2)", ir)
+        else
+            @test occursin("fence release", ir)
+            @test occursin("fence acquire", ir)
         end
-        @test err isa Metal.InvalidIRError
-        @test occursin("atomic_thread_fence requires Metal 3.2 or newer.",
-                        sprint(showerror, err))
     end
 
     # TODO: simdgroup barrier test

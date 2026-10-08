@@ -153,7 +153,7 @@ end
 function packeddata(arr::MtlArray, memdims)
     memdims == size(arr) && arr.offset == 0 && return MPSGraphTensorData(arr)
     desc = MPS.MPSNDArrayDescriptor(eltype(arr), collect(memdims))
-    return MPSGraphTensorData(MPS.MPSNDArray(arr.data[], UInt(arr.offset), desc))
+    return MPSGraphTensorData(MPS.MPSNDArray(Base.unsafe_convert(MTLBuffer, arr), UInt(arr.offset), desc))
 end
 
 # ── The op ───────────────────────────────────────────────────────────────────

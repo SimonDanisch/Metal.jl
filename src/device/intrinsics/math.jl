@@ -32,25 +32,6 @@ end
     @device_override Base.max(x::Float16, y::Float16) = ccall("llvm.maximum.f16", llvmcall, Float16, (Float16, Float16), x, y)
 end
 
-@device_override function Base.:(/)(a::Complex{Float32}, b::Complex{Float32})
-    are = real(a); aim = imag(a); bre = real(b); bim = imag(b)
-    if (isinf(bre) | isinf(bim))
-        if isfinite(a)
-            return complex(zero(Float32)*sign(are)*sign(bre), -zero(Float32)*sign(aim)*sign(bim))
-        end
-        return NaN32+NaN32*im
-    end
-    if abs(bre) <= abs(bim)
-        r = bre / bim
-        den = bim + r*bre
-        Complex((are*r + aim)/den, (aim*r - are)/den)
-    else
-        r = bim / bre
-        den = bre + r*bim
-        Complex((are + aim*r)/den, (aim - are*r)/den)
-    end
-end
-
 @device_override FastMath.acos_fast(x::Float32) = ccall("extern air.fast_acos.f32", llvmcall, Cfloat, (Cfloat,), x)
 @device_override Base.acos(x::Float32) = ccall("extern air.acos.f32", llvmcall, Cfloat, (Cfloat,), x)
 @device_override Base.acos(x::Float16) = ccall("extern air.acos.f16", llvmcall, Float16, (Float16,), x)
@@ -83,7 +64,7 @@ end
 
 @device_override FastMath.cos_fast(x::Float32) = ccall("extern air.fast_cos.f32", llvmcall, Cfloat, (Cfloat,), x)
 @device_override Base.cos(x::Float32) = ccall("extern air.cos.f32", llvmcall, Cfloat, (Cfloat,), x)
-@device_override Base.cos(x::Float16) = ccall("extern air.cos.f16", llvmcall, Float16, (Float16,), x)
+# no Float16 cos, see `sin` below
 
 @device_override FastMath.cosh_fast(x::Float32) = ccall("extern air.fast_cosh.f32", llvmcall, Cfloat, (Cfloat,), x)
 @device_override Base.cosh(x::Float32) = ccall("extern air.cosh.f32", llvmcall, Cfloat, (Cfloat,), x)
@@ -234,18 +215,7 @@ end
 @device_override Base.:(^)(x::Float32, y::Float32) = ccall("extern air.pow.f32", llvmcall, Cfloat, (Cfloat, Cfloat), x, y)
 @device_override Base.:(^)(x::Float16, y::Float16) = ccall("extern air.pow.f16", llvmcall, Float16, (Float16, Float16), x, y)
 
-@device_override @inline Base._cpow(z::ComplexF32, p::Float32) = exp(p * log(z))
-@device_override @inline Base._cpow(z::ComplexF32, p::ComplexF32) = exp(p * log(z))
-
-# Avoid use of Float64 in `pow`
-@device_override @inline function Base.:(^)(x::Float32, y::Integer)
-    y == -1 && return inv(x)
-    y == 0 && return one(x)
-    y == 1 && return x
-    y == 2 && return x * x
-    y == 3 && return x * x * x
-    x^Float32(y)
-end
+# Base computes the power by squaring in Float32; use the native power instead.
 @device_override @inline function Base.:(^)(x::Float16, y::Integer)
     y == -1 && return inv(x)
     y == 0 && return one(x)
@@ -271,7 +241,8 @@ end
 
 @device_override FastMath.sin_fast(x::Float32) = ccall("extern air.fast_sin.f32", llvmcall, Cfloat, (Cfloat,), x)
 @device_override Base.sin(x::Float32) = ccall("extern air.sin.f32", llvmcall, Cfloat, (Cfloat,), x)
-@device_override Base.sin(x::Float16) = ccall("extern air.sin.f16", llvmcall, Float16, (Float16,), x)
+# no Float16 sin/cos/sincos: Base computes them in Float32. On M1, `air.{sin,cos}.f16` are
+# approximations that are off by up to thousands of ulp (JuliaGPU/Metal.jl#985).
 
 @device_override function FastMath.sincos_fast(x::Float32)
     c = Ref{Cfloat}()
@@ -281,11 +252,6 @@ end
 @device_override function Base.sincos(x::Float32)
     c = Ref{Cfloat}()
     s = @typed_ccall("air.sincos.f32", llvmcall, Cfloat, (Cfloat, Ptr{Cfloat}), x, c)
-    (s, c[])
-end
-@device_override function Base.sincos(x::Float16)
-    c = Ref{Float16}()
-    s = @typed_ccall("air.sincos.f16", llvmcall, Float16, (Float16, Ptr{Float16}), x, c)
     (s, c[])
 end
 
@@ -320,31 +286,7 @@ end
     ccall("extern air.nextafter.f16", llvmcall, Float16, (Float16, Float16), x, y)
 end
 
-# hypot without use of double
-#
-# taken from Cosmopolitan Libc
-# Copyright 2021 Justine Alexandra Roberts Tunney
-@inline function _hypot(a::T, b::T) where T <: AbstractFloat
-    if isinf(a) || isinf(b)
-        return T(Inf)
-    end
-    a = abs(a)
-    b = abs(b)
-    if a < b
-        b, a = a, b
-    end
-    if iszero(a)
-        return b
-    end
-    r = b / a
-    return a * sqrt(one(T) + r * r)
-end
-@device_override Base.hypot(x::Float32, y::Float32) = _hypot(x, y)
-@device_override Base.hypot(x::Float16, y::Float16) = _hypot(x, y)
-@device_override Base.hypot(x::BFloat16, y::BFloat16) = BFloat16(_hypot(Float32(x), Float32(y)))
-# hypot of complex values is real: sqrt(abs2(x) + abs2(y)), i.e. hypot of the magnitudes
-@device_override Base.hypot(x::ComplexF32, y::ComplexF32) = _hypot(abs(x), abs(y))
-@device_override Base.hypot(x::ComplexF16, y::ComplexF16) = _hypot(abs(x), abs(y))
+@device_override Base.hypot(x::BFloat16, y::BFloat16) = BFloat16(hypot(Float32(x), Float32(y)))
 @device_override Base.hypot(x::Complex{BFloat16}, y::Complex{BFloat16}) = BFloat16(hypot(ComplexF32(x), ComplexF32(y)))
 
 ### Integer Intrinsics
