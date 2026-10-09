@@ -198,14 +198,7 @@ const DefaultStorageMode = let str = @load_preference("default_storage", "shared
 end
 
 @public allowscalar
-function allowscalar(allow::Bool)
-    if !allow && DefaultStorageMode == SharedStorage
-        @warn """Metal.jl uses unified memory by default, so scalar indexing will still be allowed on arrays that use it.
-                 To ensure operations run on the GPU, set `default_storage` to "private" in your LocalPreferences.toml,
-                 or use `Metal.PrivateStorage` when creating your `MtlArray`s.""" maxlog=1
-    end
-    GPUArrays.allowscalar(allow)
-end
+allowscalar(allow::Bool) = GPUArrays.allowscalar(allow)
 
 MtlArray{T,N}(::UndefInitializer, dims::Dims{N}) where {T,N} =
     MtlArray{T,N,DefaultStorageMode}(undef, dims)
@@ -276,11 +269,13 @@ end
 
 ## indexing
 
-# arrays in shared memory can be accessed directly by the CPU. this is meant to be fast, as
-# it is used to iterate arrays on the CPU, so bypass the checks for scalar iteration and
-# only synchronize when the GPU may still be using the array.
+# arrays in shared memory can be accessed directly by the CPU, and only synchronize when the
+# GPU may still be using the array. Scalar indexing follows GPUArrays' rule all the same:
+# refused unless `@allowscalar`, as it is for every other device array. Allowing it here
+# alone meant code that indexed a device array worked on a Mac and failed everywhere else.
 @inline function Base.getindex(x::MtlArray{T,N,SharedStorage}, I::Int) where {T,N}
     @boundscheck checkbounds(x, I)
+    GPUArrays.assertscalar("getindex")
     managed = x.data[]
     maybe_synchronize(managed)
     unsafe_load(convert(Ptr{T}, managed.host_ptr + x.offset), I)
@@ -288,6 +283,7 @@ end
 
 @inline function Base.setindex!(x::MtlArray{T,N,SharedStorage}, v, I::Int) where {T,N}
     @boundscheck checkbounds(x, I)
+    GPUArrays.assertscalar("setindex!")
     managed = x.data[]
     maybe_synchronize(managed)
     unsafe_store!(convert(Ptr{T}, managed.host_ptr + x.offset), v, I)
