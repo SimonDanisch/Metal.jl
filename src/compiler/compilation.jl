@@ -403,11 +403,43 @@ function GPUCompiler.metal_global_constant_addrspace(
                   job, gv)
 end
 
+"""
+    zero_undef_phis!(mod)
+
+Give every `phi`'s `undef` incoming value a zero of its type.
+
+Apple's compiler gets one of these wrong across a threadgroup barrier.
+KernelAbstractions puts the code on each side of `@synchronize` under its own bounds
+check, so an index computed before the barrier reaches the code after it as
+`phi [%i, %inbounds], [undef, %outofbounds]`. A device store through that index then
+wrote only the first element: `out[lid] = sh[lid]` after a barrier, over one
+threadgroup of 128, left 127 elements unwritten. The same kernel without the barrier
+was right, and so was one indexing `out` by a value computed after it, and the IR
+handed to the Metal compiler was correct in every case.
+
+`undef` may be any value, so zero is one it already allowed, and the compiler never
+sees the shape it gets wrong.
+"""
+function zero_undef_phis!(mod::LLVM.Module)
+    for f in functions(mod), bb in blocks(f), inst in instructions(bb)
+        # a block's phis come first
+        inst isa LLVM.PHIInst || break
+        ops = operands(inst)
+        for k in 1:length(ops)
+            ops[k] isa LLVM.UndefValue && (ops[k] = null(value_type(inst)))
+        end
+    end
+    return mod
+end
+
 function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
                                     mod::LLVM.Module, entry::LLVM.Function)
     entry = invoke(GPUCompiler.finish_ir!,
                    Tuple{CompilerJob{MetalCompilerTarget}, LLVM.Module, LLVM.Function},
                    job, mod, entry)
+    # After optimization, which is where these phis come from, and before anything
+    # below rewrites the entry.
+    zero_undef_phis!(mod)
 
     # A vertex or fragment program is a kernel up to this point and a stage from
     # here on: the call above is what applied the address-space rewrites and

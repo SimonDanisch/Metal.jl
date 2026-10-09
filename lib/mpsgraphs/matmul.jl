@@ -117,7 +117,9 @@ function CachedMatmulGraph(key::MatmulGraphKey{Tab, Tc}) where {Tab, Tc}
 
     castC = castTensor(graph, afteralpha, Tc, "castC")
 
-    afterbeta = let
+    # `beta == 0` means C is not read, as in BLAS: `0 * C` would keep a NaN or an Inf
+    # that C held before. The key carries `beta`, so this graph is only ever run with it.
+    afterbeta = iszero(key.beta) ? castC : let
         betatensor = if Tc <: Real
             constantWithScalar(graph, key.beta, Tc)
         else
