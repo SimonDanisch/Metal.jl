@@ -577,6 +577,17 @@ function GPUArrays.derive(::Type{T}, a::MtlArray{<:Any,<:Any,S}, dims::Dims{N}, 
     MtlArray{T,N,S}(a.data, dims; a.maxsize, offset)
 end
 
+# Two arrays share bytes only if they share the buffer AND their byte ranges meet.
+# `dataids` names the buffer alone, and views, reshapes and reinterprets of one
+# buffer are derived arrays of it, so on its own it reported two disjoint parts of a
+# buffer as aliasing: `accumulate!` from one part into another was refused, and
+# `Base.unalias` copied ahead of broadcasts that needed no copy.
+function Base.mightalias(a::MtlArray, b::MtlArray)
+    a.data.rc === b.data.rc || return false
+    return a.offset < b.offset + sizeof(eltype(b)) * length(b) &&
+           b.offset < a.offset + sizeof(eltype(a)) * length(a)
+end
+
 
 ## views
 
