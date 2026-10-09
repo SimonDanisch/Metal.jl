@@ -32,7 +32,14 @@ function MTLBuffer(dev::Union{MTLDevice,MTLHeap}, bytesize::Integer;
                    cache_mode=DefaultCPUCache)
     opts = convert(MTLResourceOptions, storage) | hazard_tracking | cache_mode
 
-    @assert 0 < bytesize <= max_buffer_length(dev)
+    # Errors a caller can act on, not an assertion: a request larger than one buffer
+    # can be is out of device memory as far as the caller is concerned. Not an
+    # `OutOfMemoryError`, which `alloc_buffer_with_retry` answers with a full
+    # collection and a device drain that cannot make one buffer larger.
+    bytesize > 0 || throw(ArgumentError("a Metal buffer holds at least one byte; asked for $bytesize"))
+    bytesize <= max_buffer_length(dev) ||
+        throw(ArgumentError("out of device memory: $bytesize bytes is more than the " *
+                            "$(max_buffer_length(dev)) one buffer on this device can hold"))
     ptr = alloc_buffer(dev, bytesize, opts)
     # Metal signals allocation failure by returning nil
     iszero(UInt(ptr)) && throw(OutOfMemoryError())
