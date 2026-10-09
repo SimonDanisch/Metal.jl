@@ -101,8 +101,10 @@ function __init__()
             @error "Failed to close open batched command queues at exit" exception=(err, catch_backtrace())
         end
     end
+    # the exit finalizer pass can release a residency set before the arrays in it
+    atexit(forget_residency_sets!)
 
-    initialization_world[] = Base.get_world_counter()
+    initialization_world[]= Base.get_world_counter()
 end
 
 function synchronize_metal_tasks(ex)

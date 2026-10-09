@@ -331,6 +331,29 @@ function trim_residency!()
     Base.@lock queue_residency_sets_lock flush_pending_drops_locked!()
 end
 
+"""
+    forget_residency_sets!()
+
+Drop every residency set from the bookkeeping, so that no later `free` visits one.
+Registered with `atexit`.
+
+Julia's exit runs EVERY remaining finalizer, of objects still referenced too, in no
+defined order. The set's own wrapper releases it in that pass and so does each queue
+it is attached to, so a set can be deallocated before the array finalizers that would
+take their buffers out of it: `removeAllocation:` on a freed object, a segfault at
+exit. `atexit` hooks run before that pass, and a process that is ending has no
+memory to give back, so the frees find no set at all.
+"""
+function forget_residency_sets!()
+    Base.@lock queue_residency_sets_lock begin
+        empty!(queue_residency_sets)
+        empty!(residency_attached_queues)
+        empty!(residency_members)
+    end
+    Base.@lock pending_residency_lock empty!(pending_residency_drops)
+    return
+end
+
 command_queue_key(queue::MTLCommandQueue) = UInt(pointer(queue))
 
 function install_queue_residency!(queue::MTLCommandQueue, dev::MTLDevice)
