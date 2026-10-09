@@ -9,6 +9,9 @@ using Test, Metal
 
 const CVG = Metal.MPSGraphs
 
+"""A zero device operand, for the tests that only ask which shapes are admitted."""
+mk(T, d...) = MtlArray(zeros(T, d...))
+
 """The convolution in Float64, in the same layout, from the definition."""
 function cv_ref(x, w, b, stride, pad, dil, groups)
     W, H, Cin, N = size(x); KW, KH, Cing, Cout = size(w)
@@ -96,7 +99,6 @@ end
     end
 
     @testset "which operands it admits" begin
-        mk(T, d...) = MtlArray(zeros(T, d...))
         @test CVG.conv2d_shape_supported(mk(Float16, 8, 8, 4, 1), mk(Float16, 8, 8, 4, 1),
                                          mk(Float16, 3, 3, 4, 4), nothing)
         # A destination wider than the operands, for the reason the product refuses
