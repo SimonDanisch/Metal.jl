@@ -548,7 +548,7 @@ end
         end
         take!(used)
         @test Array(a) == ones(Float32, n)
-        S === Metal.SharedStorage && @test a[1] == 1f0
+        S === Metal.SharedStorage && @test Metal.@allowscalar a[1] == 1f0
         put!(release, nothing)
         wait(t)
     end

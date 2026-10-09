@@ -216,13 +216,19 @@ check_storagemode(arr, smode) = Metal.storagemode(arr) == smode
             @test Base.unsafe_convert(Ptr{Float16}, arr_mtl) isa Ptr{Float16}
         end
 
+        # Shared storage is host-visible, but an element read or write from the host
+        # follows GPUArrays' rule like every other `MtlArray`: refused unless the
+        # caller says `@allowscalar`, so code that indexes on a Mac does not break
+        # where the same array is device-local.
         let b = rand(Float32, 10)
             arr_mtl = mtl(b; storage=Metal.SharedStorage)
-            @test arr_mtl[1] == b[1]
+            @test_throws ErrorException arr_mtl[1]
+            @test Metal.@allowscalar arr_mtl[1] == b[1]
 
             # test setting values with shared storage
-            arr_mtl[2] = 3
-            @test arr_mtl[2] == 3
+            @test_throws ErrorException arr_mtl[2] = 3
+            Metal.@allowscalar arr_mtl[2] = 3
+            @test Metal.@allowscalar arr_mtl[2] == 3
         end
     end
 end
