@@ -125,11 +125,41 @@ end_command_buffer!(cb::MTL4CommandBuffer) =
 compute_encoder(cb::MTL4CommandBuffer) =
     @objc [cb::id{MTL4CommandBuffer} computeCommandEncoder]::MTL4ComputeCommandEncoder
 
+@objcwrapper managed = false MTL4ComputeCommandEncoderRef <: MTL4ComputeCommandEncoder
+
+@doc """
+    MTL4ComputeCommandEncoderRef(cb::MTL4CommandBuffer)
+
+A NEW compute encoder on `cb`, as an unmanaged wrapper whose one reference belongs to
+the caller; `close` ends it and gives the reference back.
+
+What a submission path opens once per submission, for the reason
+[`MTLCommandBufferRef`](@ref) gives: the managed wrapper `compute_encoder` returns is a
+heap object per call, and it was made outside any autorelease pool, so the encoder's
+autoreleased reference was never given back either.
+""" MTL4ComputeCommandEncoderRef
+
+MTL4ComputeCommandEncoderRef(cb::MTL4CommandBuffer) =
+    retain_autoreleased(MTL4ComputeCommandEncoderRef) do
+        @objc [cb::id{MTL4CommandBuffer} computeCommandEncoder]::id{MTL4ComputeCommandEncoderRef}
+    end
+
 # The legacy method in `command_enc.jl` takes an `MTLCommandEncoderLike`; an MTL4
 # encoder is a separate protocol, so it needs its own. Same name, because closing
 # an encoder is one concept.
 endEncoding!(enc::MTL4CommandEncoderLike) =
     @objc [enc::id{MTL4CommandEncoder} endEncoding]::Nothing
+
+# End the encoder and give back the reference the wrapper holds, as `close` does for a
+# legacy encoder: the managed wrapper's own, or the one an `...Ref` constructor handed out.
+function Base.close(enc::MTL4CommandEncoderLike)
+    try
+        endEncoding!(enc)
+    finally
+        release(enc)
+    end
+    return nothing
+end
 
 """
 Make a residency set's allocations resident for this command buffer.
@@ -219,6 +249,22 @@ function commit!(q::MTL4CommandQueue, cbs::Vector{MTL4CommandBuffer}, fb::MTL4Fe
 end
 
 """
+    commit!(queue, cbs::Vector{id{MTL4CommandBuffer}}, fb)
+
+The same, over an ALREADY-MARSHALLED array of command buffer pointers. The method above
+converts its `Vector{MTL4CommandBuffer}` through `Base.cconvert`, which builds a fresh
+pointer array and the `idArray` holding it on every call, so a caller that keeps its
+array to submit without allocating still allocated here. The caller keeps the command
+buffers alive; these are bare pointers.
+"""
+function commit!(q::MTL4CommandQueue, cbs::Vector{id{MTL4CommandBuffer}}, fb::MTL4Feedback)
+    isempty(cbs) && return
+    @objc [q::id{MTL4CommandQueue} commit:cbs::Ptr{id{MTL4CommandBuffer}}
+                                   count:length(cbs)::Csize_t
+                                   options:fb.options::id{MTL4CommitOptions}]::Nothing
+end
+
+"""
     signal_event!(queue, event, value)
 
 Signal `event` to `value` once everything committed so far has completed.
@@ -228,12 +274,12 @@ completion handler on a command buffer. `event.signaledValue >= v` is then a
 non-blocking "has the GPU got this far", and
 `MTL.waitUntilSignaledValue(event, v)` is the blocking form.
 """
-signal_event!(q::MTL4CommandQueue, ev::MTLSharedEvent, value::Integer) =
-    @objc [q::id{MTL4CommandQueue} signalEvent:ev::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
+signal_event!(q::MTL4CommandQueue, ev::MTLEventLike, value::Integer) =
+    @objc [q::id{MTL4CommandQueue} signalEvent:eventid(ev)::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
 
 """Make everything committed after this wait for `event` to reach `value`."""
-wait_for_event!(q::MTL4CommandQueue, ev::MTLSharedEvent, value::Integer) =
-    @objc [q::id{MTL4CommandQueue} waitForEvent:ev::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
+wait_for_event!(q::MTL4CommandQueue, ev::MTLEventLike, value::Integer) =
+    @objc [q::id{MTL4CommandQueue} waitForEvent:eventid(ev)::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
 
 # ── Arguments, which are addresses ───────────────────────────────────────────
 
@@ -278,10 +324,10 @@ set_address!(table::MTL4ArgumentTable, address::Integer, index::Integer) =
     @objc [table::id{MTL4ArgumentTable} setAddress:UInt64(address)::UInt64
                                         atIndex:Csize_t(index - 1)::Csize_t]::Nothing
 
-set_argument_table!(enc::MTL4ComputeCommandEncoder, table::MTL4ArgumentTable) =
+set_argument_table!(enc::MTL4ComputeCommandEncoderLike, table::MTL4ArgumentTable) =
     @objc [enc::id{MTL4ComputeCommandEncoder} setArgumentTable:table::id{MTL4ArgumentTable}]::Nothing
 
-set_function!(enc::MTL4ComputeCommandEncoder, pipeline::MTLComputePipelineState) =
+set_function!(enc::MTL4ComputeCommandEncoderLike, pipeline::MTLComputePipelineState) =
     @objc [enc::id{MTL4ComputeCommandEncoder} setComputePipelineState:pipeline::id{MTLComputePipelineState}]::Nothing
 
 """
@@ -295,14 +341,14 @@ This is how a gate survives without an indirect command buffer. A recorded plan'
 directly it is a zero-COUNT grid instead, written by the same one-thread kernel,
 and the host still never learns whether the iteration ran.
 """
-function dispatch_threadgroups_indirect!(enc::MTL4ComputeCommandEncoder, buf::MTLBuffer,
+function dispatch_threadgroups_indirect!(enc::MTL4ComputeCommandEncoderLike, buf::MTLBuffer,
                                          offset::Integer, threads::MTLSize)
     a = MTLGPUAddress(UInt64(buf.gpuAddress) + UInt64(offset))
     @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroupsWithIndirectBuffer:a::MTLGPUAddress
                                               threadsPerThreadgroup:threads::MTLSize]::Nothing
 end
 
-dispatch_threadgroups!(enc::MTL4ComputeCommandEncoder, groups::MTLSize, threads::MTLSize) =
+dispatch_threadgroups!(enc::MTL4ComputeCommandEncoderLike, groups::MTLSize, threads::MTLSize) =
     @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroups:groups::MTLSize
                                               threadsPerThreadgroup:threads::MTLSize]::Nothing
 
@@ -337,7 +383,7 @@ barrier!(enc::MTL4CommandEncoderLike; after::MTLStages = MTLStageDispatch,
 # legacy one, and the commands inside it are unchanged.
 
 """Replay a ONE-BASED range of an indirect command buffer's commands."""
-function execute_commands!(enc::MTL4ComputeCommandEncoder, icb::MTLIndirectCommandBuffer,
+function execute_commands!(enc::MTL4ComputeCommandEncoderLike, icb::MTLIndirectCommandBuffer,
                            range::UnitRange{<:Integer})
     r = NSRange(first(range) - 1, length(range))
     @objc [enc::id{MTL4ComputeCommandEncoder} executeCommandsInBuffer:icb::id{MTLIndirectCommandBuffer}
@@ -364,7 +410,7 @@ log. `research/mtl4_icb_stall.jl` reproduces it and rules the causes out one kno
 at a time; `dispatch_threadgroups_indirect!` is what a device-decided grid has to
 go through instead.
 """
-function execute_commands_indirect!(enc::MTL4ComputeCommandEncoder,
+function execute_commands_indirect!(enc::MTL4ComputeCommandEncoderLike,
                                     icb::MTLIndirectCommandBuffer,
                                     rangebuf::MTLBuffer, offset::Integer)
     a = MTLGPUAddress(UInt64(rangebuf.gpuAddress) + UInt64(offset))
