@@ -110,8 +110,11 @@ end
         ret!(builder)
     end
 
-    # call it with the arguments
-    call!(builder, llvm_ft, llvm_f, collect(argspec))
+    # call it with the arguments. `LLVM.Value[...]`, not `collect`: with no arguments
+    # `collect(())` is a `Vector{Union{}}`, which every `cconvert` method on a vector
+    # matches, so a format with nothing to substitute failed to compile once another
+    # package's methods were loaded beside LLVM's.
+    call!(builder, llvm_ft, llvm_f, LLVM.Value[argspec...])
     nothing
 end
 
