@@ -464,7 +464,11 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         # produces goes through the object it was handed, so there is no return
         # value to build and `retag_stage!` retags that object's argument
         # metadata instead.
-        stage === :mesh || (entry = stage_return!(job, mod, entry))
+        #
+        # Asked before it runs, because it consumes the global `set_point_size!`
+        # stored into; `retag_stage!` then tags the field it appended.
+        pointsize = stage === :vertex && writes_point_size(mod)
+        stage === :mesh || (entry = stage_return!(job, mod, entry; pointsize))
         entry = stage_inputs!(job, mod, entry, markers)
         # Textures last of the signature rewrites: the placeholders a shader body
         # emits for "the texture at binding N" are replaced with the entry's own
@@ -476,7 +480,7 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         # `retag_stage!`, because the metadata it writes describes the signature
         # and would otherwise say `float` over a `ptr addrspace(1)`.
         isvisiblestage(stage) && (entry = stage_values!(job, mod, entry))
-        retag_stage!(job, mod, entry, stage, T_out, markers)
+        retag_stage!(job, mod, entry, stage, T_out, markers; pointsize)
         # A stage has no kernel state, so the throw sites GPUCompiler lowered
         # cannot signal through one. Before the cleanup, so the emptied function
         # is inlined away.

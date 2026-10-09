@@ -290,15 +290,30 @@ function stage_output_type(@nospecialize(job::CompilerJob))
           "struct, got $P")
 end
 
+"""The global `set_point_size!` stores into; `stage_return!` makes it an output field."""
+const POINT_SIZE_GLOBAL = "__air_stage_point_size"
+
+"""Whether the stage in `mod` calls `set_point_size!`."""
+writes_point_size(mod::LLVM.Module) =
+    haskey(mod.globals, POINT_SIZE_GLOBAL) && !isempty(mod.globals[POINT_SIZE_GLOBAL].uses)
+
 """
-    stage_return!(job, mod, f) -> LLVM.Function
+    stage_return!(job, mod, f; pointsize = false) -> LLVM.Function
 
 Turn `f(args..., out::Ptr{T})` into `f(args...) -> T`.
+
+With `pointsize`, the returned struct has one more field after `T`'s: a `float`
+holding what `set_point_size!` stored, `[[point_size]]` once `retag_stage!` tags it.
+The global it stored into becomes a stack slot, initialised to 1, and every exit
+returns the slot's value in that field. Last rather than second, where SpriteKit's
+`PointSprite_VertexFunc` puts it: the output list is matched to the fields by
+position, so either is the same declaration.
 
 Returns the new entry. `f` is erased and the new function takes its name, so
 callers must re-look-up the entry afterwards.
 """
-function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function)
+function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function;
+                       pointsize::Bool = false)
     ft = f.function_type
     params = collect(ft.parameters)
     isempty(params) &&
@@ -320,7 +335,7 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
     # builds a pipeline, dispatches and completes -- and the caller reads zeros,
     # because a packed one-field struct is a different ABI and nothing checks it.
     T_out = isvisiblestage(job.config.params.stage) ?
-            air_field_type(fieldtype(T_jl, 1)) : air_output_struct(T_jl)
+            air_field_type(fieldtype(T_jl, 1)) : air_output_struct(T_jl; pointsize)
 
     new_ft = LLVM.FunctionType(T_out, params[1:(end - 1)])
     new_f = LLVM.Function(mod, "", new_ft)
@@ -330,9 +345,14 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
     end
 
     slot = nothing
+    psslot = nothing
     @dispose builder = IRBuilder() begin
         entry = BasicBlock(new_f, "conversion")
         position!(builder, LLVM.at_end(entry))
+        if pointsize
+            psslot = alloca!(builder, LLVM.FloatType(), "point_size")
+            store!(builder, LLVM.ConstantFP(1f0), psslot)
+        end
 
         # The body keeps writing to a pointer; it just points at a stack slot now.
         # Cast into the address space the old parameter had, so nothing in the
@@ -366,10 +386,14 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
         @dispose builder = IRBuilder() begin
             position!(builder, LLVM.before(inst))
             jl = load!(builder, convert(LLVMType, T_jl), slot)
-            ret!(builder, T_out isa LLVM.StructType ?
-                          to_air_output(builder, jl, T_jl, T_out) :
-                          to_air_field(builder, extract_value!(builder, jl, 0),
-                                       fieldtype(T_jl, 1)))
+            out = T_out isa LLVM.StructType ?
+                  to_air_output(builder, jl, T_jl, T_out) :
+                  to_air_field(builder, extract_value!(builder, jl, 0), fieldtype(T_jl, 1))
+            if pointsize
+                ps = load!(builder, LLVM.FloatType(), psslot)
+                out = insert_value!(builder, out, ps, fieldcount(T_jl))
+            end
+            ret!(builder, out)
         end
         erase!(inst)
     end
@@ -380,6 +404,19 @@ function stage_return!(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLV
     replace_metadata_uses!(f, new_f)
     erase!(f)
     new_f.name = fn
+    if pointsize
+        # Only the clone is left using the global now. Stages are inlined into
+        # their entry, so a store anywhere else is a body this pass never saw.
+        gv = mod.globals[POINT_SIZE_GLOBAL]
+        for use in collect(gv.uses)
+            u = use.user
+            (u isa LLVM.StoreInst && LLVM.parent(LLVM.parent(u)) == new_f) ||
+                error("@$POINT_SIZE_GLOBAL is used by a $(typeof(u)) outside the " *
+                      "entry; only a store inlined into it is expected")
+            LLVM.operands(u)[2] = psslot
+        end
+        erase!(gv)
+    end
     return new_f
 end
 
@@ -546,7 +583,7 @@ are varyings tagged with the `generated(...)` linkage string; for a fragment
 every field is a render target. Field ORDER is the contract — the metadata list
 and the struct's fields are matched positionally, not by name.
 """
-function stage_outputs(stage::Symbol, @nospecialize(T::Type))
+function stage_outputs(stage::Symbol, @nospecialize(T::Type); pointsize::Bool = false)
     # A mesh stage returns nothing at all: everything it produces goes through
     # the object it was handed, so its `air.mesh` node carries an EMPTY output
     # list. That is the structural difference from the two stages below, and it
@@ -602,6 +639,13 @@ function stage_outputs(stage::Symbol, @nospecialize(T::Type))
         push!(md, MDString(String(name)))
         push!(out, MDNode(md))
     end
+    # The field `stage_return!` appended, spelled as SpriteKit's
+    # `PointSprite_VertexFunc` spells it.
+    pointsize && push!(out, MDNode(Metadata[MDString("air.point_size"),
+                                            MDString("air.arg_type_name"),
+                                            MDString("float"),
+                                            MDString("air.arg_name"),
+                                            MDString("point_size")]))
     return out
 end
 
@@ -635,7 +679,8 @@ Move `entry` from `air.kernel` to the stage's own named metadata, with outputs.
 """
 function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                       entry::LLVM.Function, stage::Symbol, @nospecialize(T_out::Type),
-                      markers::Vector{Union{Nothing,Type}} = Union{Nothing,Type}[])
+                      markers::Vector{Union{Nothing,Type}} = Union{Nothing,Type}[];
+                      pointsize::Bool = false)
     md = mod.metadata
     haskey(md, "air.kernel") ||
         error("no air.kernel metadata to convert — did GPUCompiler's finish_ir! run?")
@@ -754,7 +799,7 @@ function retag_stage!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
     end
 
     node = MDNode(Metadata[Metadata(entry),
-                           MDNode(stage_outputs(stage, T_out)),
+                           MDNode(stage_outputs(stage, T_out; pointsize)),
                            MDNode(arg_infos)])
     push!(get!(md, stage_metadata_key(stage)).operands, node)
 
@@ -781,11 +826,12 @@ spells the same thing `<4 x float>`, and the reference metallib's entries return
 `<{ <4 x float>, <2 x float>, … }>`. The two are distinct LLVM types and the
 loader only accepts the second.
 """
-function air_output_struct(@nospecialize(T::Type))
+function air_output_struct(@nospecialize(T::Type); pointsize::Bool = false)
     fields = LLVMType[]
     for i in 1:fieldcount(T)
         push!(fields, air_field_type(fieldtype(T, i)))
     end
+    pointsize && push!(fields, LLVM.FloatType())
     # A single output is still WRAPPED here, though every shipped single-target
     # fragment returns the vector bare — `TextureCopy` returns `<4 x float>`, and
     # the packed struct appears only with several fields. The one-field struct is

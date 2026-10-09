@@ -18,7 +18,7 @@
 # which convention a builtin follows will eventually get it wrong.
 
 export vertex_index, instance_index, frag_coord, frag_coord_x, frag_coord_y,
-       frag_coord_z, frag_coord_w, frag_coord_xy, dfdx, dfdy,
+       frag_coord_z, frag_coord_w, frag_coord_xy, set_point_size!, dfdx, dfdy,
        candidate_prim_raw, candidate_ox, candidate_oy, candidate_oz,
        candidate_dx, candidate_dy, candidate_dz
 
@@ -74,6 +74,28 @@ end
 @inline frag_coord_z() = frag_coord(3)
 @inline frag_coord_w() = frag_coord(4)
 @inline frag_coord_xy() = (frag_coord(1), frag_coord(2))
+
+"""
+    set_point_size!(s::Float32)
+
+The size in pixels of the point this vertex is drawn as: `[[point_size]]` in MSL.
+
+An OUTPUT, so the other way round from the builtins above: a store to an external
+global, which `stage_return!` turns into a trailing `float` field of what the
+vertex stage returns, tagged `air.point_size`. A vertex stage that never calls this
+returns no such field.
+"""
+@inline function set_point_size!(s::Float32)
+    Base.llvmcall(("""
+        @__air_stage_point_size = external global float
+        define void @entry(float %s) #0 {
+            store float %s, ptr @__air_stage_point_size, align 4
+            ret void
+        }
+        attributes #0 = { alwaysinline }
+    """, "entry"), Cvoid, Tuple{Float32}, s)
+    return nothing
+end
 
 # ── Screen-space derivatives ─────────────────────────────────────────────────
 #
