@@ -9,9 +9,9 @@ const use_nonblocking_synchronization =
 is_completed(cmdbuf::MTL.MTLCommandBufferLike) =
     cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
 
-# blocking wait, performed on a worker thread by `cooperative_wait`. `@objc` calls are
-# GC-safe, but the worker has no autorelease pool of its own, so set one up. it cannot be an
-# `@autoreleasepool`, whose global lock may be held by the waiting task.
+# blocking wait, performed on a waiter's thread. `@objc` calls are GC-safe, but the thread
+# has no autorelease pool of its own, so set one up. it cannot be an `@autoreleasepool`,
+# whose global lock may be held by the waiting task.
 function blocking_wait(cmdbuf::MTL.MTLCommandBufferLike)
     pool = ccall(:objc_autoreleasePoolPush, Ptr{Cvoid}, ())
     try
@@ -33,11 +33,171 @@ end
 function wait_cmdbuf!(cmdbuf::MTL.MTLCommandBufferLike; handlers::Bool=false)
     !handlers && is_completed(cmdbuf) && return
 
-    if use_nonblocking_synchronization
-        cooperative_wait(blocking_wait, cmdbuf; isdone=handlers ? nothing : is_completed)
-    else
+    if !use_nonblocking_synchronization
         wait_completed(cmdbuf)
+    elseif GC.in_finalizer() || ccall(:jl_generating_output, Cint, ()) != 0
+        # no switching tasks here, so no handing the wait to another thread either
+        blocking_wait(cmdbuf)
+    else
+        # A view, not a reference: the caller's own keeps `cmdbuf` alive for the call,
+        # and the waiter takes one of its own for its thread.
+        ref = MTL.MTLCommandBufferRef(cmdbuf)
+        (handlers || !poll_completed(ref)) && wait_on_waiter!(ref, !handlers)
     end
+    return
+end
+
+# Short waits are the common case, and handing one to another thread costs a couple of
+# microseconds, more when that thread has gone to sleep: poll first, busy at the start and
+# then yielding to other tasks. The same budget as GPUToolbox's `cooperative_wait`, whose
+# polling this replaces along with its slow path (see `CommandBufferWaiter`). Measured on an
+# M5 in a process with nothing else to run, the budget runs out after about 2.6 ms, most of
+# it in the yields; a one-dispatch frame waits about 190 us and stayed inside it in 5000
+# waits out of 5000, and a frame with more GPU work than the budget never does.
+function poll_completed(cmdbuf::MTL.MTLCommandBufferRef; busy::Int=32, total::Int=256)
+    for i in 1:total
+        if i <= busy
+            ccall(:jl_cpu_pause, Cvoid, ())
+            GC.safepoint()
+        else
+            yield()
+        end
+        is_completed(cmdbuf) && return true
+    end
+    return false
+end
+
+"""
+A thread of Metal.jl's own that blocks in `waitUntilCompleted` on behalf of a waiting
+task, so that the task's thread can run other tasks until the command buffer is done.
+
+This is the design of GPUToolbox's `cooperative_wait`, which `wait_cmdbuf!` used before,
+with one difference, and it is the reason this exists: NOTHING here is made per wait.
+`cooperative_wait` builds a `WaitState`, a `WaitRequest` and the `Base.Event` inside it —
+its lock, its condition and two wait lists — for every wait that outlasts its polling,
+and boxes the object it waits on into an `Any` field: 272 bytes, measured, for one wait.
+Every frame whose GPU work outlasts the polling (about 2.6 ms on an M5) waits that long,
+so a renderer allocated those bytes once a frame for nothing it kept: a Mantle plan of one
+18 ms dispatch measured 280 bytes per `run!`/`waitfor!` cycle that way, and 0 with this.
+Here a waiter, its two events and its thread are made once and used again, and the command
+buffer is a field of its own type, so handing it over boxes nothing.
+
+Handing over is the waiting task setting `cmdbuf` and notifying `work`; the thread waits
+for the command buffer, gives back the reference it was handed, and notifies `done`. The
+waiter goes back to the pool when its TASK has consumed `done`, not when its thread is
+finished: a thread that returned itself first could be handed the next wait while the
+previous task had not yet woken, and that task would consume the next wait's `done`.
+
+One thread per waiter, created when a wait finds none idle, and kept. At most four,
+as GPUToolbox has, because a driver may spin while it waits and every busy waiter would
+then hold a core: a wait that finds four busy polls its command buffer instead and takes
+the first waiter that comes free. Twelve tasks on four threads, each waiting on a long
+command buffer eight times, made twelve threads before the cap. A wait that has to see the
+completion handlers run (`handlers = true`) cannot be polled, so it makes a waiter past
+the cap rather than wait for one.
+"""
+mutable struct CommandBufferWaiter
+    const work::Base.Event
+    const done::Base.Event
+    cmdbuf::Union{Nothing,MTL.MTLCommandBufferRef}
+    # What the wait threw on the waiter's thread, for the waiting task to throw.
+    failure::Any
+end
+
+CommandBufferWaiter() = CommandBufferWaiter(Base.Event(true), Base.Event(true), nothing, nothing)
+
+# every waiter ever made, keeping them rooted (their threads hold only a pointer), and the
+# ones not handling a wait
+const waiters = CommandBufferWaiter[]
+const idle_waiters = CommandBufferWaiter[]
+const waiters_lock = ReentrantLock()
+
+function waiter_loop(data::Ptr{Cvoid})
+    w = unsafe_pointer_to_objref(data)::CommandBufferWaiter
+    # never run finalizers on this thread: one that blocks (freeing GPU memory can wait for
+    # the device) would keep it from notifying the task that is waiting on it.
+    ccall(:jl_gc_disable_finalizers_internal, Cvoid, ())
+    while true
+        wait(w.work)
+        cmdbuf = w.cmdbuf::MTL.MTLCommandBufferRef
+        try
+            blocking_wait(cmdbuf)
+        catch err
+            # passed on, and thrown by the waiting task
+            w.failure = err
+        finally
+            # the reference the waiting task took for this thread
+            release(cmdbuf)
+        end
+        notify(w.done)
+    end
+end
+
+function start_waiter!(w::CommandBufferWaiter)
+    # the size of a `uv_thread_t` is not known here, so reserve enough
+    tid = Ref{NTuple{32,UInt8}}(ntuple(_ -> 0x00, 32))
+    cb = @cfunction(waiter_loop, Cvoid, (Ptr{Cvoid},))
+    err = ccall(:uv_thread_create, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                tid, cb, pointer_from_objref(w))
+    err == 0 || Base.uv_error("uv_thread_create", err)
+    ccall(:uv_thread_detach, Cint, (Ptr{Cvoid},), tid)
+    return w
+end
+
+# An idle waiter, a new one, or `nothing` when `limit` are busy and the wait can be polled.
+# A new waiter is counted under the lock and started after it, so that two waits deciding at
+# once cannot both make the fifth.
+function take_waiter!(pollable::Bool; limit::Int=4)
+    w = Base.@lock waiters_lock begin
+        isempty(idle_waiters) || return pop!(idle_waiters)
+        pollable && length(waiters) >= limit && return nothing
+        fresh = CommandBufferWaiter()
+        push!(waiters, fresh)
+        fresh
+    end
+    return start_waiter!(w)
+end
+
+# Hand the wait for `cmdbuf` to a waiter and wait for it to say the command buffer is done.
+#
+# Interrupted, this keeps waiting and throws the interrupt afterwards, as
+# `cooperative_wait` does: the command buffer may still be using memory the caller would
+# release when unwinding. Any other exception thrown into the task is thrown at once; the
+# waiter is then not returned to the pool, because its `done` will be set by a wait nobody
+# consumes, and its thread still holds its own reference to the command buffer, so
+# nothing it reads is released under it.
+function wait_on_waiter!(cmdbuf::MTL.MTLCommandBufferRef, pollable::Bool)
+    w = take_waiter!(pollable)
+    while w === nothing
+        # every waiter is busy: poll, and look for a free one every 100 us
+        t0 = time_ns()
+        while time_ns() - t0 < 100_000
+            is_completed(cmdbuf) && return
+            yield()
+        end
+        w = take_waiter!(pollable)
+    end
+    retain(cmdbuf)
+    w.cmdbuf = cmdbuf
+    notify(w.work)
+
+    interrupt = nothing
+    while true
+        try
+            wait(w.done)
+            break
+        catch err
+            err isa InterruptException || rethrow()
+            interrupt = err
+        end
+    end
+
+    w.cmdbuf = nothing
+    failure = w.failure
+    w.failure = nothing
+    Base.@lock waiters_lock push!(idle_waiters, w)
+    failure === nothing || throw(failure)
+    interrupt === nothing || throw(interrupt)
     return
 end
 
