@@ -421,12 +421,14 @@ handed to the Metal compiler was correct in every case.
 sees the shape it gets wrong.
 """
 function zero_undef_phis!(mod::LLVM.Module)
-    for f in functions(mod), bb in blocks(f), inst in instructions(bb)
-        # a block's phis come first
-        inst isa LLVM.PHIInst || break
-        ops = operands(inst)
-        for k in 1:length(ops)
-            ops[k] isa LLVM.UndefValue && (ops[k] = null(value_type(inst)))
+    for f in LLVM.functions(mod), bb in LLVM.blocks(f)
+        for inst in LLVM.instructions(bb)
+            # a block's phis come first
+            inst isa LLVM.PHIInst || break
+            ops = LLVM.operands(inst)
+            for k in 1:length(ops)
+                ops[k] isa LLVM.UndefValue && (ops[k] = LLVM.null(LLVM.value_type(inst)))
+            end
         end
     end
     return mod
