@@ -1128,13 +1128,21 @@ end
         kc = @metal launch=false indirect_count_kernel(pointer(ind), pointer(srcn), TGW)
         km = @metal launch=false indirect_mark_kernel(pointer(out), UInt32(N))
 
-        kc(pointer(ind), pointer(srcn), TGW; groups = 1, threads = 1)
-        # No `synchronize` between the two. The count is written by the first
-        # dispatch and read by the command processor for the second; both are on
-        # one queue, which runs them in order, and the host never sees it.
-        km(pointer(out), UInt32(N); threads = Int(TGW),
-           indirect = (pointer(ind).buffer, 0))
-        Metal.synchronize()
+        # `GC.@preserve`, because a pointer does not keep its array alive: `srcn` is
+        # not used after the launch, and a collection between `pointer(srcn)` and the
+        # encode freed its buffer before `setBuffer:` retained it. Under
+        # `NSZombieEnabled=YES` that is `-[AGXG17GFamilyBuffer retain]: message sent
+        # to deallocated instance`; without it, a segfault in `objc_retain` whenever
+        # the collector happened to run there.
+        GC.@preserve out srcn ind begin
+            kc(pointer(ind), pointer(srcn), TGW; groups = 1, threads = 1)
+            # No `synchronize` between the two. The count is written by the first
+            # dispatch and read by the command processor for the second; both are on
+            # one queue, which runs them in order, and the host never sees it.
+            km(pointer(out), UInt32(N); threads = Int(TGW),
+               indirect = (pointer(ind).buffer, 0))
+            Metal.synchronize()
+        end
 
         groups = cld(Int(want), Int(TGW))
         @test Array(ind) == UInt32[groups, 1, 1]
@@ -1154,9 +1162,12 @@ end
     ind  = Metal.zeros(UInt32, 3)
     kc = @metal launch=false indirect_count_kernel(pointer(ind), pointer(srcn), UInt32(64))
     km = @metal launch=false indirect_mark_kernel(pointer(out), UInt32(256))
-    kc(pointer(ind), pointer(srcn), UInt32(64); groups = 1, threads = 1)
-    km(pointer(out), UInt32(256); threads = 64, indirect = (pointer(ind).buffer, 0))
-    Metal.synchronize()
+    # preserved for the reason given in the testset above
+    GC.@preserve out srcn ind begin
+        kc(pointer(ind), pointer(srcn), UInt32(64); groups = 1, threads = 1)
+        km(pointer(out), UInt32(256); threads = 64, indirect = (pointer(ind).buffer, 0))
+        Metal.synchronize()
+    end
     @test Array(ind) == UInt32[0, 1, 1]
     @test all(==(UInt32(0)), Array(out))
 end
