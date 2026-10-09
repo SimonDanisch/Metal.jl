@@ -15,7 +15,39 @@ function MTLComputeCommandEncoder(cmdbuf::MTLCommandBuffer;
     end
 end
 
-function set_function!(cce::MTLComputeCommandEncoder, pip::MTLComputePipelineState)
+@objcwrapper managed = false MTLComputeCommandEncoderRef <: MTLComputeCommandEncoder
+
+@doc """
+    MTLComputeCommandEncoderRef
+
+A compute encoder whose reference count is kept by hand, for the reason and under
+the rule [`MTLCommandBufferRef`](@ref) gives: an `isbits` wrapper, so opening one
+per submission allocates nothing, and one `retain` per stored reference.
+
+`close` ends it and gives back its reference, as it does for the managed wrapper.
+""" MTLComputeCommandEncoderRef
+
+"""
+    MTLComputeCommandEncoderRef(cmdbuf::MTLCommandBufferLike) -> MTLComputeCommandEncoderRef
+
+A NEW compute encoder on `cmdbuf`, with one reference that belongs to the caller;
+`close` ends it and gives the reference back.
+"""
+MTLComputeCommandEncoderRef(cmdbuf::MTLCommandBufferLike) =
+    retain_autoreleased(MTLComputeCommandEncoderRef) do
+        @objc [cmdbuf::id{MTLCommandBuffer} computeCommandEncoder]::id{MTLComputeCommandEncoderRef}
+    end
+
+"""
+    MTLComputeCommandEncoderRef(cce::MTLComputeCommandEncoderLike)
+
+The same encoder, unmanaged, taking no reference: valid while `cce` is.
+"""
+MTLComputeCommandEncoderRef(cce::MTLComputeCommandEncoderLike) =
+    reinterpret(MTLComputeCommandEncoderRef, pointer(cce))
+MTLComputeCommandEncoderRef(cce::MTLComputeCommandEncoderRef) = cce
+
+function set_function!(cce::MTLComputeCommandEncoderLike, pip::MTLComputePipelineState)
     @objc [cce::id{MTLComputeCommandEncoder} setComputePipelineState:pip::id{MTLComputePipelineState}]::Nothing
 end
 
@@ -23,24 +55,24 @@ end
 # `[[buffer(n)]]` like any other, and Metal resolves the function pointers behind
 # it. It is also a `MTLResource`, so it needs `useResource!` to be resident just
 # as a buffer reached by address does.
-function set_visible_function_table!(cce::MTLComputeCommandEncoder,
+function set_visible_function_table!(cce::MTLComputeCommandEncoderLike,
                                      table::MTLVisibleFunctionTable, index::Integer)
     @objc [cce::id{MTLComputeCommandEncoder} setVisibleFunctionTable:table::id{MTLVisibleFunctionTable} atBufferIndex:index::NSUInteger]::Nothing
 end
 
-function set_buffer!(cce::MTLComputeCommandEncoder, buf::MTLBuffer, offset, index)
+function set_buffer!(cce::MTLComputeCommandEncoderLike, buf::MTLBuffer, offset, index)
     @objc [cce::id{MTLComputeCommandEncoder} setBuffer:buf::id{MTLBuffer}
                                              offset:offset::NSUInteger
                                              atIndex:(index-1)::NSUInteger]::Nothing
 end
 
-function set_bytes!(cce::MTLComputeCommandEncoder, ptr::Ptr, len::Integer, index::Integer)
+function set_bytes!(cce::MTLComputeCommandEncoderLike, ptr::Ptr, len::Integer, index::Integer)
     @objc [cce::id{MTLComputeCommandEncoder} setBytes:ptr::Ptr{Cvoid}
                                            length:len::NSUInteger
                                           atIndex:(index-1)::NSUInteger]::Nothing
 end
 
-function dispatchThreadgroups!(cce::MTLComputeCommandEncoder, threadgroupsPerGrid, threadsPerThreadgroup)
+function dispatchThreadgroups!(cce::MTLComputeCommandEncoderLike, threadgroupsPerGrid, threadsPerThreadgroup)
     @objc [cce::id{MTLComputeCommandEncoder} dispatchThreadgroups:threadgroupsPerGrid::MTLSize
                                              threadsPerThreadgroup:threadsPerThreadgroup::MTLSize]::Nothing
 end
@@ -63,14 +95,14 @@ two dispatches are just ordered on the queue.
 The count is in THREADGROUPS, not threads: whatever writes it has to divide by
 the threadgroup width itself, because this call cannot.
 """
-function dispatchThreadgroupsIndirect!(cce::MTLComputeCommandEncoder, buf::MTLBuffer,
+function dispatchThreadgroupsIndirect!(cce::MTLComputeCommandEncoderLike, buf::MTLBuffer,
                                        offset::Integer, threadsPerThreadgroup::MTLSize)
     @objc [cce::id{MTLComputeCommandEncoder} dispatchThreadgroupsWithIndirectBuffer:buf::id{MTLBuffer}
                                              indirectBufferOffset:offset::NSUInteger
                                              threadsPerThreadgroup:threadsPerThreadgroup::MTLSize]::Nothing
 end
 
-function dispatchThreads!(cce::MTLComputeCommandEncoder, threadsPerGrid::MTLSize, threadsPerThreadgroup::MTLSize)
+function dispatchThreads!(cce::MTLComputeCommandEncoderLike, threadsPerGrid::MTLSize, threadsPerThreadgroup::MTLSize)
     @objc [cce::id{MTLComputeCommandEncoder} dispatchThreads:threadsPerGrid::MTLSize
                                              threadsPerThreadgroup:threadsPerThreadgroup::MTLSize]::Nothing
 end
@@ -87,18 +119,18 @@ function MTLComputeCommandEncoder(f::Base.Callable, cmdbuf::MTLCommandBuffer; kw
     end
 end
 
-function append_current_function!(cce::MTLComputeCommandEncoder, threadgroupsPerGrid, threadsPerThreadgroup)
+function append_current_function!(cce::MTLComputeCommandEncoderLike, threadgroupsPerGrid, threadsPerThreadgroup)
     dispatchThreadgroups!(cce, threadgroupsPerGrid, threadsPerThreadgroup)
 end
 
 #### use
 
-function use!(cce::MTLComputeCommandEncoder, buf::MTLBuffer, mode::MTLResourceUsage=ReadWriteUsage)
+function use!(cce::MTLComputeCommandEncoderLike, buf::MTLBuffer, mode::MTLResourceUsage=ReadWriteUsage)
     @objc [cce::id{MTLComputeCommandEncoder} useResource:buf::id{MTLBuffer}
                                              usage:mode::MTLResourceUsage]::Nothing
 end
 
-function use!(cce::MTLComputeCommandEncoder, buf::Vector{MTLBuffer}, mode::MTLResourceUsage=ReadWriteUsage)
+function use!(cce::MTLComputeCommandEncoderLike, buf::Vector{MTLBuffer}, mode::MTLResourceUsage=ReadWriteUsage)
     @objc [cce::id{MTLComputeCommandEncoder} useResources:buf::id{MTLBuffer}
                                              count:length(buf)::Csize_t
                                              usage:mode::MTLResourceUsage]::Nothing
@@ -117,7 +149,7 @@ per call.
 The caller owns the array and owns keeping the objects it points at alive: these
 are bare pointers and nothing here roots them.
 """
-function use!(cce::MTLComputeCommandEncoder, ids::Vector{id{MTLBuffer}},
+function use!(cce::MTLComputeCommandEncoderLike, ids::Vector{id{MTLBuffer}},
               mode::MTLResourceUsage=ReadWriteUsage)
     @objc [cce::id{MTLComputeCommandEncoder} useResources:ids::Ptr{id{MTLBuffer}}
                                              count:length(ids)::Csize_t
@@ -138,7 +170,7 @@ a separate table: in MSL the kernel parameter is declared
 
 `index` is 1-based here and 0-based in Metal, matching `set_buffer!` next door.
 """
-function set_acceleration_structure!(cce::MTLComputeCommandEncoder,
+function set_acceleration_structure!(cce::MTLComputeCommandEncoderLike,
                                      accel::MTLAccelerationStructure, index::Integer)
     @objc [cce::id{MTLComputeCommandEncoder} setAccelerationStructure:accel::id{MTLAccelerationStructure}
                                              atBufferIndex:(index - 1)::NSUInteger]::Nothing
@@ -154,13 +186,13 @@ references the encoder cannot see, so binding the TLAS alone leaves its
 instanced structures non-resident and traversal reads garbage. Metal's
 validation layer reports this; without it the symptom is missed hits.
 """
-function use!(cce::MTLComputeCommandEncoder, accel::MTLAccelerationStructure,
+function use!(cce::MTLComputeCommandEncoderLike, accel::MTLAccelerationStructure,
               mode::MTLResourceUsage=ReadUsage)
     @objc [cce::id{MTLComputeCommandEncoder} useResource:accel::id{MTLAccelerationStructure}
                                              usage:mode::MTLResourceUsage]::Nothing
 end
 
-function use!(cce::MTLComputeCommandEncoder, accels::Vector{MTLAccelerationStructure},
+function use!(cce::MTLComputeCommandEncoderLike, accels::Vector{MTLAccelerationStructure},
               mode::MTLResourceUsage=ReadUsage)
     isempty(accels) && return
     @objc [cce::id{MTLComputeCommandEncoder} useResources:accels::id{MTLAccelerationStructure}

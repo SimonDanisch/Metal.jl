@@ -27,7 +27,7 @@ end
 
 function record_commit!(collector::MTL.ProfileCollector, cmdbuf)
     @lock collector.lock begin
-        ops = get(collector.metadata, cmdbuf, nothing)
+        ops = get(collector.metadata, UInt(pointer(cmdbuf)), nothing)
         if ops !== nothing && !isempty(ops)
             name = String(something(get(first(ops), :name, nothing), "Metal operation"))
         else
@@ -39,7 +39,9 @@ function record_commit!(collector::MTL.ProfileCollector, cmdbuf)
             name = clean_label(name)
         end
 
-        push!(collector.records, (name, cmdbuf))
+        # Read after the batch has retired it, so a reference of the record's own: a
+        # batch's command buffer arrives as an unmanaged `MTLCommandBufferRef`.
+        push!(collector.records, (name, MTL.retained(cmdbuf)))
     end
     return
 end
@@ -185,7 +187,7 @@ function profile_internally(@nospecialize(f); trace::Bool=false, raw::Bool=false
                     push!(name, opname)
                     push!(start, t0)
                     push!(stop, t1)
-                    push!(ops, get(collector.metadata, cmdbuf, Any[]))
+                    push!(ops, get(collector.metadata, UInt(pointer(cmdbuf)), Any[]))
                 end
             end
         end

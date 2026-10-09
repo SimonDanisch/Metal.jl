@@ -6,6 +6,26 @@ function MTLBlitCommandEncoder(cmdbuf::MTLCommandBuffer)
     @objc [cmdbuf::id{MTLCommandBuffer} blitCommandEncoder]::MTLBlitCommandEncoder
 end
 
+@objcwrapper managed = false MTLBlitCommandEncoderRef <: MTLBlitCommandEncoder
+
+@doc """
+    MTLBlitCommandEncoderRef
+
+A blit encoder whose reference count is kept by hand; see
+[`MTLComputeCommandEncoderRef`](@ref), which this mirrors.
+""" MTLBlitCommandEncoderRef
+
+"""
+    MTLBlitCommandEncoderRef(cmdbuf::MTLCommandBufferLike) -> MTLBlitCommandEncoderRef
+
+A NEW blit encoder on `cmdbuf`, with one reference that belongs to the caller;
+`close` ends it and gives the reference back.
+"""
+MTLBlitCommandEncoderRef(cmdbuf::MTLCommandBufferLike) =
+    retain_autoreleased(MTLBlitCommandEncoderRef) do
+        @objc [cmdbuf::id{MTLCommandBuffer} blitCommandEncoder]::id{MTLBlitCommandEncoderRef}
+    end
+
 ## encode in the Command Encoder
 function MTLBlitCommandEncoder(f::Base.Callable, cmdbuf::MTLCommandBuffer)
     encoder = MTLBlitCommandEncoder(cmdbuf)
@@ -16,7 +36,7 @@ end
 
 ##
 # Copy from device to device
-function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLBuffer, doff,
+function append_copy!(enc::MTLBlitCommandEncoderLike, dst::MTLBuffer, doff,
                       src::MTLBuffer, soff, len)
     @objc [enc::id{MTLBlitCommandEncoder} copyFromBuffer:src::id{MTLBuffer}
                                           sourceOffset:soff::Csize_t
@@ -27,7 +47,7 @@ end
 
 for T in (UInt8, Int8)
     @eval begin
-        function append_fillbuffer!(enc::MTLBlitCommandEncoder, src::MTLBuffer,
+        function append_fillbuffer!(enc::MTLBlitCommandEncoderLike, src::MTLBuffer,
                                     val::$T, bytesize, offset=0)
             range = NSRange(offset, bytesize)
             @objc [enc::id{MTLBlitCommandEncoder} fillBuffer:src::id{MTLBuffer}
@@ -51,7 +71,7 @@ like this one.
 `bytes_per_image` may be 0 for a 2D copy; Metal then derives it from the row
 stride and the height.
 """
-function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLBuffer, doff::Integer,
+function append_copy!(enc::MTLBlitCommandEncoderLike, dst::MTLBuffer, doff::Integer,
                       bytes_per_row::Integer, bytes_per_image::Integer,
                       src::MTLTexture, origin::MTLOrigin, size::MTLSize,
                       slice::Integer = 0, level::Integer = 0)
@@ -80,7 +100,7 @@ fill one from data that is already on the device without a host round trip.
 
 `bytes_per_image` may be 0 for a 2D copy.
 """
-function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLTexture, origin::MTLOrigin,
+function append_copy!(enc::MTLBlitCommandEncoderLike, dst::MTLTexture, origin::MTLOrigin,
                       size::MTLSize, src::MTLBuffer, soff::Integer,
                       bytes_per_row::Integer, bytes_per_image::Integer,
                       slice::Integer = 0, level::Integer = 0)
@@ -96,6 +116,6 @@ function append_copy!(enc::MTLBlitCommandEncoder, dst::MTLTexture, origin::MTLOr
 end
 
 # only for managed resources
-function append_sync!(enc::MTLBlitCommandEncoder, src::MTLBuffer)
+function append_sync!(enc::MTLBlitCommandEncoderLike, src::MTLBuffer)
     @objc [enc::id{MTLBlitCommandEncoder} synchronizeResource:src::id{MTLBuffer}]::Nothing
 end

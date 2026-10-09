@@ -41,28 +41,13 @@ function wait_cmdbuf!(cmdbuf::MTL.MTLCommandBufferLike; handlers::Bool=false)
     return
 end
 
-function command_buffer_errors(state::Union{Nothing,MTL.QueueSubmissionState})
-    state === nothing && return nothing
-    return MTL.finish_submissions!(state)
-end
+# The failures collected so far, and the ones one more queue reported.
+merge_errors(::Nothing, more) = more
+merge_errors(errors::Vector{MTL.CommandBufferErrorInfo}, ::Nothing) = errors
+merge_errors(errors::Vector{MTL.CommandBufferErrorInfo},
+             more::Vector{MTL.CommandBufferErrorInfo}) = append!(errors, more)
 
-function command_buffer_errors(states::AbstractVector{MTL.QueueSubmissionState})
-    errors = nothing
-    for state in states
-        state_errors = MTL.finish_submissions!(state)
-        state_errors === nothing && continue
-        if errors === nothing
-            errors = state_errors
-        else
-            append!(errors, state_errors)
-        end
-    end
-    return errors
-end
-
-function check_synchronization_errors(states)
-    errors = command_buffer_errors(states)
-
+function check_synchronization_errors(errors::Union{Nothing,Vector{MTL.CommandBufferErrorInfo}})
     kernel_error = try
         check_exceptions()
         nothing
@@ -81,6 +66,18 @@ function check_synchronization_errors(states)
     return
 end
 
+# Wait for `cmdbuf`, whose reference is the caller's (`MTL.sync_point` hands one out
+# with it), and give that reference back however the wait ends.
+wait_and_release!(::Nothing) = nothing
+function wait_and_release!(cmdbuf::MTL.MTLCommandBufferRef)
+    try
+        wait_cmdbuf!(cmdbuf)
+    finally
+        release(cmdbuf)
+    end
+    return
+end
+
 
 #
 # public API
@@ -93,19 +90,21 @@ Wait for currently committed GPU work on `queue` to finish. This includes work l
 behind by tasks that have finished, so that their results are visible after `wait`ing
 for them.
 """
-function synchronize(queue = global_queue(device()))
-    # an `@autoreleasepool` takes a global lock, so don't hold one while waiting, or other
-    # tasks would not be able to use Metal in the meantime.
-    bq, committed, orphans = @autoreleasepool begin
-        b = batched_queue(queue)
-        c = Base.@lock submission_lock begin
-            commit_batch!(b)
-            isempty(b.cleanups) ? nothing : b.cleanups[end]
-        end
-        o = flush_orphaned_queues!()
-        maybe_collect(b.queue.device; will_block=true)
-        b, c, o
-    end
+synchronize() = synchronize(global_queue(device()))
+
+synchronize(queue::MTLCommandQueue) = synchronize(@autoreleasepool batched_queue(queue))
+
+# A renderer calls this once a frame, through Mantle's `waitfor!`, so the steady state
+# allocates NOTHING, and the shape below is what that took. The two pools are
+# functions of their own: as `@autoreleasepool begin … end` blocks inside this body,
+# the pool's closure captured a variable that was assigned again after it (two
+# `Core.Box`es a call), and handed back a tuple of a queue and two `Union`s, which was
+# boxed too. The wait between them holds no pool, because `@autoreleasepool` takes a
+# global lock that other tasks would then be waiting on.
+function synchronize(bq::BatchedCommandQueue)
+    # A scan, and in the steady state an empty one: see `orphaned_batched_queues`.
+    orphans = orphaned_batched_queues()
+    upto = commit_for_synchronize!(bq, orphans)
     queue = bq.queue
 
     # flush any pending log handlers from logging-enabled kernels on this queue
@@ -113,27 +112,47 @@ function synchronize(queue = global_queue(device()))
     # completion handlers is what processes its `addLogHandler:` blocks)
     drain_logging_cmdbufs!(queue)
 
-    last, submissions = MTL.take_queue_submissions(queue)
-
     # Handles the already-completed fast path internally.
-    last === nothing || wait_cmdbuf!(last)
+    point = MTL.sync_point(queue)
+    wait_and_release!(point.last)
 
+    points = orphans === nothing ? nothing : wait_orphaned_queues!(orphans)
+    finish_synchronize!(bq, upto, point, orphans, points)
+    return
+end
+
+# Commit what is open, on `bq` and on the queues finished tasks left behind, and say
+# how many command buffers `bq` had then handed to `defer_cleanup!`: those are the
+# ones this synchronization retires.
+@autoreleasepool function commit_for_synchronize!(bq::BatchedCommandQueue, orphans)
+    upto = Base.@lock submission_lock begin
+        commit_batch!(bq)
+        bq.ncommitted
+    end
+    # their owner will not touch them again, so we can, but other tasks synchronizing
+    # may do so concurrently.
+    orphans === nothing || foreach(commit_batch!, orphans)
+    maybe_collect(bq.device; will_block=true)
+    return upto
+end
+
+# Release what the waited-for work held, then report how it went.
+@autoreleasepool function finish_synchronize!(bq::BatchedCommandQueue, upto::Int,
+                                              point::MTL.SyncPoint, orphans, points)
+    # other tasks may have committed more work to this queue while we were waiting,
+    # so only force the cleanup of command buffers that were committed before.
+    drain_cleanups!(bq; until=upto)
+    errors = MTL.finish_submissions!(point)
     if orphans !== nothing
-        submissions = wait_orphaned_queues!(orphans, submissions)
-    end
-
-    @autoreleasepool begin
-        # other tasks may have committed more work to this queue while we were waiting,
-        # so only force the cleanup of command buffers that were committed before.
-        drain_cleanups!(bq; until=committed)
-        if orphans !== nothing
-            foreach(drain_cleanups!, orphans)
+        foreach(drain_cleanups!, orphans)
+        for p in points
+            errors = merge_errors(errors, MTL.finish_submissions!(p))
         end
-
-        # Surface Metal runtime failures and device-side Julia exceptions together,
-        # after cleanup has released all Julia roots held by completed work.
-        check_synchronization_errors(submissions)
     end
+
+    # Surface Metal runtime failures and device-side Julia exceptions together,
+    # after cleanup has released all Julia roots held by completed work.
+    check_synchronization_errors(errors)
     return
 end
 
@@ -142,33 +161,21 @@ end
 function synchronize_queue(bq::BatchedCommandQueue)
     (bq.owner === current_task() || istaskdone(bq.owner)) && return synchronize(bq)
 
-    last = @autoreleasepool Base.@lock submission_lock begin
-        commit_batch!(bq)
-        MTL.last_committed(bq.queue)
-    end
-    last === nothing || wait_cmdbuf!(last)
+    @autoreleasepool Base.@lock submission_lock commit_batch!(bq)
+    wait_and_release!(MTL.sync_point(bq.queue).last)
     return
 end
 
-# commit the open batches of queues whose owning task has finished. their owner will
-# not touch them again, so we can, but other tasks synchronizing may do so concurrently.
-function flush_orphaned_queues!()
-    orphans = orphaned_batched_queues()
-    orphans === nothing && return nothing
-    foreach(commit_batch!, orphans)
-    return orphans
-end
-
-function wait_orphaned_queues!(orphans, submissions)
-    states = MTL.QueueSubmissionState[]
-    submissions === nothing || push!(states, submissions)
+# wait for the queues finished tasks left work in, and say where each of them got to
+function wait_orphaned_queues!(orphans::Vector{BatchedCommandQueue})
+    points = MTL.SyncPoint[]
     for bq in orphans
         drain_logging_cmdbufs!(bq.queue)
-        last, state = MTL.take_queue_submissions(bq.queue)
-        last === nothing || wait_cmdbuf!(last)
-        state === nothing || push!(states, state)
+        point = MTL.sync_point(bq.queue)
+        wait_and_release!(point.last)
+        push!(points, point)
     end
-    return states
+    return points
 end
 
 """
@@ -194,11 +201,17 @@ function device_synchronize()
         drain_logging_cmdbufs!(raw_queue(queue))
     end
 
-    cmdbufs, submissions = MTL.take_all_submissions()
-
-    # the last command buffer committed to each queue completes after the earlier ones
-    for cmdbuf in cmdbufs
-        wait_cmdbuf!(cmdbuf)
+    # the last command buffer committed to each queue completes after the earlier ones.
+    # every `last` comes with a reference of ours, given back however the waits end.
+    points = MTL.sync_points()
+    try
+        for p in points
+            p.last === nothing || wait_cmdbuf!(p.last)
+        end
+    finally
+        for p in points
+            p.last === nothing || release(p.last)
+        end
     end
 
     # other tasks may have committed work while we were waiting, so only clean up after
@@ -207,6 +220,10 @@ function device_synchronize()
         drain_cleanups!(bq)
     end
 
-    check_synchronization_errors(submissions)
+    errors = nothing
+    for p in points
+        errors = merge_errors(errors, MTL.finish_submissions!(p))
+    end
+    check_synchronization_errors(errors)
     return
 end

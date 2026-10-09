@@ -95,7 +95,7 @@ function __init__()
             @autoreleasepool for bq in active_batched_queues()
                 cmdbuf = bq.cmdbuf
                 end_encoder!(bq)
-                cmdbuf === nothing || reset_open_cmdbuf!(bq, cmdbuf)
+                cmdbuf === nothing || discard_open_cmdbuf!(bq, cmdbuf)
             end
         catch err
             @error "Failed to close open batched command queues at exit" exception=(err, catch_backtrace())

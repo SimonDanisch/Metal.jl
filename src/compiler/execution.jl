@@ -118,11 +118,18 @@ function claim!(ptr::MtlPtr, bq::BatchedCommandQueue)
 end
 
 struct Adaptor
-    # the current command encoder, if any.
-    cce::Union{Nothing,MTLComputeCommandEncoder}
+    # the current command encoder, if any. Unmanaged and concrete: the batch's own
+    # encoder is an `MTLComputeCommandEncoderRef`, and a field of the abstract
+    # `MTLComputeCommandEncoderLike` would make every `use!` below a dynamic call.
+    cce::Union{Nothing,MTL.MTLComputeCommandEncoderRef}
     # the queue the encoder belongs to, if any.
     queue::Union{Nothing,BatchedCommandQueue}
 end
+
+# a managed encoder is seen through an unmanaged view, which the caller's own
+# reference keeps valid for the conversion
+Adaptor(cce::MTLComputeCommandEncoder, queue) =
+    Adaptor(MTL.MTLComputeCommandEncoderRef(cce), queue)
 
 """
 Make `buf` resident for every dispatch on its device's queue.
@@ -449,7 +456,7 @@ end
     ex
 end
 
-@inline function set_argument!(cce::MTLComputeCommandEncoder, arg, idx::Integer)
+@inline function set_argument!(cce::MTL.MTLComputeCommandEncoderLike, arg, idx::Integer)
     argtyp = typeof(arg)
 
     # A non-isbits argument has no fields the kernel could read — compilation would have

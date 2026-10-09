@@ -131,7 +131,7 @@ Replay a ONE-BASED range of the buffer's commands.
 This is the whole point of the file: the frame's host work is this one call, and
 everything it runs was encoded when the plan was recorded.
 """
-function execute_commands!(cce::MTLComputeCommandEncoder, icb::MTLIndirectCommandBuffer,
+function execute_commands!(cce::MTLComputeCommandEncoderLike, icb::MTLIndirectCommandBuffer,
                            range::UnitRange{<:Integer})
     r = NSRange(first(range) - 1, length(range))
     @objc [cce::id{MTLComputeCommandEncoder} executeCommandsInBuffer:icb::id{MTLIndirectCommandBuffer}
@@ -153,7 +153,7 @@ in the buffer once, and a one-thread kernel writes the length the gate implies
 just before the range is read. Nothing about the recording changes and the host
 never learns whether the iteration ran.
 """
-function execute_commands_indirect!(cce::MTLComputeCommandEncoder,
+function execute_commands_indirect!(cce::MTLComputeCommandEncoderLike,
                                     icb::MTLIndirectCommandBuffer,
                                     rangebuf::MTLBuffer, offset::Integer)
     @objc [cce::id{MTLComputeCommandEncoder} executeCommandsInBuffer:icb::id{MTLIndirectCommandBuffer}

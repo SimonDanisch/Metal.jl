@@ -42,9 +42,17 @@ end::Int
 # Completion handlers run on libdispatch worker threads, where compiling or
 # running Julia code can overflow the small foreign stack. Keep command buffers
 # alive and drain Julia roots from normal managed threads instead.
+#
+# `cmdbuf` holds ONE reference, taken in `defer_cleanup!` and given back by
+# `drain_cleanups!` when the command buffer retires. `seq` is the record's place in
+# this queue's commit order: a synchronization notes the newest before it waits and
+# retires everything up to it afterwards. Identity used to do that job, comparing
+# the record itself, which only worked while every record held a wrapper object of
+# its own; a pointer and a recycled roots vector can both come back.
 struct PendingCommand
-    cmdbuf::MTL.MTLCommandBufferLike
+    cmdbuf::MTL.MTLCommandBufferRef
     roots::Vector{Any}
+    seq::Int
 end
 
 """
@@ -88,8 +96,14 @@ mutable struct BatchedCommandQueue
     queue::MTLCommandQueue
     device::MTLDevice
     owner::Task
-    cmdbuf::Union{Nothing,MTLCommandBuffer}
-    encoder::Union{Nothing,MTLComputeCommandEncoder,MTLBlitCommandEncoder}
+    # The open batch's command buffer and encoder, each holding ONE reference that
+    # belongs to the batch. Unmanaged, because they are made once per submission:
+    # managed wrappers are a heap object each, and that was 64 of the bytes a
+    # one-submission frame allocated. The encoder's reference goes in
+    # `end_encoder!`; the command buffer's when the batch is committed or discarded,
+    # after the records that outlive it have taken theirs.
+    cmdbuf::Union{Nothing,MTL.MTLCommandBufferRef}
+    encoder::Union{Nothing,MTL.MTLComputeCommandEncoderRef,MTL.MTLBlitCommandEncoderRef}
     kind::EncoderKind
     roots::Vector{Any}
     last_pipeline::Union{Nothing,MTLComputePipelineState}
@@ -115,6 +129,11 @@ mutable struct BatchedCommandQueue
     # one adds residency sets to the buffer, and Metal aborts the process past 32 —
     # see `joingraph!`.
     graphs::Vector{UInt}
+    # How many command buffers `defer_cleanup!` has taken, which numbers them; see
+    # `PendingCommand`.
+    ncommitted::Int
+    # Whether this queue is in `batched_queues`. Under `batched_queues_lock`.
+    registered::Bool
 end
 
 function BatchedCommandQueue(queue::MTLCommandQueue)
@@ -122,7 +141,8 @@ function BatchedCommandQueue(queue::MTLCommandQueue)
     can_use_residency_sets(dev) && install_queue_residency!(queue, dev)
     BatchedCommandQueue(queue, dev, current_task(), nothing, nothing, NoEncoder,
                         Any[], nothing, 0, 0, Any[], PendingCommand[],
-                        Vector{Any}[], true, command_batching_inflight(), UInt[])
+                        Vector{Any}[], true, command_batching_inflight(), UInt[],
+                        0, false)
 end
 
 
@@ -139,7 +159,12 @@ end
     return setproperty!(getfield(bq, :queue), name, value)
 end
 
-const batched_queues = IdDict{BatchedCommandQueue,Nothing}()
+# The queues with an open batch or work in flight. A vector and a flag on the queue
+# rather than an `IdDict`: a queue that opens a batch and drains it once a frame
+# joins and leaves this set every frame, and an `IdDict` leaves a tombstone per
+# removal and rehashes into a fresh table every 24 of them. Swap-removal from a
+# vector that keeps its capacity allocates nothing, and the set is a handful long.
+const batched_queues = BatchedCommandQueue[]
 const batched_queues_lock = ReentrantLock()
 
 @inline batched_queue_key(queue::MTLCommandQueue) =
@@ -147,7 +172,10 @@ const batched_queues_lock = ReentrantLock()
 
 function register_queue!(bq::BatchedCommandQueue)
     Base.@lock batched_queues_lock begin
-        batched_queues[bq] = nothing
+        if !bq.registered
+            push!(batched_queues, bq)
+            bq.registered = true
+        end
     end
     return
 end
@@ -155,15 +183,21 @@ end
 function unregister_queue_if_idle!(bq::BatchedCommandQueue)
     (bq.cmdbuf === nothing && isempty(bq.cleanups)) || return
     Base.@lock batched_queues_lock begin
-        if bq.cmdbuf === nothing && isempty(bq.cleanups)
-            delete!(batched_queues, bq)
+        if bq.registered && bq.cmdbuf === nothing && isempty(bq.cleanups)
+            for i in eachindex(batched_queues)
+                batched_queues[i] === bq || continue
+                batched_queues[i] = batched_queues[end]
+                pop!(batched_queues)
+                break
+            end
+            bq.registered = false
         end
     end
     return
 end
 
 function active_batched_queues()
-    Base.@lock batched_queues_lock collect(keys(batched_queues))
+    Base.@lock batched_queues_lock copy(batched_queues)
 end
 
 has_active_batched_queues() =
@@ -178,11 +212,19 @@ const submission_lock = ReentrantLock()
 # batched queues whose owning task has finished, but that still have an open batch or
 # in-flight work. nobody else will ever flush or synchronize these, so `synchronize`
 # adopts them.
-
+#
+# Never the ADOPTED queue. It is every task's (see `adopt_queue!`), so the task that
+# happened to create it finishing leaves nothing behind that the next `synchronize`
+# would not reach anyway: that call resolves to the adopted queue as its own. Counted
+# as an orphan as well, it was committed, waited for and drained twice per
+# synchronization, and the orphan bookkeeping allocated each time. Measured in a
+# session that evaluates every input on a task of its own, where the Mantle device
+# was made by an earlier input: 192 of the 603 bytes a `run!`/`waitfor!` cycle cost.
 function orphaned_batched_queues()
     Base.@lock batched_queues_lock begin
         bqs = nothing
-        for bq in keys(batched_queues)
+        for bq in batched_queues
+            bq === adopted_queue[] && continue
             istaskdone(bq.owner) || continue
             bqs === nothing && (bqs = BatchedCommandQueue[])
             push!(bqs, bq)
@@ -314,15 +356,25 @@ function MTL.startCapture(bq::BatchedCommandQueue,
     return MTL.startCapture(bq.queue, destination; folder)
 end
 
+"""
+    ensure_cmdbuf!(bq) -> MTL.MTLCommandBufferRef
+
+The open batch's command buffer, opened if there is none.
+
+Unmanaged, and BORROWED by the caller: the batch holds the one reference and gives it
+up when the batch is committed. A caller that keeps the command buffer past that —
+to read its timestamps later, say — takes a managed wrapper of its own with
+`MTL.retained`.
+"""
 function ensure_cmdbuf!(bq::BatchedCommandQueue)
     cmdbuf = bq.cmdbuf
     if cmdbuf === nothing
-        cmdbuf = MTLCommandBuffer(bq.queue)
+        cmdbuf = MTL.MTLCommandBufferRef(bq.queue)
         @label! cmdbuf "MTLCommandBuffer(batched queue)"
         bq.cmdbuf = cmdbuf
         register_queue!(bq)
     end
-    return cmdbuf::MTLCommandBuffer
+    return cmdbuf
 end
 
 function end_encoder!(bq::BatchedCommandQueue)
@@ -448,13 +500,16 @@ function orderedqueue(dev::MTLDevice = device())
     return q
 end
 
+# The open encoder of the kind asked for, opened if needed. Borrowed, like the
+# command buffer `ensure_cmdbuf!` returns: the batch holds its reference until
+# `end_encoder!`.
 function compute_encoder(bq::BatchedCommandQueue)
     if bq.kind == ComputeEncoder
-        return bq.encoder::MTLComputeCommandEncoder
+        return bq.encoder::MTL.MTLComputeCommandEncoderRef
     end
 
     end_encoder!(bq)
-    enc = MTLComputeCommandEncoder(ensure_cmdbuf!(bq))
+    enc = MTL.MTLComputeCommandEncoderRef(ensure_cmdbuf!(bq))
     bq.encoder = enc
     bq.kind = ComputeEncoder
     return enc
@@ -462,17 +517,17 @@ end
 
 function blit_encoder(bq::BatchedCommandQueue)
     if bq.kind == BlitEncoder
-        return bq.encoder::MTLBlitCommandEncoder
+        return bq.encoder::MTL.MTLBlitCommandEncoderRef
     end
 
     end_encoder!(bq)
-    enc = MTLBlitCommandEncoder(ensure_cmdbuf!(bq))
+    enc = MTL.MTLBlitCommandEncoderRef(ensure_cmdbuf!(bq))
     bq.encoder = enc
     bq.kind = BlitEncoder
     return enc
 end
 
-function set_pipeline!(bq::BatchedCommandQueue, cce::MTLComputeCommandEncoder,
+function set_pipeline!(bq::BatchedCommandQueue, cce::MTL.MTLComputeCommandEncoderLike,
                        pipeline::MTLComputePipelineState)
     if bq.last_pipeline !== pipeline
         MTL.set_function!(cce, pipeline)
@@ -531,10 +586,16 @@ function register_operations!(bq::BatchedCommandQueue, cmdbuf)
     return
 end
 
+# Keep `cmdbuf` alive, and `roots` with it, until the command buffer has run. The
+# record takes a reference of its own, so a caller passing a managed wrapper may
+# drop it, and the batch's own commit gives up the batch's reference right after.
 function defer_cleanup!(bq::BatchedCommandQueue, cmdbuf::MTL.MTLCommandBufferLike,
                         roots::Vector{Any})
+    ref = MTL.MTLCommandBufferRef(cmdbuf)
     Base.@lock submission_lock begin
-        push!(bq.cleanups, PendingCommand(cmdbuf, roots))
+        retain(ref)
+        bq.ncommitted += 1
+        push!(bq.cleanups, PendingCommand(ref, roots, bq.ncommitted))
         register_queue!(bq)
     end
     return
@@ -543,26 +604,20 @@ end
 defer_cleanup!(queue, cmdbuf::MTL.MTLCommandBufferLike, roots::Vector{Any}) =
     defer_cleanup!(batched_queue(queue), cmdbuf, roots)
 
-# A barrier that returns a `Bool`. `PendingCommand.cmdbuf` is the abstract
-# `MTLCommandBufferLike`, so reading `.status` inline dispatched dynamically and
-# boxed the enum it returned: 40 B for every command buffer that retired, which
-# made a frame's allocations depend on how many happened to finish during it.
-# `true` and `false` are singletons, so the same dynamic call returns without
-# allocating.
-completed(cmdbuf) = cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
+# `PendingCommand.cmdbuf` was the abstract `MTLCommandBufferLike`, and reading
+# `.status` off it inline dispatched dynamically and boxed the enum it returned: 40 B
+# for every command buffer that retired, which made a frame's allocations depend on
+# how many happened to finish during it. The field is concrete now, so this is a
+# typed message send.
+completed(cmdbuf) = MTL.completed(cmdbuf)
 
-# release the roots of completed command buffers. `until` treats the entries up to and
-# including it as completed, e.g., because a command buffer committed later has completed.
-function drain_cleanups!(bq::BatchedCommandQueue;
-                         until::Union{Nothing,PendingCommand}=nothing)
+# release the roots of completed command buffers. `until` treats the entries numbered
+# up to it as completed, e.g., because a command buffer committed later has completed.
+function drain_cleanups!(bq::BatchedCommandQueue; until::Int=0)
     Base.@lock submission_lock begin
-        nforced = until === nothing ? 0 :
-                  something(findfirst(cleanup -> cleanup === until, bq.cleanups), 0)
         n = 0
         for cleanup in bq.cleanups
-            if !(n < nforced || completed(cleanup.cmdbuf))
-                break
-            end
+            cleanup.seq <= until || completed(cleanup.cmdbuf) || break
             n += 1
         end
         n == 0 && return
@@ -571,7 +626,9 @@ function drain_cleanups!(bq::BatchedCommandQueue;
         # fresh vector purely to iterate it, which is an allocation a frame for a
         # list that is about to be deleted anyway.
         for i in 1:n
-            recycle_roots!(bq, bq.cleanups[i].roots)
+            cleanup = bq.cleanups[i]
+            recycle_roots!(bq, cleanup.roots)
+            release(cleanup.cmdbuf)
         end
         deleteat!(bq.cleanups, 1:n)
 
@@ -627,9 +684,17 @@ function limit_inflight!(bq::BatchedCommandQueue)
         cmdbuf = Base.@lock submission_lock begin
             drain_cleanups!(bq)
             pending_cleanup_count(bq) < bq.inflight && return
-            first(bq.cleanups).cmdbuf
+            # A reference of our own for the wait, which is outside the lock: another
+            # task may retire this record meanwhile and give back the record's.
+            c = first(bq.cleanups).cmdbuf
+            retain(c)
+            c
         end
-        wait_cmdbuf!(cmdbuf)
+        try
+            wait_cmdbuf!(cmdbuf)
+        finally
+            release(cmdbuf)
+        end
     end
 end
 
@@ -667,6 +732,7 @@ function discard_open_cmdbuf!(bq::BatchedCommandQueue, cmdbuf)
     # hand them back. Straight into the pool.
     recycle_roots!(bq, bq.roots)
     reset_open_cmdbuf!(bq, cmdbuf)
+    # The batch's reference, and the only one: nothing else ever saw this buffer.
     release(cmdbuf)
     return
 end
@@ -698,6 +764,9 @@ function adopt_continued!(bq::BatchedCommandQueue, old, new)
         bq.encoder === nothing || error(
             "adopt_continued!: an encoder is still open on a command buffer the library " *
             "has committed. End it before handing the buffer over.")
+        open = bq.cmdbuf
+        (open !== nothing && pointer(open) == pointer(old)) || error(
+            "adopt_continued!: the committed command buffer is not this batch's open one.")
         register_operations!(bq, old)
         roots = bq.roots
         # Already committed, by the library. Only the bookkeeping the commit would have
@@ -707,7 +776,12 @@ function adopt_continued!(bq::BatchedCommandQueue, old, new)
         hook === nothing || hook(old)
         defer_cleanup!(bq, old, roots)
         reset_open_cmdbuf!(bq, old)
-        bq.cmdbuf = new
+        # The old buffer's records hold their own references now, so the batch gives
+        # its own back — and takes one on the continuation, which MPS made and owns.
+        release(open)
+        cont = MTL.MTLCommandBufferRef(new)
+        retain(cont)
+        bq.cmdbuf = cont
         register_queue!(bq)
     end
     # waits for the GPU, so not with the lock held
@@ -733,6 +807,9 @@ function commit_batch!(bq::BatchedCommandQueue)
         MTL.commit_with_queue_key!(cmdbuf, pointer(bq.queue))
         defer_cleanup!(bq, cmdbuf, roots)
         reset_open_cmdbuf!(bq, cmdbuf)
+        # The batch's reference. The queue's submission record and the pending
+        # cleanup took theirs above, and Metal holds the buffer while it runs.
+        release(cmdbuf)
     end
     return
 end

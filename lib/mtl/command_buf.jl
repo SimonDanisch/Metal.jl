@@ -36,6 +36,97 @@ function MTLCommandBuffer(f::Base.Callable, queue::MTLCommandQueue,
     return cmdbuf
 end
 
+@objcwrapper managed = false MTLCommandBufferRef <: MTLCommandBuffer
+
+@doc """
+    MTLCommandBufferRef
+
+An `MTLCommandBuffer` whose reference count is kept BY HAND: an `isbits` wrapper
+around the object pointer that never retains or releases anything on its own.
+
+What it exists for is the command buffer a submission path opens per submission.
+The managed `MTLCommandBuffer` is a mutable struct with a release finalizer, so
+every one is a Julia heap allocation, and a renderer that submits one command
+buffer a frame paid 32 bytes a frame for it, and 32 more for its encoder
+(`MTLComputeCommandEncoderRef`). A frame loop that must not allocate cannot be
+built on top of that. This wrapper is a pointer, stored inline wherever it is
+stored, and costs nothing to create or to hand around.
+
+The price is that Julia's GC no longer keeps the object alive, so the rule is
+the Objective-C one, applied by every place that stores one: ONE `retain` per
+stored reference, ONE `release` when that reference is dropped. A reference held
+only for the duration of a call, while something else is known to hold one, needs
+neither — which is what [`MTLCommandBufferRef(cmdbuf)`](@ref) is for.
+
+Every method written against `MTLCommandBufferLike` takes one, and its properties
+are the command buffer's: the wrapper is declared as a Julia subtype only so that
+the Objective-C class hierarchy (and with it the property chain) is the same.
+""" MTLCommandBufferRef
+
+"""
+    MTLCommandBufferRef(cmdbuf::MTLCommandBufferLike) -> MTLCommandBufferRef
+
+The same command buffer, unmanaged. Takes NO reference: it is valid for as long as
+`cmdbuf` keeps the object alive, and whoever stores it has to `retain` it.
+"""
+MTLCommandBufferRef(cmdbuf::MTLCommandBufferLike) =
+    reinterpret(MTLCommandBufferRef, pointer(cmdbuf))
+MTLCommandBufferRef(cmdbuf::MTLCommandBufferRef) = cmdbuf
+
+"""
+    MTLCommandBufferRef(queue::MTLCommandQueue) -> MTLCommandBufferRef
+
+A NEW command buffer on `queue`, with one reference that belongs to the caller, who
+gives it back with `release`. The unmanaged counterpart of `MTLCommandBuffer(queue)`.
+"""
+MTLCommandBufferRef(queue::MTLCommandQueue) =
+    retain_autoreleased(MTLCommandBufferRef) do
+        @objc [queue::id{MTLCommandQueue} commandBuffer]::id{MTLCommandBufferRef}
+    end
+
+"""
+    retain_autoreleased(T, f) -> T
+
+Call `f`, which returns an AUTORELEASED object (a `+0` result, which is what every
+Metal factory method that is not `new...` returns), and keep it: the object
+retained once more, as an unmanaged `T` whose reference belongs to the caller.
+
+Inside an autorelease pool of its own, and that is not a formality. An autoreleased
+object holds a second reference that only goes away when the innermost pool is
+drained, and a thread with no pool open puts it in an implicit one that is never
+drained. Measured on an M5: a command buffer `MTLCommandBuffer(queue)` made outside
+any pool still had a retain count of 2 after it completed and every Julia reference
+to it had been released — Mantle's replay opened one per frame that way, and its
+encoder, and leaked both. Pushing and popping a pool is two thread-local pointer
+operations and takes no lock, unlike `@autoreleasepool`; it is safe here because
+nothing between the two can switch tasks, so the pop runs on the thread the push
+did.
+"""
+@inline function retain_autoreleased(f::F, ::Type{T}) where {F,T}
+    pool = ccall(:objc_autoreleasePoolPush, Ptr{Cvoid}, ())
+    try
+        obj = T(f())
+        retain(obj)
+        return obj
+    finally
+        ccall(:objc_autoreleasePoolPop, Cvoid, (Ptr{Cvoid},), pool)
+    end
+end
+
+"""
+    retained(cmdbuf::MTLCommandBufferLike) -> MTLCommandBuffer
+
+A MANAGED wrapper of `cmdbuf` that holds a reference of its own, released by its
+finalizer — for code that keeps a command buffer it was handed as an
+`MTLCommandBufferRef` (a profiler collecting them, say) and does not count
+references itself. Allocates, so not for a per-submission path.
+"""
+retained(cmdbuf::MTLCommandBufferRef) = retain(MTLCommandBuffer, pointer(cmdbuf))
+retained(cmdbuf::MTLCommandBufferLike) = cmdbuf
+
+"""Whether `cmdbuf` has run to the end, successfully or not."""
+completed(cmdbuf::MTLCommandBufferLike) = cmdbuf.status >= MTLCommandBufferStatusCompleted
+
 """
     enqueue!(cmdbuf::MTLCommandBuffer)
 
@@ -49,7 +140,7 @@ into the command buffers and those threads can complete in any order.
 [enqueue](https://developer.apple.com/documentation/metal/mtlcommandbuffer/1443019-enqueue?language=objc)
 """
 function enqueue!(cmdbuf::MTLCommandBufferLike)
-    cmdbuf.status in [MTLCommandBufferStatusCompleted, MTLCommandBufferStatusEnqueued] &&
+    cmdbuf.status in (MTLCommandBufferStatusCompleted, MTLCommandBufferStatusEnqueued) &&
         error("Cannot enqueue an already enqueued command buffer")
     submit(cmdbuf) do
         @objc [cmdbuf::id{MTLCommandBuffer} enqueue]::Nothing
@@ -57,7 +148,6 @@ function enqueue!(cmdbuf::MTLCommandBufferLike)
 end
 
 const last_committed_lock = ReentrantLock()
-const last_committed_per_queue = Dict{id{MTLCommandQueue}, MTLCommandBufferLike}()
 
 struct CommandBufferErrorInfo
     domain::String
@@ -93,12 +183,36 @@ function Base.showerror(io::IO, exc::CommandBufferError)
     end
 end
 
+"""
+What one queue has committed and synchronization has not yet accounted for.
+
+ONE record per queue for the life of the process, updated in place. It used to be
+taken out of the table by every `synchronize` and made again by the next commit,
+which is a struct, a vector and its memory per frame for a renderer that commits and
+waits once a frame; and its entries were `MTLCommandBufferLike`, an abstract type,
+so reading a status off one was a dynamic call that boxed the enum it returned.
+
+The command buffers are `MTLCommandBufferRef`s, and each place one is stored here
+holds a reference of its own: one per entry of `pending`, one for `last`. Without
+those, an entry whose batch had already retired it would be a dangling pointer the
+next prune reads a status from.
+"""
 mutable struct QueueSubmissionState
-    pending::Vector{MTLCommandBufferLike}
+    # Committed and not yet seen to complete, in commit order.
+    pending::Vector{MTLCommandBufferRef}
+    # Diagnostics of failures that completed but no synchronization has reported yet.
     errors::Union{Nothing,Vector{CommandBufferErrorInfo}}
+    # The newest commit: the queue runs in order, so waiting for it waits for all.
+    last::Union{Nothing,MTLCommandBufferRef}
+    # How many command buffers were ever recorded, and how many of those have been
+    # pruned. A synchronization notes the first before it waits and checks the second
+    # against it afterwards, which is what "everything committed before I started has
+    # finished" means when other tasks keep committing in the meantime.
+    committed::Int
+    retired::Int
 end
 
-QueueSubmissionState() = QueueSubmissionState(MTLCommandBufferLike[], nothing)
+QueueSubmissionState() = QueueSubmissionState(MTLCommandBufferRef[], nothing, nothing, 0, 0)
 
 const submission_state_per_queue = Dict{id{MTLCommandQueue},QueueSubmissionState}()
 
@@ -119,8 +233,11 @@ function _object_label(obj)
 end
 
 # Keep this state-accounting primitive independent from Objective-C objects so its
-# ordering and pruning semantics can be tested deterministically.
-function _prune_completed_submissions!(pending, errors, is_completed, error_info)
+# ordering and pruning semantics can be tested deterministically. `retire` is called
+# on every pruned entry after its diagnostics have been read, which is where a
+# reference-counted entry gives its reference back.
+function _prune_completed_submissions!(pending, errors, is_completed, error_info,
+                                       retire=Returns(nothing))
     n = 0
     for submission in pending
         is_completed(submission) || break
@@ -132,60 +249,134 @@ function _prune_completed_submissions!(pending, errors, is_completed, error_info
                 push!(errors, info)
             end
         end
+        retire(submission)
         n += 1
     end
     n == 0 || deleteat!(pending, 1:n)
     return errors
 end
 
+failure_info(cmdbuf::MTLCommandBufferRef) =
+    cmdbuf.status == MTLCommandBufferStatusError ? command_buffer_error_info(cmdbuf) :
+                                                   nothing
+
+# `last_committed_lock` held.
 function prune_completed_submissions!(state::QueueSubmissionState)
-    state.errors = _prune_completed_submissions!(
-        state.pending, state.errors,
-        cmdbuf -> cmdbuf.status >= MTLCommandBufferStatusCompleted,
-        cmdbuf -> cmdbuf.status == MTLCommandBufferStatusError ?
-                  command_buffer_error_info(cmdbuf) : nothing)
+    before = length(state.pending)
+    state.errors = _prune_completed_submissions!(state.pending, state.errors,
+                                                 completed, failure_info, release)
+    state.retired += before - length(state.pending)
     return
 end
 
 function record_committed!(cmdbuf::MTLCommandBufferLike, key::id{MTLCommandQueue})
+    ref = MTLCommandBufferRef(cmdbuf)
     @lock last_committed_lock begin
-        state = get!(submission_state_per_queue, key) do
-            QueueSubmissionState()
-        end
+        state = get!(QueueSubmissionState, submission_state_per_queue, key)
         # Completed successes can be forgotten immediately. Completed failures are
         # reduced to diagnostics, so command-buffer retention stays bounded during
         # long-running submission workloads without explicit synchronization.
         prune_completed_submissions!(state)
-        push!(state.pending, cmdbuf)
-        last_committed_per_queue[key] = cmdbuf
+        # Two references, because it is stored twice: `pending` gives its own back
+        # when the prune reaches it, `last` when the next commit replaces it.
+        retain(ref)
+        push!(state.pending, ref)
+        retain(ref)
+        previous = state.last
+        state.last = ref
+        previous === nothing || release(previous)
+        state.committed += 1
     end
     return
 end
 
-function take_queue_submissions(queue::MTLCommandQueue)
+"""
+What a synchronization waits for on one queue: the newest command buffer committed
+to it, or `nothing`, and how many command buffers had been committed to it by then.
+
+A struct and not a tuple, and that is the whole reason it exists: a tuple holding a
+`Union` is an abstract type, so returning `(last, committed)` boxed the tuple and both
+of its elements — 56 bytes on every `synchronize`. A struct with a `Union` field is
+concrete, and comes back without a heap allocation.
+"""
+struct SyncPoint
+    queue::id{MTLCommandQueue}
+    last::Union{Nothing,MTLCommandBufferRef}
+    committed::Int
+end
+
+"""
+    sync_point(queue) -> SyncPoint
+
+Where a synchronization of `queue` has to get to.
+
+`last` comes with a reference of its own that belongs to the CALLER, who releases it
+once the wait is over. It has to: the wait happens without any lock held, and a
+commit on another task replaces `last` meanwhile and gives back the table's
+reference, which may have been the only one left.
+"""
+function sync_point(queue::MTLCommandQueue)
     key = pointer(queue)
     @lock last_committed_lock begin
-        last = get(last_committed_per_queue, key, nothing)
-        state = pop!(submission_state_per_queue, key, nothing)
-        return last, state
+        state = get(submission_state_per_queue, key, nothing)
+        state === nothing && return SyncPoint(key, nothing, 0)
+        return sync_point(key, state)
     end
 end
 
-function take_all_submissions()
+# `last_committed_lock` held.
+function sync_point(key::id{MTLCommandQueue}, state::QueueSubmissionState)
+    last = state.last
+    last === nothing || retain(last)
+    return SyncPoint(key, last, state.committed)
+end
+
+"""
+    sync_points() -> Vector{SyncPoint}
+
+`sync_point` of every queue that has committed anything, for a device-wide
+synchronization. Each `last` is the caller's to release.
+"""
+function sync_points()
     @lock last_committed_lock begin
-        last = collect(values(last_committed_per_queue))
-        states = isempty(submission_state_per_queue) ? nothing :
-                 collect(values(submission_state_per_queue))
-        empty!(submission_state_per_queue)
-        return last, states
+        return SyncPoint[sync_point(key, state) for (key, state) in submission_state_per_queue]
     end
 end
 
-function finish_submissions!(state::QueueSubmissionState)
-    prune_completed_submissions!(state)
-    isempty(state.pending) ||
-        error("Command buffer did not reach a terminal state after queue synchronization")
-    return state.errors
+"""
+    finish_submissions!(point::SyncPoint) -> errors
+
+Account for a synchronization that has waited for `point`, and claim the failures
+nobody has reported yet on its queue: the diagnostics, or `nothing`. The queue runs in
+order, so after that wait every command buffer the point covers has to be done; one
+that is not is an error here rather than a silent gap in the error report.
+"""
+function finish_submissions!(point::SyncPoint)
+    @lock last_committed_lock begin
+        state = get(submission_state_per_queue, point.queue, nothing)
+        state === nothing && return nothing
+        prune_completed_submissions!(state)
+        state.retired >= point.committed ||
+            error("Command buffer did not reach a terminal state after queue synchronization")
+        errors = state.errors
+        state.errors = nothing
+        return errors
+    end
+end
+
+"""
+    all_completed(queue) -> Bool
+
+Whether every command buffer committed to `queue` so far has completed — what
+`last_committed(queue).status` answers, without making a wrapper to read it from.
+"""
+function all_completed(queue::MTLCommandQueue)
+    @lock last_committed_lock begin
+        state = get(submission_state_per_queue, pointer(queue), nothing)
+        state === nothing && return true
+        last = state.last
+        return last === nothing || completed(last)
+    end
 end
 
 function pending_submission_count(queue::MTLCommandQueue)
@@ -213,35 +404,39 @@ const profile_metadata = Ref{Any}(nothing)
 
 struct ProfileCollector
     lock::ReentrantLock
-    metadata::IdDict{Any,Vector{Any}}
+    # Keyed by the command buffer's ADDRESS, not by the wrapper: a batch's command
+    # buffer is an `MTLCommandBufferRef` when its operations are noted and may be
+    # another wrapper of the same object by the time it is read. Every command buffer
+    # noted here is committed right after and kept alive by `records`, so an address
+    # is not reused while the collector holds it.
+    metadata::Dict{UInt,Vector{Any}}
     records::Vector{Tuple{String,Any}}
 end
 
-ProfileCollector() = ProfileCollector(ReentrantLock(), IdDict{Any,Vector{Any}}(),
+ProfileCollector() = ProfileCollector(ReentrantLock(), Dict{UInt,Vector{Any}}(),
                                       Tuple{String,Any}[])
 
 @inline function note_operation!(collector::ProfileCollector, cmdbuf::MTLCommandBufferLike, op)
     @lock collector.lock begin
-        ops = get(collector.metadata, cmdbuf, nothing)
-        if ops === nothing
-            ops = Any[]
-            collector.metadata[cmdbuf] = ops
-        end
+        ops = get!(Vector{Any}, collector.metadata, UInt(pointer(cmdbuf)))
         push!(ops, op)
     end
     return
 end
 
 """
-    last_committed(queue::MTLCommandQueue)::Union{MTLCommandBufferLike, Nothing}
+    last_committed(queue::MTLCommandQueue)::Union{MTLCommandBuffer, Nothing}
 
 Return the most recently committed command buffer on `queue`, or `nothing` if
-nothing has been committed.
+nothing has been committed. A managed wrapper with a reference of its own, so it
+allocates; [`all_completed`](@ref) asks the common question without one.
 """
 function last_committed(queue::MTLCommandQueue)
-    key = pointer(queue)
     @lock last_committed_lock begin
-        get(last_committed_per_queue, key, nothing)
+        state = get(submission_state_per_queue, pointer(queue), nothing)
+        state === nothing && return nothing
+        last = state.last
+        return last === nothing ? nothing : retained(last)
     end
 end
 
@@ -258,7 +453,7 @@ function commit!(cmdbuf::MTLCommandBufferLike, queue::MTLCommandQueue)
 end
 
 function commit_with_queue_key!(cmdbuf::MTLCommandBufferLike, key::id{MTLCommandQueue})
-    cmdbuf.status in [MTLCommandBufferStatusCompleted, MTLCommandBufferStatusCommitted] &&
+    cmdbuf.status in (MTLCommandBufferStatusCompleted, MTLCommandBufferStatusCommitted) &&
         error("Cannot commit an already committed/completed command buffer")
     @objc [cmdbuf::id{MTLCommandBuffer} commit]::Nothing
     # Record every submission for error accounting. The most recent buffer remains
