@@ -461,6 +461,12 @@ end
 # eltypes the tensor path handles (uniform in/out); these have `__tensorops` run helpers and
 # accumulate to a sensible precision in matmul2d.
 @inline gemm_tensor_eltype(::Type{T}, ::Type{T}, ::Type{T}) where {T <: Union{Float16, Float32, BFloat16}} = true
+# A half product landing in single. Both tensor bodies accumulate in a Float32
+# threadgroup tile and convert only at the store, so the destination's type is the
+# store's business and the product is the same one. Without this, fp16 operands
+# with an fp32 destination fell to the SIMD kernel: 0.6 TFLOP/s on an M5 at
+# 17408x512x5120, where this path runs the same product at 11.
+@inline gemm_tensor_eltype(::Type{T}, ::Type{T}, ::Type{Float32}) where {T <: Union{Float16, BFloat16}} = true
 @inline gemm_tensor_eltype(::Type, ::Type, ::Type) = false
 
 # `tensor_ops` runs only when the device advertises the Metal 4 family; gating the launch on

@@ -341,6 +341,20 @@ end
                 @test isapprox(Array(Ct), ref; rtol=ttol(T))
             end
 
+            # A half product into a single destination keeps the Float32 accumulator all
+            # the way out. It used to fall to the SIMD kernel, 19x slower on an M5 at
+            # 17408x512x5120, because the gate asked for one element type throughout.
+            @testset "$T into Float32" for T in (Float16, BFloat16)
+                M, N, K = 128, 256, 512
+                A = MtlArray(rand(T, M, K)); B = MtlArray(rand(T, K, N))
+                C = MtlArray(fill(NaN32, M, N))
+                @test Metal.gemm_kernel_config(C, A, B).kernel === Metal.gemm_tensor_kernel!
+                @test Metal.supports_tensor_matmul(C, A, B, 'N', 'N', true, false)
+                @with (Metal.matmul_alg => :tensor) mul!(C, A, B)
+                ref = Float32.(Array(A)) * Float32.(Array(B))
+                @test maximum(abs, Array(C) .- ref) / maximum(abs, ref) < 1.0f-5
+            end
+
             # Recorded DNN plans fold a row bias into the tensor dispatch.  Exercise the
             # entry point directly so its post-matmul device-memory barrier and indexing
             # are covered independently of Mantle.
