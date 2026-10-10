@@ -12,7 +12,7 @@ import Base.FastMath
 # `@device_override` here (the transcendentals) and the ones whose AIR intrinsic is emitted by
 # GPUCompiler rather than Metal.jl — `sqrt`/`fma`/`floor`/`ceil`/`trunc`/`round`, `abs`,
 # integer `min`/`max`, the 3-argument `min`/`max` fused to `air.min3`/`air.max3`, the bit
-# intrinsics, and the NaN-propagating float `min`/`max` — so a back-end change that stops
+# intrinsics, and the float `min`/`max` (minNum, `air.fmin`) — so a back-end change that stops
 # emitting them is caught here instead of silently regressing performance.
 #
 # The operations handled by a front-end `@device_override` emit their `air.*` intrinsic
@@ -226,7 +226,7 @@ end
     end
 end
 
-# NaN-propagating float min/max are lowered to air.fmin/air.fmax by GPUCompiler.
+# Float min/max are minNum/maxNum: the `air.fmin`/`air.fmax` overlays in `math.jl`.
 @testset "float $name $T" for T in (Float32, Float16), (fn, name) in ((min, "fmin"), (max, "fmax"))
     @eval @test @filecheck begin
         @check $("@air.$name.f$(8*sizeof(T))")
@@ -738,10 +738,10 @@ end
 end
 
 # Ops whose Metal intrinsic has IEEE edge-case behavior that differs from Julia's: Metal's
-# `sign` returns 0 for NaN (Julia returns NaN), `air.fmin`/`air.fmax` are non-NaN-propagating
-# (Julia's min/max propagate NaN), and `air.round` rounds half away from zero (Julia rounds
-# half to even). Metal.jl deliberately routes these through Base / a NaN-correcting back-end
-# lowering instead of the raw intrinsic, so the GPU result should match the host. Compare
+# `sign` returns 0 for NaN (Julia returns NaN) and `air.round` rounds half away from zero
+# (Julia rounds half to even). Metal.jl deliberately routes these through Base / a
+# NaN-correcting back-end lowering instead of the raw intrinsic, so the GPU result should
+# match the host. `min`/`max` are the exception, checked against minNum below. Compare
 # against Julia's own result over NaN/±Inf/±0/tie inputs using `isequal` (NaN == NaN, and
 # -0.0 != +0.0) rather than hard-coding the expected values, so a regression to the raw-
 # intrinsic semantics is caught without baking that behavior into the test.
@@ -760,10 +760,15 @@ end
         @test isequal(Array(o), sign.(x))
     end
 
-    # min/max: NaN in either operand, both signed zeros, and ±Inf
+    # min/max are the exception: IEEE minNum/maxNum, as every other GPU backend lowers
+    # them (see `src/device/intrinsics/math.jl`). A NaN loses to a number, two NaNs give
+    # NaN; the sign of a zero picked from (0, -0) is not specified, so either is accepted.
+    # NaN in either operand, both signed zeros, and ±Inf.
     xs = T[NaN, NaN, T(0),    T(-0.0), Inf,  -Inf, T(1), NaN,  T(-0.0)]
     ys = T[T(1), NaN, T(-0.0), T(0),   T(1), T(1), NaN,  -Inf, T(0)]
-    @testset "$op" for op in (min, max)
+    minnum(x, y) = isnan(x) ? y : isnan(y) ? x : min(x, y)
+    maxnum(x, y) = isnan(x) ? y : isnan(y) ? x : max(x, y)
+    @testset "$op" for (op, ref) in ((min, minnum), (max, maxnum))
         dx, dy = MtlArray(xs), MtlArray(ys)
         function kernel(o, a, b)
             i = thread_position_in_grid().x
@@ -772,7 +777,16 @@ end
         end
         o = similar(dx)
         Metal.@sync @metal threads=length(xs) kernel(o, dx, dy)
-        @test isequal(Array(o), op.(xs, ys))
+        got, want = Array(o), ref.(xs, ys)
+        @test all(isequal(g, w) || (iszero(g) && iszero(w)) for (g, w) in zip(got, want))
+        # A literal NaN is not folded with the host's `min`, which would let it win.
+        function constkernel(o)
+            @inbounds o[1] = op(T(NaN), T(1))
+            return
+        end
+        c = MtlArray(T[0])
+        Metal.@sync @metal threads=1 constkernel(c)
+        @test Array(c) == T[1]
     end
 
     let # clamp
