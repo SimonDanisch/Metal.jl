@@ -781,7 +781,8 @@ end
         @test all(isequal(g, w) || (iszero(g) && iszero(w)) for (g, w) in zip(got, want))
         # A literal NaN is not folded with the host's `min`, which would let it win.
         function constkernel(o)
-            @inbounds o[1] = op(T(NaN), T(1))
+            E = eltype(o)
+            @inbounds o[1] = op(E(NaN), E(1))
             return
         end
         c = MtlArray(T[0])
