@@ -379,6 +379,20 @@ function all_completed(queue::MTLCommandQueue)
     end
 end
 
+"""
+    committed(queue) -> Int
+
+How many command buffers have been committed to `queue`: every `commit!` and
+`commit_with_queue_key!` counts one. Monotone, for asserting how many submissions
+a piece of code makes.
+"""
+function committed(queue::MTLCommandQueue)
+    @lock last_committed_lock begin
+        state = get(submission_state_per_queue, pointer(queue), nothing)
+        return state === nothing ? 0 : state.committed
+    end
+end
+
 function pending_submission_count(queue::MTLCommandQueue)
     key = pointer(queue)
     @lock last_committed_lock begin

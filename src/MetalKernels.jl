@@ -3,7 +3,8 @@ module MetalKernels
 using ..Metal
 using ..Metal: @device_override, DefaultStorageMode, SharedStorage, metal_support,
                mtlfunction, mtlconvert, try_launch, MTL, MTLSize, @autoreleasepool,
-               MTLSharedEvent, MTLCommandBuffer, encode_signal!, encode_wait!, commit!
+               MTLSharedEvent, MTLCommandBuffer, encode_signal!, encode_wait!, commit!,
+               BatchedCommandQueue
 
 import KernelInterface as KI
 
@@ -16,18 +17,27 @@ export MetalBackend
 
 """
     MetalBackend()
+    MetalBackend(queue::BatchedCommandQueue)
 
 The KernelInterface back end for running on Metal GPUs, which KernelAbstractions uses to
 launch `@kernel` kernels.
+
+Without a queue it launches on the current task's queue (`global_queue(device())`), and
+`synchronize` waits for that queue. With one, every launch goes to `queue` and
+`synchronize` waits for it: a second, independent stream of work on the same device. A
+buffer used on two queues is ordered by the ownership check every launch makes (see
+`try_launch`): the launch waits for the queue that still uses it.
 """
 struct MetalBackend <: KI.Backend
+    queue::Union{Nothing,BatchedCommandQueue}
 end
+MetalBackend() = MetalBackend(nothing)
 
 # Ensure type stability. See JuliaGPU/KernelAbstractions#634
 @inline KI.allocate(::MetalBackend, ::Type{T}, dims::Tuple; unified::Bool = false) where T = MtlArray{T, length(dims), unified ? SharedStorage : DefaultStorageMode}(undef, dims)
 
 KI.get_backend(::MtlArray) = MetalBackend()
-KI.synchronize(::MetalBackend) = synchronize()
+KI.synchronize(b::MetalBackend) = b.queue === nothing ? synchronize() : synchronize(b.queue)
 
 KI.functional(::MetalBackend) = Metal.functional()
 
@@ -112,6 +122,7 @@ function KI.launch(obj::KI.Kernel{MetalBackend}, groups::Dims{3}, items::Dims{3}
         throw(ArgumentError("Unsupported keyword argument `$(first(keys(kwargs)))`"))
     end
     gs, ts = MTLSize(groups), MTLSize(items)
+    queue === nothing && (queue = obj.backend.queue)
     while true
         conflict = try_launch(obj.kern, queue, gs, ts, args, submit)
         conflict === nothing && return
