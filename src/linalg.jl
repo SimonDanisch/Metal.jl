@@ -289,7 +289,9 @@ LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
 
     synchronize(cmdbuf)
 
-    status = convert(LinearAlgebra.BlasInt, status[]::MPS.MPSMatrixDecompositionStatus)
+    # One element, read after the synchronize above. A Shared array is host-visible
+    # but refuses element access outside `@allowscalar`, like every device array.
+    status = convert(LinearAlgebra.BlasInt, @allowscalar(status[])::MPS.MPSMatrixDecompositionStatus)
     check && checknonsingular(status)
 
     return LinearAlgebra.LU(B, p, status)
@@ -346,7 +348,7 @@ end
 
     synchronize(cmdbuf)
 
-    status = convert(LinearAlgebra.BlasInt, status[])
+    status = convert(LinearAlgebra.BlasInt, @allowscalar status[])
     check && check_lu_success(status, allowsingular)
 
     return LinearAlgebra.LU(A, p, status)

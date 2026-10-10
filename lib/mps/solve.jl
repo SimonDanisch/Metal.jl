@@ -179,7 +179,7 @@ end
 
     synchronize(cmdbuf)
 
-    info = convert(LinearAlgebra.BlasInt, status[])
+    info = convert(LinearAlgebra.BlasInt, GPUArrays.@allowscalar status[])
     check && checknonsingular(info)
     return X
 end
@@ -245,7 +245,7 @@ end
     commit!(cmdbuf)
     synchronize(cmdbuf)
 
-    info = convert(LinearAlgebra.BlasInt, status[])
+    info = convert(LinearAlgebra.BlasInt, GPUArrays.@allowscalar status[])
     return A, info
 end
 
@@ -335,7 +335,7 @@ end
 
     synchronize(cmdbuf)
 
-    info = convert(LinearAlgebra.BlasInt, status[])
+    info = convert(LinearAlgebra.BlasInt, GPUArrays.@allowscalar status[])
     check && checkpositivedefinite(info)
     return X
 end

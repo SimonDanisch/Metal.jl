@@ -557,10 +557,13 @@ end
     bls = rand(T, 8)
     dAls = MtlMatrix(Als)
     dbls = MtlVector(bls)
-    if Metal.DefaultStorageMode == Metal.PrivateStorage
-        @test_throws ErrorException dAls \ dbls
-    else
-        @test dAls \ dbls ≈ Als \ bls rtol=1f-4
+    # A non-square solve has no Metal kernel and falls back to LinearAlgebra's QR,
+    # which indexes element by element. That is refused for every storage mode, as
+    # it is for any device array, and works under `@allowscalar` where the memory
+    # is host-visible.
+    @test_throws ErrorException dAls \ dbls
+    if Metal.DefaultStorageMode == Metal.SharedStorage
+        @test (Metal.@allowscalar dAls \ dbls) ≈ Als \ bls rtol=1f-4
     end
 
     Ap = T[0 2 1; 1 1 0; 2 0 1]
