@@ -725,19 +725,23 @@ end
             error("""Metal $(metal) requires AIR $(air_floor(metal)) or newer; cannot target AIR $(air).""")
     end
     # Only Apple family values form the capability sequence used by device code.
-    if gpufamily === nothing
-        apple_family = default_apple_family(dev)
+    apple_family = if gpufamily === nothing
+        # `nothing` when neither the device nor a preference names an Apple family:
+        # GPUCompiler then applies the workarounds it keeps for GPUs it cannot tell apart.
+        MTL.highest_apple_family(dev) === nothing && target_gpufamily() === nothing ?
+            nothing : default_apple_family(dev)
     else
         gpufamily = convert(MTL.MTLGPUFamily, gpufamily)
-        apple_family = Int(gpufamily) - 1000
-        if !(1 <= apple_family <= 10)
+        family = Int(gpufamily) - 1000
+        if !(1 <= family <= 10)
             throw(ArgumentError("gpufamily must be an MTLGPUFamilyApple<n>, got $(gpufamily)"))
         end
+        family
     end
 
     # create GPUCompiler objects
-    target = MetalCompilerTarget(; macos, air, metal, kwargs...)
-    params = MetalCompilerParams(apple_family, stage)
+    target = MetalCompilerTarget(; macos, air, metal, apple_family, kwargs...)
+    params = MetalCompilerParams(something(apple_family, 0), stage)
     # `kernel = true` even for a graphics stage: that flag is what turns on the
     # address-space and argument-metadata work a stage also needs.
     CompilerConfig(target, params; kernel, name, always_inline, debug_level, opt_level)
@@ -874,7 +878,7 @@ end
 # Shared storage, written once, read-only on device. The buffer is not bound to the encoder as
 # an argument (only its address travels, inside the state), so each launch declares it
 # resident — same as the malloc and exception scratch buffers.
-@autoreleasepool function reloc_table_buffer(dev::MTLDevice,
+function reloc_table_buffer(dev::MTLDevice,
                                              relocations::GPUCompiler.Relocations)
     words = GPUCompiler.resolved_relocation_table(relocations)
     buf = MTLBuffer(dev, sizeof(words); storage=SharedStorage)
@@ -884,9 +888,9 @@ end
 end
 
 # link the metallib into a session-local pipeline state on the given device.
-@autoreleasepool function link_pipeline(dev::MTLDevice, air::Vector{UInt8},
-                                        metallib::Vector{UInt8}, entry::String;
-                                        indirect::Bool = false)
+function link_pipeline(dev::MTLDevice, air::Vector{UInt8},
+                       metallib::Vector{UInt8}, entry::String;
+                       indirect::Bool = false)
     @signpost_event log=log_compiler() "Link" entry
 
     @signpost_interval log=log_compiler() "Instantiate compute pipeline" begin

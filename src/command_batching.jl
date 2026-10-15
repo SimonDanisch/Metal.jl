@@ -297,16 +297,16 @@ function submit_command_buffer(f, cmdbuf)
 
     pending = pending_ownership()
     # creating a batched queue takes the autorelease pool lock, so do so before locking
-    !isempty(pending) && bq === nothing && (bq = batched_queue(queue))
+    owner = isempty(pending) || bq !== nothing ? bq : batched_queue(queue)
     while true
         conflict = Base.@lock submission_lock begin
             if isempty(pending)
                 f()
                 return
             end
-            i = findfirst(managed -> !can_take_ownership(managed, bq), pending)
+            i = findfirst(managed -> !can_take_ownership(managed, owner), pending)
             if i === nothing
-                foreach(managed -> take_ownership!(managed, bq), pending)
+                foreach(managed -> take_ownership!(managed, owner), pending)
                 empty!(pending)
                 f()
                 return
@@ -542,8 +542,14 @@ function note_operation!(bq::BatchedCommandQueue, op)
     return
 end
 
-function record_operation!(bq::BatchedCommandQueue, roots...; bytes::Integer=0, op=nothing)
-    append!(bq.roots, roots)
+# `roots` are pushed one by one: `append!`ing the tuple would compile `copyto!` for every
+# combination of root types, i.e., for every kernel signature.
+Base.@nospecializeinfer function record_operation!(bq::BatchedCommandQueue,
+                                                   @nospecialize(roots...);
+                                                   bytes::Integer=0, op=nothing)
+    for root in roots
+        push!(bq.roots, root)
+    end
     note_recorded!(bq, bytes, op)
     return
 end

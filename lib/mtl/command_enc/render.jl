@@ -30,10 +30,10 @@ function MTLRenderCommandEncoder(cmdbuf::MTLCommandBuffer, desc::MTLRenderPassDe
 end
 
 function MTLRenderPipelineState(dev::MTLDevice, desc::MTLRenderPipelineDescriptor)
-    err = Ref{id{NSError}}(nil)
+    err = Out{NSError}()
     state = @objc [dev::id{MTLDevice} newRenderPipelineStateWithDescriptor:desc::id{MTLRenderPipelineDescriptor}
-                   error:err::Ptr{id{NSError}}]::Union{Nothing,MTLRenderPipelineState}
-    state === nothing && throw_error(err[])
+                   error:err::Out{NSError}]::Union{Nothing,MTLRenderPipelineState}
+    state === nothing && throw_error(err)
     return state
 end
 
@@ -42,12 +42,12 @@ end
 # mesh stages have threadgroup sizes and a payload length that a vertex pipeline
 # has nowhere to put.
 function MTLRenderPipelineState(dev::MTLDevice, desc::MTLMeshRenderPipelineDescriptor)
-    err = Ref{id{NSError}}(nil)
+    err = Out{NSError}()
     state = @objc [dev::id{MTLDevice} newRenderPipelineStateWithMeshDescriptor:desc::id{MTLMeshRenderPipelineDescriptor}
                    options:MTLPipelineOptionNone::MTLPipelineOption
                    reflection:C_NULL::Ptr{Nothing}
-                   error:err::Ptr{id{NSError}}]::Union{Nothing,MTLRenderPipelineState}
-    state === nothing && throw_error(err[])
+                   error:err::Out{NSError}]::Union{Nothing,MTLRenderPipelineState}
+    state === nothing && throw_error(err)
     return state
 end
 

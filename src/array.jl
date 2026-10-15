@@ -245,6 +245,15 @@ Base.elsize(::Type{<:MtlArray{T}}) where {T} = sizeof(T)
 Base.size(x::MtlArray) = x.dims
 Base.sizeof(x::MtlArray) = Base.elsize(x) * length(x)
 
+
+## alias detection
+
+# GPUArrays implements `Base.dataids` and `Base.mightalias` from where an array lives,
+# identifying the buffer by its GPU address
+GPUArrays.memory_location(x::MtlArray) = (UInt(x.data[].buffer.gpuAddress), x.offset)
+
+Base.unaliascopy(x::MtlArray) = copy(x)
+
 @inline function Base.pointer(x::MtlArray{T}, i::Integer=1; storage=PrivateStorage) where {T}
     PT = if storage == PrivateStorage
         MtlPtr{T}
@@ -572,14 +581,6 @@ function GPUArrays.derive(::Type{T}, a::MtlArray{<:Any,<:Any,S}, dims::Dims{N}, 
     offset = a.offset + offset * sizeof(T)
     MtlArray{T,N,S}(a.data, dims; a.maxsize, offset)
 end
-
-# Where the elements are: the allocation, and the byte offset of the first element in it.
-# GPUArrays derives `mightalias`, `dataids` and its `SubArray` parent check from this, so
-# arrays alias where their byte ranges meet rather than wherever they share a buffer: two
-# parts of one buffer do not, an empty view aliases nothing, and strided views of the same
-# bytes are compared by index. The allocation is named by identity rather than by
-# `gpuAddress`, which is an Objective-C call, on a path every broadcast takes.
-GPUArrays.memory_location(a::MtlArray) = (UInt(objectid(a.data.rc)), a.offset)
 
 
 ## views

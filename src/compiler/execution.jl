@@ -290,12 +290,17 @@ The output of this function is automatically cached, i.e. you can simply call `m
 in a hot path without degrading performance. New code will be generated automatically when
 the function changes, or when different types or keyword arguments are provided.
 """
-function mtlfunction(f::F, tt::TT=Tuple{}; source=f, name=nothing, indirect::Bool=false,
-                     kwargs...) where {F,TT}
+function mtlfunction(f::F, tt::TT=Tuple{}; source::S=f, kwargs...) where {F,TT,S}
+    HostKernel{F,S,tt}(f, source, link_kernel(methodinstance(F, tt); kwargs...)...)
+end
+
+# Everything about creating a kernel object that doesn't depend on the kernel's type, kept
+# out of `mtlfunction`, which is compiled for every kernel.
+@noinline function link_kernel(mi::Core.MethodInstance; name=nothing, indirect::Bool=false,
+                               kwargs...)
     Base.@lock mtlfunction_lock begin
         dev = device()
         config = compiler_config(dev; name, kwargs...)::MetalCompilerConfig
-        mi = methodinstance(F, tt)
         job = CompilerJob(mi, config)
 
         res = compile_or_lookup(job)::MetalResults
@@ -350,12 +355,13 @@ function mtlfunction(f::F, tt::TT=Tuple{}; source=f, name=nothing, indirect::Boo
             end
         end
 
-        HostKernel{F,typeof(source),tt}(f, source, pipeline[], res.loggingEnabled::Bool, dev,
-                                        Int(pipeline[].maxTotalThreadsPerThreadgroup),
-                                        Int(pipeline[].staticThreadgroupMemoryLength),
-                                        Int(pipeline[].threadExecutionWidth),
-                                        can_use_residency_sets(dev),
-                                        reloc_table)
+        # the fields of `HostKernel` following `f` and `source`
+        (pipeline[], res.loggingEnabled::Bool, dev,
+         Int(pipeline[].maxTotalThreadsPerThreadgroup),
+         Int(pipeline[].staticThreadgroupMemoryLength),
+         Int(pipeline[].threadExecutionWidth),
+         can_use_residency_sets(dev),
+         reloc_table)
     end
 end
 
@@ -424,7 +430,7 @@ end
                                               f, args::Tuple) where {F,S,TT}
     sig = (KernelState, F, TT.parameters...)
     vals = (:kernel_state, :f, (:(args[$i]) for i in 1:fieldcount(args))...)
-    typs = (kernel_state, f, fieldtypes(args)...)
+    typs = (kernel_state, f, args.parameters...)
     if length(sig) != length(typs)
         msg = "Kernel expects $(length(TT.parameters)) arguments, got $(fieldcount(args))"
         return :(throw(ArgumentError($msg)))
@@ -446,7 +452,7 @@ end
             push!(ex.args, :(set_buffer!(cce, $val.buffer, $val.offset, $idx)))
         else
             # everything else is passed by reference, copied into Metal's transient buffer
-            push!(ex.args, :(set_argument!(cce, mtlconvert($val, cce, bq), $idx)))
+            push!(ex.args, :(convert_argument!(cce, bq, $val, $idx)))
         end
         idx += 1
     end
@@ -455,6 +461,11 @@ end
 
     ex
 end
+
+# Not inlined into `encode_arguments!`, which is compiled for every kernel signature, so
+# that the conversion of each argument type is compiled once and shared between kernels.
+@noinline convert_argument!(cce::MTL.MTLComputeCommandEncoderLike, bq, arg, idx::Integer) =
+    set_argument!(cce, mtlconvert(arg, cce, bq), idx)
 
 @inline function set_argument!(cce::MTL.MTLComputeCommandEncoderLike, arg, idx::Integer)
     argtyp = typeof(arg)
@@ -494,16 +505,14 @@ function (kernel::HostKernel)(args...; groups=1, threads=1, queue=nothing,
     end
 end
 
-# wraps a single function call, keeping its closure body small.
-#
 # Not `@nospecialize`: a `@nospecialize`d kernel or argument tuple makes the calls below
 # dynamic, which boxes `kernel_state`, the arguments and every field read of the kernel
 # on each launch. `HostKernel{F,S,TT}` is one type per kernel and the generated encoder
 # specializes per argument list anyway, so specializing here partitions nothing further.
-@autoreleasepool function try_launch(kernel::HostKernel, queue,
-                                     gs::MTLSize, ts::MTLSize, args::Tuple,
-                                     submit::Bool, indirect=nothing)
-    # function barrier to avoid capturing the `@autoreleasepool` in the generated code
+# Upstream's launch path is `@nospecializeinfer` instead, to infer it once for all kernels;
+# that costs these allocations on every launch, so this path stays specialized.
+function try_launch(kernel::HostKernel, queue, gs::MTLSize, ts::MTLSize, args::Tuple,
+                    submit::Bool, indirect=nothing)
     launch_with_queue(kernel, queue, gs, ts, args, submit, indirect)
 end
 
@@ -519,15 +528,16 @@ end
     launch(kernel, gs, ts, batched_queue(queue), args, submit, indirect)
 end
 
-function kernel_operation(kernel::HostKernel, gs::MTLSize, ts::MTLSize)
+Base.@nospecializeinfer function kernel_operation(@nospecialize(kernel::HostKernel),
+                                                  gs::MTLSize, ts::MTLSize)
     (; kind = :kernel, name = string(nameof(kernel.f)),
        threadgroups = gs, threads = ts,
        tgmem = kernel.tgmem, maxthreads = kernel.maxthreads)
 end
 
-function launch_logging!(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
-                         bq::BatchedCommandQueue, @nospecialize(args::Tuple),
-                         kernel_state, buf, exc)
+Base.@nospecializeinfer function launch_logging!(
+        @nospecialize(kernel::HostKernel), gs::MTLSize, ts::MTLSize,
+        bq::BatchedCommandQueue, @nospecialize(args::Tuple), kernel_state, buf, exc)
     flush!(bq)
     queue = bq.queue
 
@@ -606,11 +616,11 @@ function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
         throw(ArgumentError("Number of threads in group ($nthreads) should not exceed $maxthreads"))
 
     (gs.width * ts.width) > typemax(UInt32) &&
-        throw(ArgumentError("Total threads per grid in a dimension (threads.width($(gs.width)) * groups.width($(ts.width)) = $(gs.width * ts.width)) must not exceed $(typemax(UInt32))"))
+        throw(ArgumentError("Total threads per grid in a dimension (groups.width($(gs.width)) * threads.width($(ts.width)) = $(gs.width * ts.width)) must not exceed $(typemax(UInt32))"))
     (gs.height * ts.height) > typemax(UInt32) &&
-        throw(ArgumentError("Total threads per grid in a dimension (threads.height($(gs.height)) * groups.height($(ts.height)) = $(gs.height * ts.height)) must not exceed $(typemax(UInt32))"))
+        throw(ArgumentError("Total threads per grid in a dimension (groups.height($(gs.height)) * threads.height($(ts.height)) = $(gs.height * ts.height)) must not exceed $(typemax(UInt32))"))
     (gs.depth * ts.depth) > typemax(UInt32) &&
-        throw(ArgumentError("Total threads per grid in a dimension (threads.depth($(gs.depth)) * groups.depth($(ts.depth)) = $(gs.depth * ts.depth)) must not exceed $(typemax(UInt32))"))
+        throw(ArgumentError("Total threads per grid in a dimension (groups.depth($(gs.depth)) * threads.depth($(ts.depth)) = $(gs.depth * ts.depth)) must not exceed $(typemax(UInt32))"))
 
     dev = kernel.device
     tgmem = kernel.tgmem

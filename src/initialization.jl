@@ -63,7 +63,7 @@ function __init__()
         @warn "Metal.jl has not been tested on macOS 28 or later, you may run into issues."
     end
 
-    @autoreleasepool try
+    try
         load_framework("CoreGraphics")
         load_framework("MetalPerformanceShadersGraph")
         # `CAMetalLayer` lives here, and it is the only way anything Metal draws
@@ -92,7 +92,7 @@ function __init__()
     atexit() do
         has_active_batched_queues() || return
         try
-            @autoreleasepool for bq in active_batched_queues()
+            for bq in active_batched_queues()
                 cmdbuf = bq.cmdbuf
                 end_encoder!(bq)
                 cmdbuf === nothing || discard_open_cmdbuf!(bq, cmdbuf)

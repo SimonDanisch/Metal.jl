@@ -156,16 +156,12 @@ end
 # body the same name resolves at call time, which is why the assertions above spell it.
 @noinline function make_task_queue!(queues::Dict{UInt,Any}, key::UInt, dev::MTLDevice)
     return get!(queues, key) do
-        @autoreleasepool begin
-            # NOTE: MTLCommandQueue itself is manually reference-counted,
-            #       the release pool is for resources used during its construction.
-            queue = MTLCommandQueue(dev)
-            queue.label = "global_queue($(current_task()))"
-            bq = BatchedCommandQueue(queue)
-            task_local_storage(batched_queue_key(queue), bq)
-            Base.@lock global_queues_lock global_queues[bq] = nothing
-            bq
-        end
+        queue = MTLCommandQueue(dev)
+        queue.label = "global_queue($(current_task()))"
+        bq = BatchedCommandQueue(queue)
+        task_local_storage(batched_queue_key(queue), bq)
+        Base.@lock global_queues_lock global_queues[bq] = nothing
+        bq
     end::BatchedCommandQueue
 end
 
@@ -418,8 +414,7 @@ const device_malloc_lock = ReentrantLock()
 function malloc_buffer_and_gpu_address(dev::MTLDevice)
     Base.@lock device_malloc_lock begin
         get!(device_malloc_bufs, dev) do
-            buf = @autoreleasepool MTLBuffer(dev, MALLOC_BUF_SIZE;
-                                             storage=SharedStorage)
+            buf = MTLBuffer(dev, MALLOC_BUF_SIZE; storage=SharedStorage)
             # initialize the counter (first 4 bytes) to 4 so the first
             # allocation lands past the counter itself
             unsafe_store!(convert(Ptr{UInt32}, MTL.contents(buf)), UInt32(4))

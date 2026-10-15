@@ -78,10 +78,10 @@ function MTL4CommandQueue(dev::MTLDevice)
     # freezing with the property set (`research/mtl4_icb_stall.jl`).
     desc = @objc [MTL4CommandQueueDescriptor alloc]::id{MTL4CommandQueueDescriptor}
     desc = @objc [desc::id{MTL4CommandQueueDescriptor} init]::MTL4CommandQueueDescriptor
-    err = Ref{id{NSError}}(nil)
+    err = Out{NSError}()
     q = @objc [dev::id{MTLDevice} newMTL4CommandQueueWithDescriptor:desc::id{MTL4CommandQueueDescriptor}
-                                  error:err::Ptr{id{NSError}}]::Union{Nothing,MTL4CommandQueue}
-    q === nothing && throw_error(err[])
+                                  error:err::Out{NSError}]::Union{Nothing,MTL4CommandQueue}
+    q === nothing && throw_error(err)
     return q
 end
 
@@ -304,10 +304,10 @@ function MTL4ArgumentTable(dev::MTLDevice; buffers::Integer = 8, textures::Integ
     textures > 0 && (desc.maxTextureBindCount = UInt64(textures))
     samplers > 0 && (desc.maxSamplerStateBindCount = UInt64(samplers))
     desc.initializeBindings = initialize
-    err = Ref{id{NSError}}(nil)
+    err = Out{NSError}()
     table = @objc [dev::id{MTLDevice} newArgumentTableWithDescriptor:desc::id{MTL4ArgumentTableDescriptor}
-                                      error:err::Ptr{id{NSError}}]::Union{Nothing,MTL4ArgumentTable}
-    table === nothing && throw_error(err[])
+                                      error:err::Out{NSError}]::Union{Nothing,MTL4ArgumentTable}
+    table === nothing && throw_error(err)
     return table
 end
 

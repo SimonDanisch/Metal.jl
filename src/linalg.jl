@@ -67,7 +67,7 @@ function empty_matmul!(C, beta)
     iszero(beta) ? fill!(C, zero(eltype(C))) : rmul!(C, beta)
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlMatrix, tA, tB, A::MtlMatrix, B::MtlMatrix,
+function LinearAlgebra.mul!(C::MtlMatrix, tA, tB, A::MtlMatrix, B::MtlMatrix,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
     mB, nB = LinearAlgebra.lapack_size(tB, B)
@@ -111,7 +111,7 @@ end
     end
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlMatrixOperand, tA, tB,
+function LinearAlgebra.mul!(C::MtlMatrixOperand, tA, tB,
                                              A::MtlMatrixOperand, B::MtlMatrixOperand,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
@@ -155,7 +155,7 @@ if isdefined(LinearAlgebra, :generic_matmatmul_wrapper!)
     end
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlVector, tA::AbstractChar, A::MtlMatrix, B::MtlVector,
+function LinearAlgebra.mul!(C::MtlVector, tA::AbstractChar, A::MtlMatrix, B::MtlVector,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
     mB = length(B)
@@ -249,7 +249,7 @@ LinearAlgebra.ipiv2perm(v::MtlVector, maxi::Integer) =
 LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
     LinearAlgebra.ipiv2perm(unsafe_wrap(Array, v), maxi)
 
-@autoreleasepool function LinearAlgebra.lu(A::MtlMatrix{T};
+function LinearAlgebra.lu(A::MtlMatrix{T};
                                            check::Bool = true) where {T <: MtlFloat}
     M, N = size(A)
     dev = device()
@@ -291,10 +291,10 @@ LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
 
     # One element, read after the synchronize above. A Shared array is host-visible
     # but refuses element access outside `@allowscalar`, like every device array.
-    status = convert(LinearAlgebra.BlasInt, @allowscalar(status[])::MPS.MPSMatrixDecompositionStatus)
-    check && checknonsingular(status)
+    info = convert(LinearAlgebra.BlasInt, @allowscalar(status[])::MPS.MPSMatrixDecompositionStatus)
+    check && checknonsingular(info)
 
-    return LinearAlgebra.LU(B, p, status)
+    return LinearAlgebra.LU(B, p, info)
 end
 
 function check_lu_success(info, allowsingular)
@@ -310,7 +310,7 @@ function check_lu_success(info, allowsingular)
 end
 
 # TODO: dispatch on pivot strategy
-@autoreleasepool function LinearAlgebra.lu!(A::MtlMatrix{T};
+function LinearAlgebra.lu!(A::MtlMatrix{T};
                                             check::Bool = true,
                                             allowsingular::Bool = false) where {T <: MtlFloat}
     M, N = size(A)
@@ -348,13 +348,13 @@ end
 
     synchronize(cmdbuf)
 
-    status = convert(LinearAlgebra.BlasInt, @allowscalar status[])
-    check && check_lu_success(status, allowsingular)
+    info = convert(LinearAlgebra.BlasInt, @allowscalar status[])
+    check && check_lu_success(info, allowsingular)
 
-    return LinearAlgebra.LU(A, p, status)
+    return LinearAlgebra.LU(A, p, info)
 end
 
-@autoreleasepool function LinearAlgebra.transpose!(B::MtlMatrix{T},
+function LinearAlgebra.transpose!(B::MtlMatrix{T},
                                                    A::MtlMatrix{T}) where {T}
     axes(B, 2) == axes(A, 1) && axes(B, 1) == axes(A, 2) || throw(DimensionMismatch("transpose"))
 
