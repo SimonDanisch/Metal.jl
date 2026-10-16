@@ -986,6 +986,102 @@ end
     @test count(i -> px[4i + 2] > 0x80, 0:(W*H - 1)) > 500
 end
 
+# ── Sampling next to a by-reference argument ────────────────────────────────
+#
+# The same `XPC_ERROR_CONNECTION_INTERRUPTED`, from another cause: a stage that
+# samples AND loads a by-reference argument whose load carries Julia's alias
+# scopes, which reach AIR since GPUCompiler 2.14 (`drop_alias_scopes!` in
+# `compiler/texture.jl`). RayMakie's image fragment, which samples and reads its
+# packed arguments, failed exactly so.
+
+struct GfxTexArgs
+    args::Tuple{NTuple{2,Float32},Float32,Int32}
+end
+
+function gfx_tex_args_fragment(a::GfxTexArgs, pos::FragCoord,
+                               tex::Metal.Texture2DPtr{Float32}, samp::Metal.SamplerPtr,
+                               out::Core.LLVMPtr{GfxFOut,1})
+    s = Metal.air_sample_texture_2d(tex, samp, 0.25f0, 0.25f0)
+    # Blue from the argument, so the draw shows the load ran and read the right field.
+    Base.unsafe_store!(out, GfxFOut((s.value[1].value, s.value[2].value,
+                                     a.args[2], 1f0)))
+    return nothing
+end
+
+const GFX_TEX_ARGS_TT = Tuple{GfxTexArgs, FragCoord, Metal.Texture2DPtr{Float32},
+                              Metal.SamplerPtr, Core.LLVMPtr{GfxFOut,1}}
+
+@testset "a stage that samples and reads a by-reference argument" begin
+    air = stage_air_text(gfx_tex_args_fragment, GFX_TEX_ARGS_TT, :fragment,
+                         "gfx_tex_args_fragment")
+    # The argument is loaded, and no load carries a scope.
+    @test any(l -> occursin("= load ", l), split(air, '\n'))
+    @test !occursin("!alias.scope", air)
+    @test !occursin("!noalias", air)
+
+    MTL = Metal.MTL
+    dev = GFX_DEV
+    # Texel (0, 0) is green, and (0.25, 0.25) samples it with nearest filtering.
+    texels = UInt8[0x00, 0xff, 0x00, 0xff,   0xff, 0x00, 0x00, 0xff,
+                   0x00, 0x00, 0xff, 0xff,   0xff, 0xff, 0x00, 0xff]
+    td = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, 2, 2, false)
+    td.usage = MTL.MTLTextureUsageShaderRead
+    td.storageMode = MTL.MTLStorageModeShared
+    tex = MTL.MTLTexture(dev, td)
+    GC.@preserve texels MTL.replace_region!(
+        tex, MTL.MTLRegion(MTL.MTLOrigin(0, 0, 0), MTL.MTLSize(2, 2, 1)), 0,
+        convert(Ptr{Cvoid}, pointer(texels)), 2 * 4)
+    sd = MTL.MTLSamplerDescriptor()
+    sd.minFilter = MTL.MTLSamplerMinMagFilterNearest
+    sd.magFilter = MTL.MTLSamplerMinMagFilterNearest
+    samp = MTL.MTLSamplerState(dev, sd)
+
+    vsf = stage_function(gfx_vertex,
+                         Tuple{Core.LLVMPtr{NTuple{4,Float32},1}, VertexID,
+                               Core.LLVMPtr{GfxVOut,1}}, :vertex, "gfx_vertex")
+    fsf = stage_function(gfx_tex_args_fragment, GFX_TEX_ARGS_TT, :fragment,
+                         "gfx_tex_args_fragment")
+    pd = MTL.MTLRenderPipelineDescriptor()
+    pd.vertexFunction = vsf
+    pd.fragmentFunction = fsf
+    pd.colorAttachments[1].pixelFormat = MTL.MTLPixelFormatRGBA8Unorm
+    # The step that crashed the compiler service.
+    pipe = MTL.MTLRenderPipelineState(dev, pd)
+
+    W = H = 64
+    rtd = MTL.MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, W, H, false)
+    rtd.usage = MTL.MTLTextureUsageRenderTarget | MTL.MTLTextureUsageShaderRead
+    rtd.storageMode = MTL.MTLStorageModeShared
+    target = MTL.MTLTexture(dev, rtd)
+    rp = MTL.MTLRenderPassDescriptor()
+    ca = rp.colorAttachments[1]
+    ca.texture = target
+    ca.loadAction  = MTL.MTLLoadActionClear
+    ca.storeAction = MTL.MTLStoreActionStore
+    ca.clearColor  = MTL.MTLClearColor(0.0, 0.0, 0.0, 1.0)
+
+    args = Ref(GfxTexArgs(((0f0, 0f0), 1f0, Int32(7))))
+    cb  = MTL.MTLCommandBuffer(GFX_QUEUE)
+    enc = MTL.MTLRenderCommandEncoder(cb, rp)
+    MTL.set_pipeline!(enc, pipe)
+    MTL.set_vertex_buffer!(enc, GFX_VBUF, 0, 1)
+    GC.@preserve args MTL.set_fragment_bytes!(
+        enc, Base.unsafe_convert(Ptr{GfxTexArgs}, args), sizeof(GfxTexArgs), 1)
+    MTL.set_fragment_texture!(enc, tex, 1)
+    MTL.set_fragment_sampler!(enc, samp, 1)
+    MTL.draw_primitives!(enc, MTL.MTLPrimitiveTypeTriangle, 0, 3)
+    MTL.endEncoding!(enc)
+    MTL.commit!(cb)
+    MTL.wait_completed(cb)
+
+    px = Vector{UInt8}(undef, W * H * 4)
+    GC.@preserve px MTL.getBytes!(pointer(px), target, W * 4,
+                                  MTL.MTLRegion(MTL.MTLOrigin(0,0,0), MTL.MTLSize(W,H,1)))
+    # Green from the texel, blue from the argument.
+    mid = ((H ÷ 2) * W + (W ÷ 2)) * 4
+    @test px[mid + 1] == 0x00 && px[mid + 2] == 0xff && px[mid + 3] == 0xff
+end
+
 # ── A VISIBLE function ───────────────────────────────────────────────────────
 
 struct VisOut
