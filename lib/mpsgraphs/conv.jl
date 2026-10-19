@@ -21,7 +21,7 @@
 # **75% of the entire frame** (438 ms of 581).
 
 """What makes two convolution graphs the same graph."""
-struct Conv2DGraphKey
+struct BatchedConv2DGraphKey
     dims_x::NTuple{4,Int}
     dims_w::NTuple{4,Int}
     dims_o::NTuple{4,Int}
@@ -45,7 +45,7 @@ struct CachedConv2DGraph
     result::MPSGraphTensor
 end
 
-function CachedConv2DGraph(key::Conv2DGraphKey)
+function CachedConv2DGraph(key::BatchedConv2DGraphKey)
     graph = MPSGraph()
     bx = bindshape(key.dims_x, key.Txw)
     bw = bindshape(key.dims_w, key.Txw)
@@ -94,7 +94,7 @@ function CachedConv2DGraph(key::Conv2DGraphKey)
     return CachedConv2DGraph(graph, px, pw, place_bias, t)
 end
 
-const _conv2d_graph_cache = Dict{Conv2DGraphKey,CachedConv2DGraph}()
+const _conv2d_graph_cache = Dict{BatchedConv2DGraphKey,CachedConv2DGraph}()
 const _conv2d_graph_cache_lock = ReentrantLock()
 
 """
@@ -159,7 +159,7 @@ function conv2d_batched!(out::MtlArray, x::MtlArray, w::MtlArray, bias,
         "conv2d_batched!: these operands are not ones MPSGraph can be given — " *
         "$(size(x)) * $(size(w)) into $(size(out)), $(eltype(x))/$(eltype(out)), " *
         "activation :$act. Ask `conv2d_shape_supported` first."))
-    key = Conv2DGraphKey(size(x), size(w), size(out), eltype(x), eltype(out),
+    key = BatchedConv2DGraphKey(size(x), size(w), size(out), eltype(x), eltype(out),
                          bias === nothing ? nothing : eltype(bias),
                          stride, pad, dilation, groups, act, transposed)
     cached = @lock _conv2d_graph_cache_lock get!(_conv2d_graph_cache, key) do

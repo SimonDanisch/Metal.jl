@@ -27,7 +27,7 @@ end
 
 function record_commit!(collector::MTL.ProfileCollector, cmdbuf)
     @lock collector.lock begin
-        ops = get(collector.metadata, UInt(pointer(cmdbuf)), nothing)
+        ops = get(collector.metadata, MTL.profile_key(cmdbuf), nothing)
         if ops !== nothing && !isempty(ops)
             name = String(something(get(first(ops), :name, nothing), "Metal operation"))
         else
@@ -40,7 +40,8 @@ function record_commit!(collector::MTL.ProfileCollector, cmdbuf)
         end
 
         # Read after the batch has retired it, so a reference of the record's own: a
-        # batch's command buffer arrives as an unmanaged `MTLCommandBufferRef`.
+        # batch's command buffer arrives as an unmanaged `MTLCommandBufferRef`. (A Metal 4
+        # submission is a Julia object, and keeps itself.)
         push!(collector.records, (name, MTL.retained(cmdbuf)))
     end
     return
@@ -180,14 +181,14 @@ function profile_internally(@nospecialize(f); trace::Bool=false, raw::Bool=false
             records
         end
         for (opname, cmdbuf) in records
-            if cmdbuf.status == MTL.MTLCommandBufferStatusCompleted
-                t0 = cmdbuf.GPUStartTime
-                t1 = cmdbuf.GPUEndTime
+            range = MTL.gpu_time_range(cmdbuf)
+            if range !== nothing
+                t0, t1 = range
                 if t1 > t0
                     push!(name, opname)
                     push!(start, t0)
                     push!(stop, t1)
-                    push!(ops, get(collector.metadata, UInt(pointer(cmdbuf)), Any[]))
+                    push!(ops, get(collector.metadata, MTL.profile_key(cmdbuf), Any[]))
                 end
             end
         end

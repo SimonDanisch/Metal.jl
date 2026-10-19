@@ -76,10 +76,11 @@ GPUCompiler.runtime_module(::MetalCompilerJob) = Metal
 
 GPUCompiler.method_table(::MetalCompilerJob) = method_table
 
-# Metal does not support double precision, so also use GPUToolbox's overrides that keep
-# single-precision math out of Float64.
+# Metal supports neither double precision nor 128-bit integers, so also use GPUToolbox's
+# overrides that keep single-precision math out of Float64, and 64-bit integer math (e.g.
+# `Rational` comparisons) out of Int128.
 GPUCompiler.method_tables(::MetalCompilerJob) =
-    (method_table, GPUToolbox.Overlays.float64_overrides)
+    (method_table, GPUToolbox.Overlays.float64_overrides, GPUToolbox.Overlays.int128_overrides)
 
 # A graphics stage has NO kernel state. `KernelState` carries the machinery a
 # compute launch needs — exception reporting, the relocation table — and none of
@@ -214,7 +215,7 @@ function linked_functions_for(dev::MTLDevice)
 end
 
 """
-Create a pipeline with `linked` attached.
+Attach `linked` to the pipeline `desc` describes.
 
 `privateFunctions`, not `functions`. Both link the code in, and the difference
 is what the compiler is then allowed to do with it: a function in `functions`
@@ -234,10 +235,8 @@ that itself calls another (the intersector's own helpers count) overflows it,
 and the failure is a pipeline-creation error rather than anything that names
 the cause. Kept even with inlining allowed, because "allowed" is not "will".
 """
-function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFunction};
-                        indirect::Bool = false)
-    desc = MTLComputePipelineDescriptor()
-    desc.computeFunction = fun
+function link_functions!(desc::MTLComputePipelineDescriptor, dev::MTLDevice,
+                         linked::Vector{MTLFunction})
     lf = MTL.MTLLinkedFunctions()
     # the setter takes an ObjC array, not a Julia Vector
     lf.privateFunctions = NSArray(linked)
@@ -248,25 +247,8 @@ function linked_pipeline(dev::MTLDevice, fun::MTLFunction, linked::Vector{MTLFun
     isempty(tbl) || (lf.functions = NSArray(tbl))
     desc.linkedFunctions = lf
     desc.maxCallStackDepth = 4
-    desc.supportIndirectCommandBuffers = indirect
-    return MTLComputePipelineState(dev, desc)
+    return desc
 end
-
-"""
-A pipeline an indirect command buffer may name.
-
-`supportIndirectCommandBuffers` is not a hint: `setComputePipelineState` on an
-indirect command REFUSES a pipeline without it. It is a property of the pipeline
-and not of the compiled code, so this shares the metallib with the ordinary one.
-"""
-function indirect_pipeline(dev::MTLDevice, fun::MTLFunction)
-    desc = MTLComputePipelineDescriptor()
-    desc.computeFunction = fun
-    desc.supportIndirectCommandBuffers = true
-    return MTLComputePipelineState(dev, desc)
-end
-
-
 
 function GPUCompiler.finish_module!(@nospecialize(job::MetalCompilerJob),
                                     mod::LLVM.Module, entry::LLVM.Function)
@@ -669,7 +651,8 @@ end
 const _compiler_configs = Dict{UInt, MetalCompilerConfig}()
 const compiler_configs_lock = ReentrantLock()
 function compiler_config(dev; kwargs...)
-    h = hash(dev, hash(kwargs))
+    # (as a `NamedTuple`: hashing the `Pairs` boxes each value, on every launch)
+    h = hash(dev, hash(values(kwargs)))
     return Base.@lock compiler_configs_lock begin
         get!(_compiler_configs, h) do
             _compiler_config(dev; kwargs...)
@@ -680,7 +663,9 @@ end
                                          debug_level=Base.JLOptions().debug_level,
                                          opt_level=2,
                                          macos=nothing, air=nothing, metal=nothing,
-                                         gpufamily=nothing, stage::Symbol=:kernel, kwargs...)
+                                         gpufamily=nothing, minthreads=nothing,
+                                         maxthreads=nothing, stage::Symbol=:kernel,
+                                         kwargs...)
     # `:visible` is not a stage in the rasteriser sense — it is an ordinary AIR
     # function a kernel CALLS (`MTLLinkedFunctions`), which is how a body that
     # has to be Julia reaches a loop that has to be MSL. It travels here because
@@ -709,16 +694,16 @@ end
     if macos === nothing
         macos = something(target_macos(), macos_version())
     else
-        macos = normalize_macos(macos)
+        macos = check_macos(macos)
     end
     if metal === nothing
         metal = metal_target(macos)
     end
+    # like the offline compiler, derive everything from a single deployment target,
+    # raised to what the language version requires
+    macos = max(macos, macos_floor(metal))
     if air === nothing
-        air = max(air_support(macos), air_floor(metal))
-        if air < v"2.7"
-            error("""Metal.jl requires AIR 2.7 (macOS 15) or newer, but macOS $(macos) only supports AIR $(air_support(macos)).""")
-        end
+        air = air_support(macos)
     elseif air < v"2.7"
         error("""Metal.jl requires AIR 2.7 (macOS 15) or newer; cannot target AIR $(air).""")
     elseif air < air_floor(metal)
@@ -733,14 +718,45 @@ end
     else
         gpufamily = convert(MTL.MTLGPUFamily, gpufamily)
         family = Int(gpufamily) - 1000
-        if !(1 <= family <= 10)
+        if !(1 <= family <= 11)
             throw(ArgumentError("gpufamily must be an MTLGPUFamilyApple<n>, got $(gpufamily)"))
         end
         family
     end
 
+    # threadgroup size properties. These are checked here because a pipeline descriptor
+    # requiring an unsupported size aborts the process. Apple GPUs limit the total number of
+    # threads per threadgroup to the same value as each dimension.
+    limits = dev.maxThreadsPerThreadgroup
+    maxtotal = Int(limits.width)
+    if minthreads !== nothing
+        if !(1 <= length(minthreads) <= 3)
+            throw(ArgumentError("minthreads should be an integer or a tuple of up to three integers, got $(minthreads)"))
+        end
+        # normalize, so that equivalent sizes share a compiled kernel
+        minthreads = ntuple(i -> i <= length(minthreads) ? Int(minthreads[i]) : 1, 3)
+        if any(<(1), minthreads) || any(minthreads .> (limits.width, limits.height, limits.depth)) ||
+           prod(minthreads) > maxtotal
+            throw(ArgumentError("minthreads $(minthreads) is not a valid threadgroup size for this device (at most $(Int(limits.width))×$(Int(limits.height))×$(Int(limits.depth)) and $(maxtotal) threads in total)"))
+        end
+        # enforced through the pipeline descriptor's `requiredThreadsPerThreadgroup`, which the
+        # runtime only provides on macOS 26, regardless of the targeted Metal version
+        if macos_version() < v"26"
+            throw(ArgumentError("minthreads requires macOS 26 or newer; running macOS $(macos_version())"))
+        end
+    end
+    if maxthreads !== nothing
+        if !(1 <= maxthreads <= maxtotal)
+            throw(ArgumentError("maxthreads should be between 1 and $(maxtotal), got $(maxthreads)"))
+        end
+        if minthreads !== nothing && maxthreads < prod(minthreads)
+            throw(ArgumentError("maxthreads ($(maxthreads)) should not be lower than the total of minthreads $(minthreads)"))
+        end
+    end
+
     # create GPUCompiler objects
-    target = MetalCompilerTarget(; macos, air, metal, apple_family, kwargs...)
+    target = MetalCompilerTarget(; macos, air, metal, apple_family, minthreads, maxthreads,
+                                   kwargs...)
     params = MetalCompilerParams(something(apple_family, 0), stage)
     # `kernel = true` even for a graphics stage: that flag is what turns on the
     # address-space and argument-metadata work a stage also needs.
@@ -887,42 +903,84 @@ function reloc_table_buffer(dev::MTLDevice,
     return buf
 end
 
+# The runtime rejects libraries with a container, AIR or MSL version it doesn't know, with a
+# generic error. Kernels can be compiled for newer systems (e.g. to inspect their code), so
+# this is only checked when loading. Only major and minor versions matter: the function list
+# doesn't encode patch versions, and newer container patch versions load fine. The
+# deployment target itself isn't checked: the newest macOS emits the same versions as its
+# successors, and the runtime ignores the header's OS.
+function check_loadable(target)
+    host = macos_version()
+    newer(a, b) = (a.major, a.minor) > (b.major, b.minor)
+    if newer(metallib_target(target.macos), metallib_support(host)) ||
+       newer(target.air, air_support(host)) || newer(target.metal, metal_support(host))
+        error("""Kernel was compiled for metallib $(metallib_target(target.macos)), AIR $(target.air) and MSL $(target.metal) (macOS $(target.macos)), which this system (macOS $host) cannot load.""")
+    end
+end
+
 # link the metallib into a session-local pipeline state on the given device.
+#
+# `indirect` makes a pipeline an indirect command buffer may name.
+# `supportIndirectCommandBuffers` is not a hint: `setComputePipelineState` on an indirect
+# command REFUSES a pipeline without it. It is a property of the pipeline and not of the
+# compiled code, so both pipelines share the metallib.
 function link_pipeline(dev::MTLDevice, air::Vector{UInt8},
-                       metallib::Vector{UInt8}, entry::String;
+                       metallib::Vector{UInt8}, entry::String,
+                       minthreads::Union{Nothing,NTuple{3,Int}};
                        indirect::Bool = false)
     @signpost_event log=log_compiler() "Link" entry
 
     @signpost_interval log=log_compiler() "Instantiate compute pipeline" begin
         lib = MTLLibraryFromData(dev, metallib)
         fun = MTLFunction(lib, entry)
+        desc = MTLComputePipelineDescriptor()
+        desc.computeFunction = fun
+        # the kernel's IR only carries the required size as a hint; this enforces it
+        if minthreads !== nothing
+            desc.requiredThreadsPerThreadgroup = MTLSize(minthreads)
+        end
+        desc.supportIndirectCommandBuffers = indirect
+        linked = linked_functions_for(dev)
+        # Either registry is enough to take the linked path: a table-only
+        # registration still has to reach `lf.functions`.
+        (isempty(linked) && isempty(table_functions_for(dev))) ||
+            link_functions!(desc, dev, linked)
         try
-            linked = linked_functions_for(dev)
-            # Either registry is enough to take the linked path: a table-only
-            # registration still has to reach `lf.functions`.
-            (isempty(linked) && isempty(table_functions_for(dev))) ||
-                return linked_pipeline(dev, fun, linked; indirect)
-            indirect && return indirect_pipeline(dev, fun)
-            return MTLComputePipelineState(dev, fun)
+            return MTLComputePipelineState(dev, desc)
         catch err
             isa(err, NSError) || rethrow()
 
             # the back-end compiler likely failed
             # XXX: check more accurately? the error domain doesn't help much here
             air_file, metallib_file = dump_artifacts(".air" => air, ".metallib" => metallib)
-            # The driver's own explanation, which this used to throw away: the
-            # message named two temporary files and no reason, so every back-end
-            # compile failure looked identical and none of them said what was
-            # wrong. `localizedDescription` is where Metal puts it.
-            why = try
-                String(err.localizedDescription)
-            catch
-                "(the NSError carried no localizedDescription)"
-            end
-            error("""Compilation to native code failed: $(why)
+            # The driver's own explanation: without it every back-end compile failure
+            # looks identical. `localizedDescription` is where Metal puts it.
+            why = String(err.localizedDescription)
+            msg = """Compilation to native code failed: $(why)
                      If you think this is a bug, please file an issue and attach:
                      - $(air_file)
-                     - $(metallib_file)""")
+                     - $(metallib_file)"""
+            if !gpu_addresses_available(dev)
+                msg *= """\n\nMetal also returned a null GPU address for a new buffer. The driver may
+                          have stopped servicing this process, failing all further compilations.
+                          Restart Julia."""
+            end
+            error(msg)
         end
+    end
+end
+
+# After repeated GPU errors, the driver may stop servicing the process, failing every
+# compilation, also of valid kernels. New buffers then lack a GPU address.
+function gpu_addresses_available(dev::MTLDevice)
+    try
+        buf = MTLBuffer(dev, 4; storage=SharedStorage)
+        try
+            !iszero(UInt(buf.gpuAddress))
+        finally
+            release(buf)
+        end
+    catch
+        true    # inconclusive
     end
 end

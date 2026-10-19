@@ -7,7 +7,13 @@ log_array(args...)      = log_array()(args...)
 
 const LABEL_RESOURCES = @load_preference("label_resources", nothing)
 
-@inline label_resources() = @something(LABEL_RESOURCES, Base.JLOptions().debug_level >= 2)
+# without a preference, label when debugging (`-g2`). set by `__init__`.
+const label_resources_default = Ref(false)
+function init_label_resources!()
+    label_resources_default[] = Base.JLOptions().debug_level >= 2
+end
+
+@inline label_resources() = @something(LABEL_RESOURCES, label_resources_default[])
 
 macro label!(obj, str)
     quote
@@ -93,10 +99,10 @@ function global_queue(dev::MTLDevice)
     # one residency set, and a task that happened not to have made a queue yet
     # must not get a second. One integer compare on the launch path, and `0` is
     # not a device address, so an un-adopted process never takes the branch.
-    adopted_key[] == key && return adopted_queue[]::BatchedCommandQueue
+    adopted_key[] == key && return adopted_queue[]::ConcreteBatchedQueue
     queues = task_queues()
     bq = get(queues, key, nothing)
-    bq === nothing || return bq::BatchedCommandQueue
+    bq === nothing || return bq::ConcreteBatchedQueue
     return make_task_queue!(queues, key, dev)
 end
 
@@ -162,7 +168,7 @@ end
         task_local_storage(batched_queue_key(queue), bq)
         Base.@lock global_queues_lock global_queues[bq] = nothing
         bq
-    end::BatchedCommandQueue
+    end::ConcreteBatchedQueue
 end
 
 # tracks the most recently launched logging-enabled cmdbuf per queue, so that
@@ -418,7 +424,7 @@ function malloc_buffer_and_gpu_address(dev::MTLDevice)
             # initialize the counter (first 4 bytes) to 4 so the first
             # allocation lands past the counter itself
             unsafe_store!(convert(Ptr{UInt32}, MTL.contents(buf)), UInt32(4))
-            (buf, UInt64(buf.gpuAddress))
+            (buf, UInt64(MTL.gpu_address(buf)))
         end
     end
 end

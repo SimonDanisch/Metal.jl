@@ -64,9 +64,15 @@ function alloc(dev::Union{MTLDevice,MTLHeap}, sz::Integer, args...; kwargs...)
     end
 
     maybe_collect(dev)
+    @static if COMMAND_API === :metal4
+        has_freed_buffers() && Base.@lock submission_lock process_freed!()
+    end
 
     time = Base.@elapsed begin
         buf = alloc_buffer_with_retry(dev, sz, args...; kwargs...)
+        @static if COMMAND_API === :metal4
+            track_allocation!(buf)
+        end
     end
 
     Base.@atomic alloc_stats.alloc_count + 1
@@ -97,10 +103,19 @@ function free(buf::MTLBuffer)
     sz::Int = buf.length
 
     time = Base.@elapsed begin
-        # Out of its residency set BEFORE the release, or the release frees nothing:
-        # a set holds a strong reference to everything in it. See `forget_resident!`.
+        # Out of the per-device residency set of the Metal 3 queues BEFORE the release,
+        # or the release frees nothing: a set holds a strong reference to everything in
+        # it. See `forget_resident!`.
         forget_resident!(buf)
-        release(buf)
+        @static if COMMAND_API === :metal4
+            # Metal 4 command buffers don't retain the buffers they use, so this may
+            # have to wait (see `process_freed!`). finalizers can't take the lock, but
+            # an explicit free releases right away when no work uses the buffer.
+            defer_release!(buf)
+            GC.in_finalizer() || Base.@lock submission_lock process_freed!()
+        else
+            release(buf)
+        end
     end
 
     Base.@atomic alloc_stats.free_count + 1

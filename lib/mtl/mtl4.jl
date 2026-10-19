@@ -1,15 +1,13 @@
-export MTL4CommandQueue, MTL4CommandAllocator, MTL4CommandBuffer, MTL4ArgumentTable
-export MTL4Feedback, supports_mtl4, begin_command_buffer!, end_command_buffer!, compute_encoder,
-       use_residency_set!, add_residency_set!, signal_event!, wait_for_event!,
-       set_argument_table!, set_address!, barrier!,
-       dispatch_threadgroups_indirect!
+export MTL4ComputeCommandEncoderRef, MTL4Feedback, dispatch_threadgroups_indirect!
 
 # Metal 4 submission, which is the model Metal has been moving towards and the one
 # a render graph already wanted.
 #
-# `libmtl.jl` (generated) has the TYPES — the queue, the allocator, the command
-# buffer, the compute encoder, the argument table. Every method that makes them do
-# anything is here, the same division as `indirect_command_buffer.jl`.
+# `libmtl.jl` (generated) has the TYPES; `command_queue4.jl`, `command_alloc4.jl`,
+# `command_buf4.jl`, `command_enc4.jl`, `command_enc/compute4.jl` and `arg_table.jl`
+# have the methods upstream wraps. This file is what they lack: an unmanaged encoder
+# for a per-submission path, a feedback handler that runs no Julia code that can
+# allocate, a device-decided grid, and replaying an indirect command buffer.
 #
 # ── What is different, and why it matters here ───────────────────────────────
 #
@@ -35,95 +33,8 @@ export MTL4Feedback, supports_mtl4, begin_command_buffer!, end_command_buffer!, 
 # command binds buffer slices by address), which is why replaying one needs none
 # of the migration work an ordinary launch does.
 #
-# Everything here is macOS 26 and later. `supports_mtl4` is the per-device
-# question and it is asked once, at device creation.
-
-"""
-    supports_mtl4(dev) -> Bool
-
-Whether this device can create an `MTL4CommandQueue`.
-
-Per DEVICE and not per OS: the selector exists on macOS 26, and whether a given
-GPU answers `true` is the GPU's business. Asked through `respondsToSelector:`
-first so that the question is also answerable on an older system, where sending
-it would be an unrecognised selector rather than a `false`.
-"""
-function supports_mtl4(dev::MTLDevice)
-    sel = ccall(:sel_registerName, Ptr{Cvoid}, (Cstring,), "supportsMTL4CommandQueue")
-    ccall(:objc_msgSend, Bool, (id{MTLDevice}, Ptr{Cvoid}, Ptr{Cvoid}),
-          dev, ccall(:sel_registerName, Ptr{Cvoid}, (Cstring,), "respondsToSelector:"), sel) || return false
-    return ccall(:objc_msgSend, Bool, (id{MTLDevice}, Ptr{Cvoid}), dev, sel)
-end
-
-"""
-    MTL4CommandQueue(dev)
-
-A Metal 4 submission queue.
-
-Independent of the device's `MTLCommandQueue`s: a device may hold both, and work
-on one is ordered against work on the other only through a shared event.
-"""
-function MTL4CommandQueue(dev::MTLDevice)
-    # WITH A DESCRIPTOR, and the reason is the `error:` — `newMTL4CommandQueue`
-    # returns nil and says nothing, so a device that refuses one is a
-    # `MethodError` two calls away from its cause.
-    #
-    # NOT for `supportMTLEvent`, which is what this was first written for. The
-    # descriptor does respond to `setSupportMTLEvent:` on macOS 26.6, but the
-    # property is in neither the 26.5 nor the 27.0 SDK headers, and a fresh
-    # descriptor already reads back `true` — so setting it is an undeclared
-    # selector sent to change nothing, which is one OS release away from an
-    # unrecognised-selector abort. Nor was it the fix it looked like: the timeline
-    # freeze it was blamed for is `executeCommandsInBuffer:`, and the queue keeps
-    # freezing with the property set (`research/mtl4_icb_stall.jl`).
-    desc = @objc [MTL4CommandQueueDescriptor alloc]::id{MTL4CommandQueueDescriptor}
-    desc = @objc [desc::id{MTL4CommandQueueDescriptor} init]::MTL4CommandQueueDescriptor
-    err = Out{NSError}()
-    q = @objc [dev::id{MTLDevice} newMTL4CommandQueueWithDescriptor:desc::id{MTL4CommandQueueDescriptor}
-                                  error:err::Out{NSError}]::Union{Nothing,MTL4CommandQueue}
-    q === nothing && throw_error(err)
-    return q
-end
-
-"""
-    MTL4CommandAllocator(dev)
-
-The storage a command buffer records into — a command pool.
-
-`reset!` hands all of it back at once, which is the only way an MTL4 command
-buffer's memory is reclaimed. One allocator per frame-in-flight is the shape
-this is for: reset it, refill the command buffer from it, submit, and do not
-reset it again until the GPU has signalled that the submission landed.
-"""
-MTL4CommandAllocator(dev::MTLDevice) =
-    @objc [dev::id{MTLDevice} newCommandAllocator]::MTL4CommandAllocator
-
-"""Give the allocator's storage back. Only legal once the GPU is done with it."""
-reset!(alloc::MTL4CommandAllocator) =
-    @objc [alloc::id{MTL4CommandAllocator} reset]::Nothing
-
-"""
-    MTL4CommandBuffer(dev)
-
-A REUSABLE command buffer.
-
-Created once and refilled with [`begin_command_buffer!`](@ref) for every
-submission, where the legacy path creates one per submission and throws it away.
-"""
-MTL4CommandBuffer(dev::MTLDevice) =
-    @objc [dev::id{MTLDevice} newCommandBuffer]::MTL4CommandBuffer
-
-"""Open the command buffer for recording, taking its storage from `alloc`."""
-begin_command_buffer!(cb::MTL4CommandBuffer, alloc::MTL4CommandAllocator) =
-    @objc [cb::id{MTL4CommandBuffer} beginCommandBufferWithAllocator:alloc::id{MTL4CommandAllocator}]::Nothing
-
-"""Close the command buffer. It is submittable, and not yet submitted."""
-end_command_buffer!(cb::MTL4CommandBuffer) =
-    @objc [cb::id{MTL4CommandBuffer} endCommandBuffer]::Nothing
-
-"""A compute encoder on an open MTL4 command buffer."""
-compute_encoder(cb::MTL4CommandBuffer) =
-    @objc [cb::id{MTL4CommandBuffer} computeCommandEncoder]::MTL4ComputeCommandEncoder
+# Everything here is macOS 26 and later. `Metal.metal4_unsupported_reason` is the
+# per-device question.
 
 @objcwrapper managed = false MTL4ComputeCommandEncoderRef <: MTL4ComputeCommandEncoder
 
@@ -134,7 +45,7 @@ A NEW compute encoder on `cb`, as an unmanaged wrapper whose one reference belon
 the caller; `close` ends it and gives the reference back.
 
 What a submission path opens once per submission, for the reason
-[`MTLCommandBufferRef`](@ref) gives: the managed wrapper `compute_encoder` returns is a
+[`MTLCommandBufferRef`](@ref) gives: the managed `MTL4ComputeCommandEncoder(cb)` is a
 heap object per call, and it was made outside any autorelease pool, so the encoder's
 autoreleased reference was never given back either.
 """ MTL4ComputeCommandEncoderRef
@@ -143,52 +54,6 @@ MTL4ComputeCommandEncoderRef(cb::MTL4CommandBuffer) =
     retain_autoreleased(MTL4ComputeCommandEncoderRef) do
         @objc [cb::id{MTL4CommandBuffer} computeCommandEncoder]::id{MTL4ComputeCommandEncoderRef}
     end
-
-# The legacy method in `command_enc.jl` takes an `MTLCommandEncoderLike`; an MTL4
-# encoder is a separate protocol, so it needs its own. Same name, because closing
-# an encoder is one concept.
-endEncoding!(enc::MTL4CommandEncoderLike) =
-    @objc [enc::id{MTL4CommandEncoder} endEncoding]::Nothing
-
-# End the encoder and give back the reference the wrapper holds, as `close` does for a
-# legacy encoder: the managed wrapper's own, or the one an `...Ref` constructor handed out.
-function Base.close(enc::MTL4CommandEncoderLike)
-    try
-        endEncoding!(enc)
-    finally
-        release(enc)
-    end
-    return nothing
-end
-
-"""
-Make a residency set's allocations resident for this command buffer.
-
-The replacement for `useResource:`, and the only residency mechanism MTL4 has.
-Declaring the set on the QUEUE ([`add_residency_set!`](@ref)) covers every
-submission on it; declaring it here covers this one.
-"""
-use_residency_set!(cb::MTL4CommandBuffer, set::MTLResidencySet) =
-    @objc [cb::id{MTL4CommandBuffer} useResidencySet:set::id{MTLResidencySet}]::Nothing
-
-"""Make a residency set's allocations resident for everything on this queue."""
-add_residency_set!(q::MTL4CommandQueue, set::MTLResidencySet) =
-    @objc [q::id{MTL4CommandQueue} addResidencySet:set::id{MTLResidencySet}]::Nothing
-
-"""
-    commit!(queue, cmdbufs)
-
-Submit closed command buffers, in order.
-
-`commit:count:` takes an array because a queue submission is a batch here, the
-way `vkQueueSubmit` takes one. The single-buffer method is the common case and
-allocates the one-element array it needs.
-"""
-function commit!(q::MTL4CommandQueue, cbs::Vector{MTL4CommandBuffer})
-    isempty(cbs) && return
-    @objc [q::id{MTL4CommandQueue} commit:cbs::id{MTL4CommandBuffer}
-                                   count:length(cbs)::Csize_t]::Nothing
-end
 
 # ── When a submission fails ──────────────────────────────────────────────────
 #
@@ -213,8 +78,7 @@ mutable struct MTL4Feedback
 end
 
 function MTL4Feedback()
-    opts = @objc [MTL4CommitOptions alloc]::id{MTL4CommitOptions}
-    opts = @objc [opts::id{MTL4CommitOptions} init]::MTL4CommitOptions
+    opts = MTL4CommitOptions()
     err = Ref(UInt(0))
     # No allocation, no lock, no yield: one message send and one store.
     handler = function (feedback::Ptr{Cvoid})
@@ -241,20 +105,15 @@ function failure(fb::MTL4Feedback)
 end
 
 """Submit with a feedback handler attached, so a failure is reportable."""
-function commit!(q::MTL4CommandQueue, cbs::Vector{MTL4CommandBuffer}, fb::MTL4Feedback)
-    isempty(cbs) && return
-    @objc [q::id{MTL4CommandQueue} commit:cbs::id{MTL4CommandBuffer}
-                                   count:length(cbs)::Csize_t
-                                   options:fb.options::id{MTL4CommitOptions}]::Nothing
-end
+commit!(q::MTL4CommandQueue, cbs::Vector{MTL4CommandBuffer}, fb::MTL4Feedback) =
+    isempty(cbs) ? nothing : commit!(q, cbs, fb.options)
 
 """
     commit!(queue, cbs::Vector{id{MTL4CommandBuffer}}, fb)
 
 The same, over an ALREADY-MARSHALLED array of command buffer pointers. The method above
-converts its `Vector{MTL4CommandBuffer}` through `Base.cconvert`, which builds a fresh
-pointer array and the `idArray` holding it on every call, so a caller that keeps its
-array to submit without allocating still allocated here. The caller keeps the command
+maps its `Vector{MTL4CommandBuffer}` to a fresh pointer array on every call, so a caller
+that keeps its array to submit without allocating still allocated there. The caller keeps the command
 buffers alive; these are bare pointers.
 """
 function commit!(q::MTL4CommandQueue, cbs::Vector{id{MTL4CommandBuffer}}, fb::MTL4Feedback)
@@ -263,72 +122,6 @@ function commit!(q::MTL4CommandQueue, cbs::Vector{id{MTL4CommandBuffer}}, fb::MT
                                    count:length(cbs)::Csize_t
                                    options:fb.options::id{MTL4CommitOptions}]::Nothing
 end
-
-"""
-    signal_event!(queue, event, value)
-
-Signal `event` to `value` once everything committed so far has completed.
-
-The whole of completion tracking on MTL4: there is no `waitUntilCompleted` and no
-completion handler on a command buffer. `event.signaledValue >= v` is then a
-non-blocking "has the GPU got this far", and
-`MTL.waitUntilSignaledValue(event, v)` is the blocking form.
-"""
-signal_event!(q::MTL4CommandQueue, ev::MTLEventLike, value::Integer) =
-    @objc [q::id{MTL4CommandQueue} signalEvent:eventid(ev)::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
-
-"""Make everything committed after this wait for `event` to reach `value`."""
-wait_for_event!(q::MTL4CommandQueue, ev::MTLEventLike, value::Integer) =
-    @objc [q::id{MTL4CommandQueue} waitForEvent:eventid(ev)::id{MTLEvent} value:UInt64(value)::UInt64]::Nothing
-
-# ── Arguments, which are addresses ───────────────────────────────────────────
-
-"""
-    MTL4ArgumentTable(dev; buffers, textures, samplers, initialize)
-
-The binding table an MTL4 dispatch reads its arguments from.
-
-There is no `setBytes`/`setBuffer` on the encoder: a shader's buffer argument at
-index `i` is whatever 64-bit GPU address slot `i` of the bound table holds. That
-is the same indirection a recorded command already uses, which is why a replay
-needs no table at all — only an ordinary launch does.
-
-`initialize` zeroes the slots at creation; without it an unwritten slot is
-undefined rather than null.
-"""
-function MTL4ArgumentTable(dev::MTLDevice; buffers::Integer = 8, textures::Integer = 0,
-                           samplers::Integer = 0, initialize::Bool = true)
-    desc = @objc [MTL4ArgumentTableDescriptor alloc]::id{MTL4ArgumentTableDescriptor}
-    desc = @objc [desc::id{MTL4ArgumentTableDescriptor} init]::MTL4ArgumentTableDescriptor
-    desc.maxBufferBindCount = UInt64(buffers)
-    textures > 0 && (desc.maxTextureBindCount = UInt64(textures))
-    samplers > 0 && (desc.maxSamplerStateBindCount = UInt64(samplers))
-    desc.initializeBindings = initialize
-    err = Out{NSError}()
-    table = @objc [dev::id{MTLDevice} newArgumentTableWithDescriptor:desc::id{MTL4ArgumentTableDescriptor}
-                                      error:err::Out{NSError}]::Union{Nothing,MTL4ArgumentTable}
-    table === nothing && throw_error(err)
-    return table
-end
-
-"""
-    set_address!(table, address, index)
-
-Bind a GPU address to a ONE-BASED buffer slot.
-
-One-based to match `set_kernel_buffer!` on an indirect command, which is the
-other place this package binds an argument by index; the selector underneath is
-zero-based.
-"""
-set_address!(table::MTL4ArgumentTable, address::Integer, index::Integer) =
-    @objc [table::id{MTL4ArgumentTable} setAddress:UInt64(address)::UInt64
-                                        atIndex:Csize_t(index - 1)::Csize_t]::Nothing
-
-set_argument_table!(enc::MTL4ComputeCommandEncoderLike, table::MTL4ArgumentTable) =
-    @objc [enc::id{MTL4ComputeCommandEncoder} setArgumentTable:table::id{MTL4ArgumentTable}]::Nothing
-
-set_function!(enc::MTL4ComputeCommandEncoderLike, pipeline::MTLComputePipelineState) =
-    @objc [enc::id{MTL4ComputeCommandEncoder} setComputePipelineState:pipeline::id{MTLComputePipelineState}]::Nothing
 
 """
     dispatch_threadgroups_indirect!(enc, buf, offset, threads)
@@ -343,38 +136,10 @@ and the host still never learns whether the iteration ran.
 """
 function dispatch_threadgroups_indirect!(enc::MTL4ComputeCommandEncoderLike, buf::MTLBuffer,
                                          offset::Integer, threads::MTLSize)
-    a = MTLGPUAddress(UInt64(buf.gpuAddress) + UInt64(offset))
+    a = MTLGPUAddress(UInt64(gpu_address(buf)) + UInt64(offset))
     @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroupsWithIndirectBuffer:a::MTLGPUAddress
                                               threadsPerThreadgroup:threads::MTLSize]::Nothing
 end
-
-dispatch_threadgroups!(enc::MTL4ComputeCommandEncoderLike, groups::MTLSize, threads::MTLSize) =
-    @objc [enc::id{MTL4ComputeCommandEncoder} dispatchThreadgroups:groups::MTLSize
-                                              threadsPerThreadgroup:threads::MTLSize]::Nothing
-
-# ── Hazards, which are the caller's ──────────────────────────────────────────
-
-"""
-    barrier!(enc; after = MTLStageDispatch, before = MTLStageDispatch,
-             visibility = MTL4VisibilityOptionDevice)
-
-Order work encoded before this point against work encoded after it.
-
-MTL4 does no hazard tracking, so a write followed by a read of the same bytes is
-a race unless this says otherwise. `after`/`before` name the pipeline stages
-(`MTLStageDispatch` for compute, `MTLStageBlit` for copies,
-`MTLStageAccelerationStructure` for a build), and `visibility` says how far the
-write has to be pushed — `Device` for anything another dispatch will read.
-
-Only the encoder-to-encoder form is wrapped: the queue-stage variants order
-against other queues, which is a different question and has no caller here.
-"""
-barrier!(enc::MTL4CommandEncoderLike; after::MTLStages = MTLStageDispatch,
-         before::MTLStages = MTLStageDispatch,
-         visibility::MTL4VisibilityOptions = MTL4VisibilityOptionDevice) =
-    @objc [enc::id{MTL4CommandEncoder} barrierAfterEncoderStages:after::MTLStages
-                                       beforeEncoderStages:before::MTLStages
-                                       visibilityOptions:visibility::MTL4VisibilityOptions]::Nothing
 
 # ── Replaying a recording ────────────────────────────────────────────────────
 #
@@ -413,7 +178,7 @@ go through instead.
 function execute_commands_indirect!(enc::MTL4ComputeCommandEncoderLike,
                                     icb::MTLIndirectCommandBuffer,
                                     rangebuf::MTLBuffer, offset::Integer)
-    a = MTLGPUAddress(UInt64(rangebuf.gpuAddress) + UInt64(offset))
+    a = MTLGPUAddress(UInt64(gpu_address(rangebuf)) + UInt64(offset))
     @objc [enc::id{MTL4ComputeCommandEncoder} executeCommandsInBuffer:icb::id{MTLIndirectCommandBuffer}
                                               indirectBuffer:a::MTLGPUAddress]::Nothing
 end

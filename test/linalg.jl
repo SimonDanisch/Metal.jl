@@ -76,6 +76,21 @@ using LinearAlgebra, ScopedValues
     end
 end
 
+@testset "β = 0 ignores the output's contents" begin
+    A = MtlArray(rand(Float32, 8, 8))
+    B = MtlArray(rand(Float32, 8, 8))
+    x = MtlArray(rand(Float32, 8))
+    @testset "$alg" for alg in (:auto, :MPS, :MPSGraph, :native, :GPUArrays)
+        C = MtlArray(fill(NaN32, 8, 8))
+        @with (Metal.matmul_alg => alg) mul!(C, A, B)
+        @test Array(C) ≈ Array(A) * Array(B)
+
+        y = MtlArray(fill(NaN32, 8))
+        @with (Metal.matmul_alg => alg) mul!(y, A, x)
+        @test Array(y) ≈ Array(A) * Array(x)
+    end
+end
+
 @testset "empty dimensions" begin
     # products with M, K or N == 0 must not reach the backends (MPS asserts on empty buffers):
     # the result is empty, or β·C when the contraction dimension is empty
@@ -91,6 +106,29 @@ end
         @with (Metal.matmul_alg => alg) mul!(dC, MtlArray(A), MtlArray(B), 2f0, 3f0)
         @test Array(dC) ≈ ref
     end
+end
+
+@testset "destination size mismatch" begin
+    # the backends take the output size from C, so a wrongly sized C has to be rejected up
+    # front (MPSGraph asserts on it, the native kernels silently compute a partial product)
+    A = MtlArray(rand(Float32, 4, 3))
+    B = MtlArray(rand(Float32, 3, 5))
+    x = MtlArray(rand(Float32, 3))
+    @testset "$alg" for alg in (:auto, :MPS, :MPSGraph, :native, :GPUArrays)
+        @with (Metal.matmul_alg => alg) begin
+            for dims in ((1, 5), (8, 5), (4, 4), (4, 6))
+                @test_throws DimensionMismatch mul!(Metal.zeros(Float32, dims), A, B)
+                @test_throws DimensionMismatch mul!(Metal.zeros(Float32, dims), 'N', 'N', A, B, true, false)
+            end
+            for len in (2, 8)
+                @test_throws DimensionMismatch mul!(Metal.zeros(Float32, len), A, x)
+                @test_throws DimensionMismatch mul!(Metal.zeros(Float32, len), 'N', A, x, true, false)
+            end
+        end
+    end
+    # views go through the `MtlMatrixOperand` method
+    @test_throws DimensionMismatch mul!(Metal.zeros(Float32, 1, 5), 'N', 'N', view(A, 1:2, :), B, true, false)
+    @test_throws DimensionMismatch mul!(view(Metal.zeros(Float32, 4, 5), 1:2, :), A, B)
 end
 
 @testset "test matrix vector multiplication of views" begin

@@ -4,7 +4,7 @@ using ..Metal
 using ..Metal: @device_override, DefaultStorageMode, SharedStorage, metal_support,
                mtlfunction, mtlconvert, try_launch, MTL, MTLSize,
                MTLSharedEvent, MTLCommandBuffer, encode_signal!, encode_wait!, commit!,
-               BatchedCommandQueue
+               BatchedCommandQueue, ConcreteBatchedQueue
 
 import KernelInterface as KI
 
@@ -29,7 +29,7 @@ buffer used on two queues is ordered by the ownership check every launch makes (
 `try_launch`): the launch waits for the queue that still uses it.
 """
 struct MetalBackend <: KI.Backend
-    queue::Union{Nothing,BatchedCommandQueue}
+    queue::Union{Nothing,ConcreteBatchedQueue}
 end
 MetalBackend() = MetalBackend(nothing)
 
@@ -255,8 +255,7 @@ function KI.wait_event(::MetalBackend, ev::Tuple{MTLSharedEvent, UInt64})
     bq = global_queue(device())
     # other tasks may commit the open batch, but only while holding this lock
     Base.@lock Metal.submission_lock begin
-        Metal.end_encoder!(bq)
-        encode_wait!(Metal.ensure_cmdbuf!(bq), event, value)
+        Metal.encode_event_wait!(bq, event, value)
         Metal.record_operation!(bq, event)
     end
     Metal.maybe_autoflush!(bq)

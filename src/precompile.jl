@@ -17,8 +17,13 @@ using PrecompileTools: @setup_workload, @compile_workload
         #       command buffer and waiting for it) hangs during precompilation.
         mtlfunction(identity, Tuple{Nothing})
 
+        # the rest needs a command queue, which can't be created when the `command_api`
+        # preference selects an API this system doesn't support (`__init__` reports that)
+        command_api_supported =
+            COMMAND_API === :metal3 || metal4_unsupported_reason(device()) === nothing
+
         # exercise the integrated profiler and its display path:
-        sprint(show, @profile @metal identity(nothing))
+        command_api_supported && sprint(show, @profile @metal identity(nothing))
 
         # exercise MtlArray creation and host↔device copy paths in both 1D and 2D
         for h in (Float32[0], Float32[0;;])
@@ -35,7 +40,7 @@ using PrecompileTools: @setup_workload, @compile_workload
         # those shared methods leak into the package image and shadow the host versions,
         # crashing the host with unresolved `julia.air.*` intrinsics when it later
         # compiles the corresponding `Base` method.
-        @static if VERSION >= v"1.11"
+        @static if VERSION >= v"1.11"; if command_api_supported
             let a = MtlArray([1, 2, 3])
                 a .+ 1
                 synchronize()
@@ -53,7 +58,7 @@ using PrecompileTools: @setup_workload, @compile_workload
                 LinearAlgebra.mul!(similar(a), a, a)
                 synchronize()
             end
-        end
+        end; end
     end
 
     # Caches populated by the workload hold ObjectiveC handles whose underlying
@@ -67,6 +72,7 @@ using PrecompileTools: @setup_workload, @compile_workload
     empty!(residency_attached_queues)
     empty!(residency_members)
     empty!(pending_residency_drops)
+    Base.@lock device_residencies_lock empty!(device_residencies)
     Base.@lock memory_pressure_stats_lock empty!(_memory_pressure_stats)
     empty!(device_malloc_bufs)
     empty!(MTL.submission_state_per_queue)

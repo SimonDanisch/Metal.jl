@@ -6,8 +6,9 @@ export synchronize, device_synchronize, CommandBufferError
 const use_nonblocking_synchronization =
     @load_preference("nonblocking_synchronization", true)
 
-is_completed(cmdbuf::MTL.MTLCommandBufferLike) =
-    cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
+is_completed(cmdbuf::MTL.MTLCommandBufferLike) = MTL.is_completed(cmdbuf)
+
+wait_completed!(cmdbuf::MTL.MTLCommandBufferLike) = wait_cmdbuf!(cmdbuf)
 
 # wait for a committed command buffer to complete, without blocking the calling thread so
 # that other tasks can run in the meantime. pass `handlers=true` to also wait for its
@@ -226,6 +227,27 @@ function wait_and_release!(cmdbuf::MTL.MTLCommandBufferRef)
     return
 end
 
+# Wait for everything `point` covers: the newest command buffer, after which the queue's
+# earlier ones are done too, and each Metal 4 submission, as one is only known to have
+# completed once its feedback ran, which can come after work committed later.
+#
+# Then for whatever the point covers that is still running: a command buffer enqueued
+# before work committed ahead of it runs first, and that work after it (see
+# `MTL.oldest_pending`). Nothing in the common case, where the newest commit ran last.
+function wait_point!(point::MTL.SyncPoint)
+    try
+        point.pending4 === nothing || foreach(wait_completed!, point.pending4)
+    finally
+        wait_and_release!(point.last)
+    end
+    while true
+        cmdbuf = MTL.oldest_pending(point)
+        cmdbuf === nothing && break
+        wait_and_release!(cmdbuf)
+    end
+    return
+end
+
 
 #
 # public API
@@ -262,7 +284,7 @@ function synchronize(bq::BatchedCommandQueue)
 
     # Handles the already-completed fast path internally.
     point = MTL.sync_point(queue)
-    wait_and_release!(point.last)
+    wait_point!(point)
 
     points = orphans === nothing ? nothing : wait_orphaned_queues!(orphans)
     finish_synchronize!(bq, upto, point, orphans, points)
@@ -310,17 +332,17 @@ function synchronize_queue(bq::BatchedCommandQueue)
     (bq.owner === current_task() || istaskdone(bq.owner)) && return synchronize(bq)
 
     Base.@lock submission_lock commit_batch!(bq)
-    wait_and_release!(MTL.sync_point(bq.queue).last)
+    wait_point!(MTL.sync_point(bq.queue))
     return
 end
 
 # wait for the queues finished tasks left work in, and say where each of them got to
-function wait_orphaned_queues!(orphans::Vector{BatchedCommandQueue})
+function wait_orphaned_queues!(orphans::Vector{ConcreteBatchedQueue})
     points = MTL.SyncPoint[]
     for bq in orphans
         drain_logging_cmdbufs!(bq.queue)
         point = MTL.sync_point(bq.queue)
-        wait_and_release!(point.last)
+        wait_point!(point)
         push!(points, point)
     end
     return points
@@ -341,6 +363,9 @@ Synchronize all committed GPU work across all global queues.
 """
 function device_synchronize()
     flush_batched_queues!()
+    @static if COMMAND_API === :metal4
+        Base.@lock submission_lock process_freed!()
+    end
     maybe_collect(device(); will_block=true)
 
     queues = active_global_queues()
@@ -349,15 +374,20 @@ function device_synchronize()
         drain_logging_cmdbufs!(raw_queue(queue))
     end
 
-    # the last command buffer committed to each queue completes after the earlier ones.
-    # every `last` comes with a reference of ours, given back however the waits end.
+    # every queue's sync point (see `wait_point!`). every `last` comes with a reference of
+    # ours, given back however the waits end.
     points = MTL.sync_points()
+    waited = 0
     try
-        for p in points
-            p.last === nothing || wait_cmdbuf!(p.last)
+        for i in eachindex(points)
+            wait_point!(points[i])
+            waited = i
         end
     finally
-        for p in points
+        # `wait_point!` gives back its point's reference however it ends; these are the
+        # ones it never got to
+        for i in (waited + 2):length(points)
+            p = points[i]
             p.last === nothing || release(p.last)
         end
     end
