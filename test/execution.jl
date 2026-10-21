@@ -42,9 +42,60 @@ end
     # TODO: kernel introspection
 end
 
+@testset "threadgroup size hints" begin
+    # maxthreads is forwarded to the GPUCompiler target
+    @test Metal.compiler_config(device(); maxthreads=256).target.maxthreads == 256
+    # and applied to the compute pipeline
+    k = Metal.mtlfunction(dummy; maxthreads=256)
+    @test k.pipeline.maxTotalThreadsPerThreadgroup == 256
+    @test k.maxthreads == 256
+    k(; threads=256)
+    @test_throws ArgumentError k(; threads=512)
+    # and accepted by the `@metal` macro
+    @metal maxthreads=256 dummy()
+    k = @metal launch=false maxthreads=256 dummy()
+    @test k.maxthreads == 256
+
+    # invalid sizes are rejected before reaching Metal, which would abort or fail to compile
+    @test_throws ArgumentError Metal.compiler_config(device(); maxthreads=0)
+    @test_throws ArgumentError Metal.compiler_config(device(); maxthreads=2048)
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=0)
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=(32, 0, 1))
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=(1, 1, 1, 1))
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=2048)
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=(32, 32, 2))
+    @test_throws ArgumentError Metal.compiler_config(device(); minthreads=(1 << 32, 1 << 32, 1))
+
+    # minthreads requires macOS 26, independent of the targeted Metal version
+    if Metal.macos_version() >= v"26"
+        # sizes are normalized to three dimensions
+        @test Metal.compiler_config(device(); minthreads=32).target.minthreads == (32, 1, 1)
+        @test Metal.compiler_config(device(); minthreads=(8, 4)).target.minthreads == (8, 4, 1)
+        @test Metal.compiler_config(device(); metal=v"3.2", minthreads=32).target.minthreads == (32, 1, 1)
+        @test_throws ArgumentError Metal.compiler_config(device(); minthreads=32, maxthreads=16)
+
+        k = Metal.mtlfunction(dummy; minthreads=(32, 1, 1))
+        @test k.pipeline.requiredThreadsPerThreadgroup == MTL.MTLSize(32, 1, 1)
+        @test k.pipeline.maxTotalThreadsPerThreadgroup == 32
+        @test k.reqthreads == MTL.MTLSize(32, 1, 1)
+        k(; threads=32)
+        k(; threads=(32, 1, 1))
+        # launching with any other threadgroup size is rejected up front,
+        # whether it has fewer or more threads, or the same number in another shape
+        @test_throws "should equal the kernel's minthreads (32, 1, 1)" k(; threads=16)
+        @test_throws "should equal the kernel's minthreads (32, 1, 1)" k(; threads=64)
+        @test_throws "should equal the kernel's minthreads (32, 1, 1)" k(; threads=(16, 2))
+    else
+        @test_throws ArgumentError Metal.compiler_config(device(); minthreads=32)
+    end
+end
+
 @testset "inference" begin
     foo() = @metal dummy()
     @inferred foo()
+    # the kernel object is constructed on every launch, so its fields should be inferred
+    fields = only(Base.return_types(Metal.link_kernel, (Core.MethodInstance,)))
+    @test Any ∉ fieldtypes(fields)
 
     # with arguments, we call mtlconvert
     kernel(a) = return
@@ -61,6 +112,12 @@ end
     @metal range_kernel(a)
     @test Array(a) == [5]
 end
+
+# Upstream's "launch code is shared between kernels" is not run here: this fork keeps the
+# launch path specialised per kernel on purpose (see the comment above `try_launch` in
+# src/compiler/execution.jl), because a `@nospecialize`d path boxes the kernel state and
+# the arguments on every launch. Its methods also take an `indirect` default argument, so
+# `only(methods(f))` has two to choose from.
 
 
 @testset "reflection" begin
@@ -152,6 +209,11 @@ end
             device(); gpufamily=MTL.MTLGPUFamilyMetal3)
         @test Metal.compiler_config(
             device(); gpufamily=MTL.MTLGPUFamilyApple7).params.apple_family == 7
+        # newer than any device we test on, but code can still be generated for it
+        @test Metal.compiler_config(
+            device(); gpufamily=MTL.MTLGPUFamilyApple11).params.apple_family == 11
+        @test !isempty(sprint(io->Metal.code_llvm(io, dummy, Tuple{};
+                                                  gpufamily=MTL.MTLGPUFamilyApple11)))
 
         @test occursin("""!{!"Metal", i32 3, i32 2, i32 1}""",
                        sprint(io->Metal.code_llvm(io, dummy, Tuple{}; metal=v"3.2.1",
@@ -171,8 +233,11 @@ end
                                                       dump_module=true, kernel=true)))
 
         # targeting macOS < 15, or the AIR versions that come with it, is not supported
-        @test_throws "Metal.jl requires AIR 2.7" begin
+        @test_throws "Metal.jl requires macOS 15" begin
             Metal.code_llvm(devnull, dummy, Tuple{}; macos=v"14")
+        end
+        @test_throws "Metal.jl requires macOS 15" begin
+            Metal.code_llvm(devnull, dummy, Tuple{}; macos=v"14", metal=v"3.2")
         end
         @test_throws "Metal.jl requires AIR 2.7" begin
             Metal.code_llvm(devnull, dummy, Tuple{}; air=v"2.6")
@@ -184,6 +249,66 @@ end
         @test Metal.compiler_config(device(); macos=v"15", metal=v"4.1").target.air == v"2.9"
         @test_throws "Metal 4.1.0 requires AIR 2.9.0" begin
             Metal.code_llvm(devnull, dummy, Tuple{}; metal=v"4.1", air=v"2.8")
+        end
+
+        # like the offline compiler, everything follows one effective deployment target:
+        # a language version that needs a newer macOS raises the target, including the
+        # metallib's file format and platform version.
+        function compiled_library(; kwargs...)
+            cfg = Metal.compiler_config(device(); kernel=true, kwargs...)
+            src = Metal.methodinstance(typeof(dummy), Tuple{}, Base.get_world_counter())
+            job = Metal.CompilerJob(src, cfg, Base.get_world_counter())
+            lib = read(IOBuffer(Metal.compile_to_metallib(job).metallib), Metal.MetalLib)
+            return cfg.target, lib
+        end
+        let (target, lib) = compiled_library(; macos=v"15", metal=v"4.1")
+            @test target.macos == v"27"
+            @test target.air == v"2.9"
+            @test lib.file_version == v"1.2.9"
+            @test lib.platform_version == v"27"
+        end
+        let (target, lib) = compiled_library(; macos=v"15", metal=v"4.0")
+            @test target.macos == v"26"
+            @test target.air == v"2.8"
+            @test lib.file_version == v"1.2.9"
+            @test lib.platform_version == v"26"
+        end
+        # targets newer than the host can be compiled, but loading them fails with a
+        # clear error. the newest macOS shares its versions with whatever comes next, so
+        # test with an AIR version the host doesn't support.
+        let air = VersionNumber(2, Metal.air_support().minor + 1)
+            @test !isempty(sprint(io->Metal.code_llvm(io, dummy, Tuple{}; air)))
+            # (not `@test_throws`, which passes on Apple's error: `NSError` isn't an `Exception`)
+            err = try
+                @metal launch=false air=air dummy()
+            catch err
+                err
+            end
+            @test err isa ErrorException
+            @test occursin("which this system (macOS $(Metal.macos_version())) cannot load",
+                           sprint(showerror, err))
+        end
+        let host = Metal.macos_version(), target = Metal.compiler_config(device()).target
+            # what the host compiles for by default, or for an older or newer macOS that
+            # uses the same versions, can be loaded
+            @test Metal.check_loadable(target) === nothing
+            @test Metal.check_loadable((; macos=v"15", air=v"2.7", metal=v"3.2")) === nothing
+            @test Metal.check_loadable((; target.air, target.metal,
+                                          macos=VersionNumber(host.major + 1))) === nothing
+            @test Metal.check_loadable((; target.macos,
+                                          air=VersionNumber(target.air.major, target.air.minor, 1),
+                                          metal=VersionNumber(target.metal.major, target.metal.minor, 1))) === nothing
+            # unsupported AIR or MSL versions can't be
+            @test_throws ErrorException Metal.check_loadable(
+                (; target.macos, target.metal, air=VersionNumber(2, Metal.air_support().minor + 1)))
+            @test_throws ErrorException Metal.check_loadable(
+                (; target.macos, target.air, metal=VersionNumber(4, Metal.metal_support().minor + 1)))
+        end
+        let (target, lib) = compiled_library(; macos=v"15", metal=v"3.2")
+            @test target.macos == v"15"
+            @test target.air == v"2.7"
+            @test lib.file_version == v"1.2.8"
+            @test lib.platform_version == v"15"
         end
     end
 
@@ -283,16 +408,16 @@ end
         @metal threads=1 queue=queue increment_kernel(A)
     end
     if !Metal.command_batching() || Metal.profiling_command_buffers()
-        @test queue.cmdbuf === nothing
+        @test !Metal.has_open_batch(queue)
     elseif Metal.command_batching_ops() > 1
         @test queue.nops == 8
     end
     synchronize(queue)
     @test Array(A) == Int32[8]
-    @test queue.cmdbuf === nothing
+    @test !Metal.has_open_batch(queue)
 
     @metal threads=1 queue=queue submit=true increment_kernel(A)
-    @test queue.cmdbuf === nothing
+    @test !Metal.has_open_batch(queue)
     synchronize(queue)
     @test Array(A) == Int32[9]
 
@@ -311,7 +436,7 @@ end
     @metal threads=1 queue=queue write_kernel(D, UInt8(1))
     cmdbuf = MTL.MTLCommandBuffer(queue)
     if !Metal.command_batching() || Metal.profiling_command_buffers()
-        @test queue.cmdbuf === nothing
+        @test !Metal.has_open_batch(queue)
     elseif Metal.command_batching_ops() > 1
         @test queue.nops == 1
     end
@@ -455,8 +580,8 @@ end
     synchronize(queue)
 
     @test_throws ErrorException @metal threads=1 queue=queue failed_encode_kernel(EncodeFailure(1))
-    @test queue.cmdbuf === nothing
-    @test queue.encoder === nothing
+    @test !Metal.has_open_batch(queue)
+    @test queue.backend.encoder === nothing
     @test queue.nops == 0
 
     A = MtlArray(Int32[0])
@@ -465,8 +590,8 @@ end
 
     if Metal.command_batching() && !Metal.profiling_command_buffers() &&
        Metal.command_batching_ops() > 1
-        @test queue.cmdbuf !== nothing
-        @test queue.encoder === nothing
+        @test Metal.has_open_batch(queue)
+        @test queue.backend.encoder === nothing
         @test queue.nops == 1
     end
 
@@ -519,9 +644,9 @@ end
         end
         queue = fetch(t)
         @test Array(a) == ones(Float32, 16)
-        @test queue.cmdbuf === nothing
-        @test isempty(queue.cleanups)
-        @test MTL.last_committed(queue.queue).status == MTL.MTLCommandBufferStatusCompleted
+        @test !Metal.has_open_batch(queue)
+        @test isempty(Metal.pending_commands(queue))
+        @test MTL.is_completed(MTL.last_committed(queue.queue))
     end
 
     # host reads of shared memory
@@ -1050,6 +1175,68 @@ end
             @test Array(b) == [42]
         end
     end
+
+    @testset "dynamically indexed closure argument" begin
+        # the closure used to be copied to the stack, where the dynamic indexing of `w` kept
+        # it alive, and the back-end miscompiled the kernel (#1018)
+        function kernel(out, f)
+            i = thread_position_in_grid().x
+            n = length(out)
+            if i > n
+                return
+            elseif i == n
+                out[i] = f(i)
+            else
+                out[i] = f(i) + 0f0 * f(i + 1)
+            end
+            return
+        end
+        make_f(u, J, w) = el -> begin
+            V = 0f0
+            for k in 1:4, j in 1:4, i in 1:4
+                V += J[i, j, k, el] * w[i] * w[j] * w[k] * u[1, i, j, k, el]
+            end
+            return V
+        end
+
+        len = 512
+        u = ones(Float32, 1, 4, 4, 4, len)
+        J = repeat(reshape(Float32.(1:len), 1, 1, 1, len), 4, 4, 4)
+        w = (1f0, 2f0, 3f0, 4f0)
+        out = Metal.zeros(Float32, len)
+        @metal threads=256 groups=cld(len, 256) kernel(out, make_f(MtlArray(u), MtlArray(J), w))
+        @test Array(out) == map(make_f(u, J, w), 1:len)
+    end
+end
+
+@testset "read-only arrays" begin
+    function const_copy(A, B)
+        i = thread_position_in_grid().x
+        @inbounds A[i] = Base.Experimental.Const(B)[i]
+        return
+    end
+    function const_copy_2d(A, B)
+        i, j = thread_position_in_grid().x, thread_position_in_grid().y
+        @inbounds A[i, j] = Base.Experimental.Const(B)[i, j]
+        return
+    end
+
+    A = Metal.zeros(Float32, 64)
+    B = MtlArray(rand(Float32, 64))
+    ir = sprint(io -> Metal.@device_code_llvm io=io raw=true @metal threads=length(A) const_copy(A, B))
+    @test Array(A) == Array(B)
+    @test occursin("!invariant.load", ir)
+
+    A = Metal.zeros(Float32, 8, 8)
+    B = MtlArray(rand(Float32, 8, 8))
+    @metal threads=size(A) const_copy_2d(A, B)
+    @test Array(A) == Array(B)
+end
+
+@testset "Symbols in device memory" begin
+    # loaded as a pointer into thread memory, a Symbol used to lose its upper bits (#1017)
+    syms = MtlArray([(:begin, :end), (:end, :begin)])
+    @test Array(map(t -> t[1] === :begin, syms)) == [true, false]
 end
 
 @testset "compilation cache" begin
@@ -1153,6 +1340,23 @@ end
     end
 end
 
+# `pointer` of a `Const` array, which KernelAbstractions' `@Const` hands a kernel. Without
+# a method of its own it reached Base's error path, and compiling that (it prints the type)
+# crashed the LLVM inliner.
+function const_pointer_kernel(out, a)
+    c = Base.Experimental.Const(a)
+    i = Metal.thread_position_in_grid().x
+    @inbounds out[i] = unsafe_load(pointer(c, i)) + unsafe_load(pointer(c)) * 0f0
+    return nothing
+end
+
+@testset "pointer of a Const array" begin
+    a = MtlArray(Float32.(1:16))
+    out = Metal.zeros(Float32, 16)
+    @metal threads=16 const_pointer_kernel(out, a)
+    @test Array(out) == Float32.(1:16)
+end
+
 @testset "an indirect dispatch of zero threadgroups runs nothing" begin
     # The wavefront case: a queue that emptied. It has to be a no-op rather than
     # an error, and it has to stay on the device — noticing the zero on the host
@@ -1170,4 +1374,29 @@ end
     end
     @test Array(ind) == UInt32[0, 1, 1]
     @test all(==(UInt32(0)), Array(out))
+end
+
+@testset "resource labelling" begin
+    # enable labelling here rather than in a `-g2` process: that would precompile Metal
+    # again, and later sessions would load that image without the kernels it precompiles
+    default = Metal.label_resources_default[]
+    Metal.label_resources_default[] = true
+    try
+        @test Metal.label_resources()
+
+        function kernel(a)
+            a[thread_position_in_grid().x] += 1f0
+            return
+        end
+
+        # a new queue creates its own command API objects, labelling them
+        queue = MTL.MTLCommandQueue(device())
+        a = Metal.zeros(Float32, 4)
+        @test startswith(String(a.data[].buffer.label), "MtlArray{Float32,1,")
+        @metal threads=4 queue=queue kernel(a)
+        synchronize(queue)
+        @test Array(a) == ones(Float32, 4)
+    finally
+        Metal.label_resources_default[] = default
+    end
 end

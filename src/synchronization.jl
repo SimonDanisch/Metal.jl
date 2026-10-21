@@ -6,21 +6,9 @@ export synchronize, device_synchronize, CommandBufferError
 const use_nonblocking_synchronization =
     @load_preference("nonblocking_synchronization", true)
 
-is_completed(cmdbuf::MTL.MTLCommandBufferLike) =
-    cmdbuf.status >= MTL.MTLCommandBufferStatusCompleted
+is_completed(cmdbuf::MTL.MTLCommandBufferLike) = MTL.is_completed(cmdbuf)
 
-# blocking wait, performed on a waiter's thread. `@objc` calls are GC-safe, but the thread
-# has no autorelease pool of its own, so set one up. it cannot be an `@autoreleasepool`,
-# whose global lock may be held by the waiting task.
-function blocking_wait(cmdbuf::MTL.MTLCommandBufferLike)
-    pool = ccall(:objc_autoreleasePoolPush, Ptr{Cvoid}, ())
-    try
-        wait_completed(cmdbuf)
-    finally
-        ccall(:objc_autoreleasePoolPop, Cvoid, (Ptr{Cvoid},), pool)
-    end
-    return
-end
+wait_completed!(cmdbuf::MTL.MTLCommandBufferLike) = wait_cmdbuf!(cmdbuf)
 
 # wait for a committed command buffer to complete, without blocking the calling thread so
 # that other tasks can run in the meantime. pass `handlers=true` to also wait for its
@@ -28,8 +16,7 @@ end
 # may or may not return before they have run.
 #
 # note that long waits use `waitUntilCompleted`, which waits for the completion handlers, so
-# these must not depend on the waiting task, e.g., on locks it holds (like the global lock
-# taken by `@autoreleasepool`).
+# these must not depend on the waiting task, e.g., on locks it holds.
 function wait_cmdbuf!(cmdbuf::MTL.MTLCommandBufferLike; handlers::Bool=false)
     !handlers && is_completed(cmdbuf) && return
 
@@ -37,7 +24,7 @@ function wait_cmdbuf!(cmdbuf::MTL.MTLCommandBufferLike; handlers::Bool=false)
         wait_completed(cmdbuf)
     elseif GC.in_finalizer() || ccall(:jl_generating_output, Cint, ()) != 0
         # no switching tasks here, so no handing the wait to another thread either
-        blocking_wait(cmdbuf)
+        wait_completed(cmdbuf)
     else
         # A view, not a reference: the caller's own keeps `cmdbuf` alive for the call,
         # and the waiter takes one of its own for its thread.
@@ -121,7 +108,9 @@ function waiter_loop(data::Ptr{Cvoid})
         wait(w.work)
         cmdbuf = w.cmdbuf::MTL.MTLCommandBufferRef
         try
-            blocking_wait(cmdbuf)
+            # the thread has no autorelease pool of its own, and needs none: every `@objc`
+            # call runs in a pool of its own (ObjectiveC.jl 7)
+            wait_completed(cmdbuf)
         catch err
             # passed on, and thrown by the waiting task
             w.failure = err
@@ -238,6 +227,27 @@ function wait_and_release!(cmdbuf::MTL.MTLCommandBufferRef)
     return
 end
 
+# Wait for everything `point` covers: the newest command buffer, after which the queue's
+# earlier ones are done too, and each Metal 4 submission, as one is only known to have
+# completed once its feedback ran, which can come after work committed later.
+#
+# Then for whatever the point covers that is still running: a command buffer enqueued
+# before work committed ahead of it runs first, and that work after it (see
+# `MTL.oldest_pending`). Nothing in the common case, where the newest commit ran last.
+function wait_point!(point::MTL.SyncPoint)
+    try
+        point.pending4 === nothing || foreach(wait_completed!, point.pending4)
+    finally
+        wait_and_release!(point.last)
+    end
+    while true
+        cmdbuf = MTL.oldest_pending(point)
+        cmdbuf === nothing && break
+        wait_and_release!(cmdbuf)
+    end
+    return
+end
+
 
 #
 # public API
@@ -252,15 +262,15 @@ for them.
 """
 synchronize() = synchronize(global_queue(device()))
 
-synchronize(queue::MTLCommandQueue) = synchronize(@autoreleasepool batched_queue(queue))
+synchronize(queue::MTLCommandQueue) = synchronize(batched_queue(queue))
 
 # A renderer calls this once a frame, through Mantle's `waitfor!`, so the steady state
-# allocates NOTHING, and the shape below is what that took. The two pools are
-# functions of their own: as `@autoreleasepool begin … end` blocks inside this body,
+# allocates NOTHING, and the shape below is what that took. The commit before the wait
+# and the release after it are functions of their own: as `@autoreleasepool begin … end`
+# blocks inside this body (before ObjectiveC.jl 7 gave every `@objc` call its own pool),
 # the pool's closure captured a variable that was assigned again after it (two
 # `Core.Box`es a call), and handed back a tuple of a queue and two `Union`s, which was
-# boxed too. The wait between them holds no pool, because `@autoreleasepool` takes a
-# global lock that other tasks would then be waiting on.
+# boxed too.
 function synchronize(bq::BatchedCommandQueue)
     # A scan, and in the steady state an empty one: see `orphaned_batched_queues`.
     orphans = orphaned_batched_queues()
@@ -270,11 +280,11 @@ function synchronize(bq::BatchedCommandQueue)
     # flush any pending log handlers from logging-enabled kernels on this queue
     # (Metal delivers logs asynchronously; waiting for the specific cmdbuf's
     # completion handlers is what processes its `addLogHandler:` blocks)
-    drain_logging_cmdbufs!(queue)
+    drain_logging_cmdbufs!(bq.queue)
 
     # Handles the already-completed fast path internally.
     point = MTL.sync_point(queue)
-    wait_and_release!(point.last)
+    wait_point!(point)
 
     points = orphans === nothing ? nothing : wait_orphaned_queues!(orphans)
     finish_synchronize!(bq, upto, point, orphans, points)
@@ -284,7 +294,7 @@ end
 # Commit what is open, on `bq` and on the queues finished tasks left behind, and say
 # how many command buffers `bq` had then handed to `defer_cleanup!`: those are the
 # ones this synchronization retires.
-@autoreleasepool function commit_for_synchronize!(bq::BatchedCommandQueue, orphans)
+function commit_for_synchronize!(bq::BatchedCommandQueue, orphans)
     upto = Base.@lock submission_lock begin
         commit_batch!(bq)
         bq.ncommitted
@@ -297,8 +307,8 @@ end
 end
 
 # Release what the waited-for work held, then report how it went.
-@autoreleasepool function finish_synchronize!(bq::BatchedCommandQueue, upto::Int,
-                                              point::MTL.SyncPoint, orphans, points)
+function finish_synchronize!(bq::BatchedCommandQueue, upto::Int,
+                             point::MTL.SyncPoint, orphans, points)
     # other tasks may have committed more work to this queue while we were waiting,
     # so only force the cleanup of command buffers that were committed before.
     drain_cleanups!(bq; until=upto)
@@ -321,18 +331,18 @@ end
 function synchronize_queue(bq::BatchedCommandQueue)
     (bq.owner === current_task() || istaskdone(bq.owner)) && return synchronize(bq)
 
-    @autoreleasepool Base.@lock submission_lock commit_batch!(bq)
-    wait_and_release!(MTL.sync_point(bq.queue).last)
+    Base.@lock submission_lock commit_batch!(bq)
+    wait_point!(MTL.sync_point(bq.queue))
     return
 end
 
 # wait for the queues finished tasks left work in, and say where each of them got to
-function wait_orphaned_queues!(orphans::Vector{BatchedCommandQueue})
+function wait_orphaned_queues!(orphans::Vector{ConcreteBatchedQueue})
     points = MTL.SyncPoint[]
     for bq in orphans
         drain_logging_cmdbufs!(bq.queue)
         point = MTL.sync_point(bq.queue)
-        wait_and_release!(point.last)
+        wait_point!(point)
         push!(points, point)
     end
     return points
@@ -353,6 +363,9 @@ Synchronize all committed GPU work across all global queues.
 """
 function device_synchronize()
     flush_batched_queues!()
+    @static if COMMAND_API === :metal4
+        Base.@lock submission_lock process_freed!()
+    end
     maybe_collect(device(); will_block=true)
 
     queues = active_global_queues()
@@ -361,15 +374,20 @@ function device_synchronize()
         drain_logging_cmdbufs!(raw_queue(queue))
     end
 
-    # the last command buffer committed to each queue completes after the earlier ones.
-    # every `last` comes with a reference of ours, given back however the waits end.
+    # every queue's sync point (see `wait_point!`). every `last` comes with a reference of
+    # ours, given back however the waits end.
     points = MTL.sync_points()
+    waited = 0
     try
-        for p in points
-            p.last === nothing || wait_cmdbuf!(p.last)
+        for i in eachindex(points)
+            wait_point!(points[i])
+            waited = i
         end
     finally
-        for p in points
+        # `wait_point!` gives back its point's reference however it ends; these are the
+        # ones it never got to
+        for i in (waited + 2):length(points)
+            p = points[i]
             p.last === nothing || release(p.last)
         end
     end

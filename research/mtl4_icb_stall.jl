@@ -128,7 +128,7 @@ for b in icbs; MTL.add_allocation!(rs, b); end
 MTL.commit!(rs)
 
 # An argument table holding the same three slots the ICB commands bind.
-table = MTL.MTL4ArgumentTable(dev; buffers = 4)
+table = MTL.MTL4ArgumentTable(dev; buffers = 4, initialize = true)
 let gpu = UInt64(argbuf.gpuAddress)
     for (i, off) in enumerate((0, 256, 512))
         MTL.set_address!(table, gpu + UInt64(off), i)
@@ -186,8 +186,8 @@ for i in 1:ITER
         MTL.reset!(allocs[slot])
         al = allocs[slot]; cb = cbs[slot]
     end
-    MTL.begin_command_buffer!(cb, al)
-    enc = MTL.compute_encoder(cb)
+    MTL.beginCommandBuffer!(cb, al)
+    enc = MTL.MTL4ComputeCommandEncoder(cb)
     MTL.use_residency_set!(cb, rs)
     if EMPTY
         # nothing
@@ -198,20 +198,20 @@ for i in 1:ITER
         MTL.set_argument_table!(enc, table)
         MTL.set_function!(enc, kern.pipeline)
         MTL.dispatch_threadgroups_indirect!(enc, gridbuf, 0, Metal.MTLSize(256))
-        BARRIER && MTL.barrier!(enc)
+        BARRIER && MTL.barrierAfterEncoderStages!(enc, MTL.MTLStageDispatch, MTL.MTLStageDispatch)
     elseif DIRECT
         # The same kernel, dispatched straight onto the MTL4 encoder through an
         # argument table, so the only difference from the branch below is that no
         # indirect command buffer is involved.
         MTL.set_argument_table!(enc, table)
         MTL.set_function!(enc, kern.pipeline)
-        MTL.dispatch_threadgroups!(enc, Metal.MTLSize(cld(N, 256)), Metal.MTLSize(256))
+        MTL.dispatchThreadgroups!(enc, Metal.MTLSize(cld(N, 256)), Metal.MTLSize(256))
     elseif INDIRECTRANGE
         # The OTHER execute form: the command processor reads (location, length)
         # from memory instead of taking it from the encoder. Different path in
         # the driver, and the one a gated plan already uses.
         MTL.execute_commands_indirect!(enc, icbs[mod1(i, NICB)], rangebuf, 0)
-        BARRIER && MTL.barrier!(enc)
+        BARRIER && MTL.barrierAfterEncoderStages!(enc, MTL.MTLStageDispatch, MTL.MTLStageDispatch)
     elseif RAWSEND
         # Bypass the wrapper entirely: the selector sent by hand, so the stall
         # cannot be blamed on how Metal.jl marshals an NSRange.
@@ -222,13 +222,13 @@ for i in 1:ITER
               ccall(:sel_registerName, Ptr{Cvoid}, (Cstring,),
                     "executeCommandsInBuffer:withRange:"),
               reinterpret(Ptr{Cvoid}, pointer(b)), MTL.NSRange(0, 1))
-        BARRIER && MTL.barrier!(enc)
+        BARRIER && MTL.barrierAfterEncoderStages!(enc, MTL.MTLStageDispatch, MTL.MTLStageDispatch)
     else
         MTL.execute_commands!(enc, icbs[mod1(i, NICB)], 1:1)
-        BARRIER && MTL.barrier!(enc)
+        BARRIER && MTL.barrierAfterEncoderStages!(enc, MTL.MTLStageDispatch, MTL.MTLStageDispatch)
     end
     MTL.endEncoding!(enc)
-    MTL.end_command_buffer!(cb)
+    MTL.endCommandBuffer!(cb)
     # RAW_FRESHQ: a brand new MTL4 queue per submission, to ask whether the limit
     # is per QUEUE. If it is, rotating queues is a workaround that keeps the
     # indirect command buffer — and so `repeat!` gates — working.

@@ -2,9 +2,9 @@ module MetalKernels
 
 using ..Metal
 using ..Metal: @device_override, DefaultStorageMode, SharedStorage, metal_support,
-               mtlfunction, mtlconvert, try_launch, MTL, MTLSize, @autoreleasepool,
+               mtlfunction, mtlconvert, try_launch, MTL, MTLSize,
                MTLSharedEvent, MTLCommandBuffer, encode_signal!, encode_wait!, commit!,
-               BatchedCommandQueue
+               BatchedCommandQueue, ConcreteBatchedQueue
 
 import KernelInterface as KI
 
@@ -29,7 +29,7 @@ buffer used on two queues is ordered by the ownership check every launch makes (
 `try_launch`): the launch waits for the queue that still uses it.
 """
 struct MetalBackend <: KI.Backend
-    queue::Union{Nothing,BatchedCommandQueue}
+    queue::Union{Nothing,ConcreteBatchedQueue}
 end
 MetalBackend() = MetalBackend(nothing)
 
@@ -47,8 +47,19 @@ KI.supports_float64(::MetalBackend) = false
 KI.supports_atomics(::MetalBackend) = metal_support() >= v"4.1"
 KI.supports_unified(::MetalBackend) = true
 KI.supports_subgroups(::MetalBackend) = true
-KI.supports_shuffle(::MetalBackend, ::Type{T}) where {T} =
-    T <: Union{Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8}
+# Metal doesn't specify how SIMD-groups are formed, but Apple GPUs form them from consecutive
+# linear thread indices, and KernelInterface's testsuite checks that. SIMD-groups of a
+# threadgroup execute independently.
+KI.supports_linear_subgroups(::MetalBackend) = true
+KI.supports_independent_subgroups(::MetalBackend) = true
+# MSL has no barrier for part of a SIMD-group, but Apple GPUs execute a SIMD-group with a
+# single program counter and an execution mask, serializing divergent paths, so the lanes of a
+# segment in segment-uniform control flow execute in lock-step: see `KI.sub_group_barrier`.
+KI.supports_partitionable_subgroups(::MetalBackend) = true
+# the types Metal's SIMD-group shuffles support natively. KernelInterface's fallbacks shuffle
+# other primitive types (e.g. 64-bit integers) and structs as `UInt32` words.
+const ShuffleTypes = Union{Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8}
+KI.supports_shuffle(::MetalBackend, ::Type{<:ShuffleTypes}) = true
 # `simd_shuffle` takes the same types as `simd_shuffle_down`: both come from
 # `simd_shuffle_map`. Float64 is absent because an Apple GPU does not have it.
 KI.shfl_types(::MetalBackend) =
@@ -197,7 +208,9 @@ end
 
 @device_override KI.get_sub_group_size(::Type{T}) where {T} = active_simdgroup_size() % T
 
-@device_override KI.get_max_sub_group_size(::Type{T}) where {T} = threads_per_simdgroup() % T
+# a constant rather than `threads_per_simdgroup()`, so that code depending on it is
+# specialized for it: `kernel_function` checks that kernels are compiled for this width
+@device_override KI.get_max_sub_group_size(::Type{T}) where {T} = SIMD_WIDTH % T
 
 @device_override KI.get_num_sub_groups(::Type{T}) where {T} = simdgroups_per_threadgroup() % T
 
@@ -224,7 +237,7 @@ end
 ## events
 
 # signal a new event once the work the task has queued so far completes
-@autoreleasepool function KI.record_event(::MetalBackend)
+function KI.record_event(::MetalBackend)
     dev = device()
     event = MTLSharedEvent(dev)
     value = event.signaledValue + 1
@@ -242,8 +255,7 @@ function KI.wait_event(::MetalBackend, ev::Tuple{MTLSharedEvent, UInt64})
     bq = global_queue(device())
     # other tasks may commit the open batch, but only while holding this lock
     Base.@lock Metal.submission_lock begin
-        Metal.end_encoder!(bq)
-        encode_wait!(Metal.ensure_cmdbuf!(bq), event, value)
+        Metal.encode_event_wait!(bq, event, value)
         Metal.record_operation!(bq, event)
     end
     Metal.maybe_autoflush!(bq)
@@ -251,7 +263,7 @@ function KI.wait_event(::MetalBackend, ev::Tuple{MTLSharedEvent, UInt64})
 end
 
 
-## synchronization and printing
+## synchronization
 
 @device_override @inline function KI.barrier()
     threadgroup_barrier(Metal.MemoryFlagDevice | Metal.MemoryFlagThreadGroup)
@@ -261,20 +273,64 @@ end
     simdgroup_barrier(Metal.MemoryFlagDevice | Metal.MemoryFlagThreadGroup)
 end
 
-@device_override function KI.shfl_down(val::T, offset::Integer) where T
-    simd_shuffle_down(val, offset)
+# MSL does not specify an execution barrier for a segment of a SIMD-group. On Apple GPUs,
+# control flow that is uniform over a segment executes in lock-step within it, which we rely on
+# for the rendezvous (validated on M1 and M3 with a stress test of diverging segments), and a
+# SIMD-group-scope fence orders threadgroup and device memory. A full `simdgroup_barrier` would
+# need every lane of the SIMD-group, including those of segments on other paths.
+@device_override @inline function KI.sub_group_barrier(width::Integer)
+    if width >= 32
+        simdgroup_barrier(Metal.MemoryFlagDevice | Metal.MemoryFlagThreadGroup)
+    else
+        atomic_thread_fence(Metal.MemoryFlagDevice | Metal.MemoryFlagThreadGroup,
+                            Metal.memory_order_seq_cst, Metal.thread_scope_simdgroup)
+    end
 end
 
-# `lane + 1`: KI's lane is ABSOLUTE and ZERO-based, while `simd_shuffle` takes a one-based
-# lane. The off-by-one reads a neighbour's value rather than failing, so nothing catches it
-# but a test that checks WHICH lane it got.
-@device_override function KI.shfl(val::T, lane::Integer) where T
-    simd_shuffle(val, lane + 1)
-end
 
+## sub-group communication
+
+# Lanes and masks are wrapped with `% Int16` (the type the intrinsics take), which unlike a
+# conversion can't throw: out of range, they give an unspecified value. They are also reduced
+# to the SIMD-group width, since Metal requires a valid lane. Offsets are compared with the
+# width before narrowing them, so that `shfl_down` and `shfl_up` by any offset past the width
+# return the work-item's own value, which Metal's shuffles do for a `delta` of 0.
+
+@inline shuffle_lane(lane::Integer) = (((lane - 1) % Int16) & Int16(SIMD_WIDTH - 1)) + Int16(1)
+@inline shuffle_mask(mask::Integer) = (mask % Int16) & Int16(SIMD_WIDTH - 1)
+
+@device_override @inline KI.shfl(val::ShuffleTypes, lane::Integer) =
+    simd_shuffle(val, shuffle_lane(lane))
+
+@inline shuffle_delta(offset::Integer) = ifelse(offset < SIMD_WIDTH, offset % Int16, Int16(0))
+
+@device_override @inline KI.shfl_down(val::ShuffleTypes, offset::Integer) =
+    simd_shuffle_down(val, shuffle_delta(offset))
+
+@device_override @inline KI.shfl_up(val::ShuffleTypes, offset::Integer) =
+    simd_shuffle_up(val, shuffle_delta(offset))
+
+@device_override @inline KI.shfl_xor(val::ShuffleTypes, mask::Integer) =
+    simd_shuffle_xor(val, shuffle_mask(mask))
+
+# MSL leaves the bits of `simd_ballot` past the SIMD-group width undefined, so the ballot is
+# masked to the lanes of the SIMD-group (which only leaves lanes past the end of a partial
+# one). `sub_group_all` checks that no lane has `pred` false, rather than that all bits are set.
+@inline function ballot(pred::Bool)
+    lanes = (UInt64(1) << (active_simdgroup_size() % UInt32)) - UInt64(1)
+    return simd_ballot(pred) & lanes
+end
+@device_override @inline KI.sub_group_ballot(pred::Bool) = ballot(pred)
+@device_override @inline KI.sub_group_any(pred::Bool) = ballot(pred) != 0
+@device_override @inline KI.sub_group_all(pred::Bool) = ballot(!pred) == 0
+
+# the hardware reduction, rather than a shuffle loop
 @device_override function KI.sub_group_reduce_add(val::T) where T
     simd_sum(val)
 end
+
+
+## printing
 
 @device_override @inline function KI._print(args...)
     Metal._mtlprint(args...)

@@ -15,11 +15,11 @@ import Base.FastMath
 # intrinsics, and the float `min`/`max` (minNum, `air.fmin`) — so a back-end change that stops
 # emitting them is caught here instead of silently regressing performance.
 #
-# The operations handled by a front-end `@device_override` emit their `air.*` intrinsic
-# directly into the Julia-generated IR, so we inspect `Metal.code_llvm` (no GPU or metallib
-# build needed). The ones lowered by GPUCompiler's back-end keep their generic `llvm.*`
-# intrinsic at that stage and only become `air.*` during machine-code generation, so those
-# are inspected through `Metal.code_air` (which lowers, downgrades, and disassembles).
+# Operations with an LLVM intrinsic (emitted by Julia, or by the overrides here) keep it in the
+# Julia-generated IR and only become `air.*` during machine-code generation, so those are
+# inspected through `Metal.code_air` (which lowers, downgrades, and disassembles). The ones
+# without an LLVM intrinsic call their `air.*` function directly, so `Metal.code_llvm` (no
+# metallib build needed) suffices.
 # Each function is spliced into the compiled closure via `@eval` so the call is a concrete,
 # specializable call (a captured `Function` would dispatch dynamically and never lower).
 
@@ -45,15 +45,15 @@ FLOAT_A = [acos, acosh, asin, asinh, atan, atanh, cos, cosh,
     @eval begin
         @test @filecheck begin
             @check $("@air.$root.f32")
-            Metal.code_llvm(x -> $f(x), Tuple{Float32})
+            Metal.code_air(x -> $f(x), Tuple{Float32})
         end
         @test @filecheck begin
             @check $("@air.$root.$half")
-            Metal.code_llvm(x -> $f(x), Tuple{Float16})
+            Metal.code_air(x -> $f(x), Tuple{Float16})
         end
         @test @filecheck begin
             @check $("@air.fast_$root.f32")
-            Metal.code_llvm(x -> $fast(x), Tuple{Float32})
+            Metal.code_air(x -> $fast(x), Tuple{Float32})
         end
     end
 end
@@ -85,15 +85,15 @@ end
     @eval begin
         @test @filecheck begin
             @check $("@air.$root.f32")
-            Metal.code_llvm(x -> $f(x), Tuple{Float32})
+            Metal.code_air(x -> $f(x), Tuple{Float32})
         end
         @test @filecheck begin
             @check $("@air.$root.f16")
-            Metal.code_llvm(x -> $f(x), Tuple{Float16})
+            Metal.code_air(x -> $f(x), Tuple{Float16})
         end
         @test @filecheck begin
             @check $("@air.fast_$root.f32")
-            Metal.code_llvm(x -> $fast(x), Tuple{Float32})
+            Metal.code_air(x -> $fast(x), Tuple{Float32})
         end
     end
 end
@@ -103,7 +103,7 @@ end
     fast = getfield(Metal, Symbol(root, "_fast"))
     @eval @test @filecheck begin
         @check $("@air.fast_$root.f32")
-        Metal.code_llvm(x -> $fast(x), Tuple{Float32})
+        Metal.code_air(x -> $fast(x), Tuple{Float32})
     end
 end
 
@@ -112,15 +112,15 @@ end
     @eval begin
         @test @filecheck begin
             @check "@air.atan2.f32"
-            Metal.code_llvm((x, y) -> atan(x, y), Tuple{Float32,Float32})
+            Metal.code_air((x, y) -> atan(x, y), Tuple{Float32,Float32})
         end
         @test @filecheck begin
             @check "@air.atan2.f16"
-            Metal.code_llvm((x, y) -> atan(x, y), Tuple{Float16,Float16})
+            Metal.code_air((x, y) -> atan(x, y), Tuple{Float16,Float16})
         end
         @test @filecheck begin
             @check "@air.fast_atan2.f32"
-            Metal.code_llvm((x, y) -> $(FastMath.atan_fast)(x, y), Tuple{Float32,Float32})
+            Metal.code_air((x, y) -> $(FastMath.atan_fast)(x, y), Tuple{Float32,Float32})
         end
     end
 end
@@ -128,15 +128,15 @@ end
     @eval begin
         @test @filecheck begin
             @check "@air.pow.f32"
-            Metal.code_llvm((x, y) -> x^y, Tuple{Float32,Float32})
+            Metal.code_air((x, y) -> x^y, Tuple{Float32,Float32})
         end
         @test @filecheck begin
             @check "@air.pow.f16"
-            Metal.code_llvm((x, y) -> x^y, Tuple{Float16,Float16})
+            Metal.code_air((x, y) -> x^y, Tuple{Float16,Float16})
         end
         @test @filecheck begin
             @check "@air.fast_pow.f32"
-            Metal.code_llvm((x, y) -> $(FastMath.pow_fast)(x, y), Tuple{Float32,Float32})
+            Metal.code_air((x, y) -> $(FastMath.pow_fast)(x, y), Tuple{Float32,Float32})
         end
     end
 end
@@ -174,7 +174,7 @@ end
         # (have_fma(::MetalCompilerTarget) is true).
         @test @filecheck begin
             @check "@air.fma.f16"
-            Metal.code_llvm((a, b, c) -> fma(a, b, c), Tuple{Float16,Float16,Float16})
+            Metal.code_air((a, b, c) -> fma(a, b, c), Tuple{Float16,Float16,Float16})
         end
         @test @filecheck begin
             @check "@air.fma.f32"
@@ -184,7 +184,7 @@ end
         # back-end's llvm.sqrt lowering.
         @test @filecheck begin
             @check "@air.sqrt.f16"
-            Metal.code_llvm(x -> sqrt(x), Tuple{Float16})
+            Metal.code_air(x -> sqrt(x), Tuple{Float16})
         end
         @test @filecheck begin
             @check "@air.sqrt.f32"
@@ -196,16 +196,68 @@ end
         end
         @test @filecheck begin
             @check "@air.sincos.f32"
-            Metal.code_llvm(x -> sincos(x), Tuple{Float32})
+            Metal.code_air(x -> sincos(x), Tuple{Float32})
         end
         @test @filecheck begin
             @check "@air.sincos.f32"
-            Metal.code_llvm(x -> sincos(x), Tuple{Float16})
+            Metal.code_air(x -> sincos(x), Tuple{Float16})
         end
         @test @filecheck begin
             @check "@air.fast_sincos.f32"
-            Metal.code_llvm(x -> $(FastMath.sincos_fast)(x), Tuple{Float32})
+            Metal.code_air(x -> $(FastMath.sincos_fast)(x), Tuple{Float32})
         end
+    end
+end
+
+# The transcendentals are emitted as LLVM intrinsics (on LLVMs that have them), with the fast
+# variants marked `afn`, so that LLVM can optimize them and `fastmath=true` relaxes them.
+@testset "LLVM intrinsics" begin
+    @eval begin
+        @test @filecheck begin
+            @check "call float @llvm.exp.f32"
+            Metal.code_llvm(x -> exp(x), Tuple{Float32})
+        end
+        @test @filecheck begin
+            @check "call afn float @llvm.exp.f32"
+            Metal.code_llvm(x -> $(FastMath.exp_fast)(x), Tuple{Float32})
+        end
+        # (intrinsics of newer LLVMs)
+        @test @filecheck begin
+            @check $(Base.libllvm_version >= v"19" ? "call float @llvm.tan.f32" : "@air.tan.f32")
+            Metal.code_llvm(x -> tan(x), Tuple{Float32})
+        end
+        @test @filecheck begin
+            @check $(Base.libllvm_version >= v"20" ? "call afn float @llvm.atan2.f32" :
+                                                "@air.fast_atan2.f32")
+            Metal.code_llvm((x, y) -> $(FastMath.atan_fast)(x, y), Tuple{Float32,Float32})
+        end
+        @test @filecheck begin
+            @check $(Base.libllvm_version >= v"20" ? "@llvm.sincos.f32" : "@air.sincos.f32")
+            Metal.code_llvm(x -> sincos(x), Tuple{Float32})
+        end
+        @test @filecheck begin
+            @check "@air.fast_exp.f32"
+            @check "@air.fast_sin.f32"
+            Metal.code_air(x -> exp(x) + sin(x), Tuple{Float32}; fastmath=true)
+        end
+        # constant arguments fold
+        @test @filecheck begin
+            @check_not "@air.exp"
+            Metal.code_air(() -> exp(1f0), Tuple{})
+        end
+    end
+
+    # LLVM rewrites some calls into others, which need lowering too, but must not introduce
+    # calls to the C library (e.g. `ldexpf`, `exp10f` or `tanf`), which Metal doesn't have.
+    @testset "$name" for (name, f, T) in (
+            ("pow(2, i)", i -> 2f0^Float32(i), Int32),
+            ("exp2(i)", i -> exp2(Float32(i)), Int32),
+            ("pow(10, x)", x -> 10f0^x, Float32),
+            ("pow(x, 2)", x -> x^2f0, Float32),
+            ("sin/cos", x -> @fastmath(sin(x) / cos(x)), Float32))
+        # (compilation rejects calls to unknown functions)
+        ir = sprint(io -> Metal.code_air(io, f, Tuple{T}))
+        @test !occursin("@llvm.", ir)
     end
 end
 
@@ -284,6 +336,15 @@ end
     @eval @test @filecheck begin
         @check $("@air.$name.$iN")
         Metal.code_air(x -> $fn(x), Tuple{$T})
+    end
+end
+
+# cmp: LLVM 19+ folds Julia's `ifelse` chain into `llvm.{s,u}cmp`, which AIR lacks
+@testset "cmp $T" for (T, iN, sgn) in INT_TYPES
+    @eval @test @filecheck begin
+        @check_not "@llvm.{{[su]}}cmp"
+        @check $("icmp $(sgn)lt $iN")
+        Metal.code_air((x, y) -> cmp(x, y), Tuple{$T,$T})
     end
 end
 
@@ -816,6 +877,36 @@ end
         Metal.@sync @metal threads=length(x) kernel(o, d)
         @test isequal(Array(o), round.(x))
     end
+
+    T == Float32 && let # round_fast rounds half away from zero, keeping the sign of zero
+        x = T[0.5, 2.5, -0.5, -2.5, -0.3, -0.0, 0.49999997]
+        d = MtlArray(x)
+        function kernel(o, a)
+            i = thread_position_in_grid().x
+            @inbounds o[i] = Metal.round_fast(a[i])
+            return
+        end
+        o = similar(d)
+        Metal.@sync @metal threads=length(x) kernel(o, d)
+        @test isequal(Array(o), round.(x, RoundNearestTiesAway))
+    end
+
+    let # powers of 2 and 10, which LLVM rewrites
+        n = Int32.(-10:10)
+        d = MtlArray(n)
+        function kernel(o, a, z)
+            i = thread_position_in_grid().x
+            @inbounds e = typeof(z)(a[i])
+            @inbounds o[i] = (2^e, exp2(e), 10^(e/4))
+            return
+        end
+        o = MtlArray{NTuple{3,T}}(undef, length(n))
+        Metal.@sync @metal threads=length(n) kernel(o, d, zero(T))
+        # (exact once LLVM turns these into `ldexp`, otherwise within a few ulp)
+        @test all(isapprox.(first.(Array(o)), T(2).^T.(n); rtol=4eps(T)))
+        @test all(isapprox.(getindex.(Array(o), 2), exp2.(T.(n)); rtol=4eps(T)))
+        @test all(isapprox.(getindex.(Array(o), 3), T(10).^(T.(n)./T(4)); rtol=4eps(T)))
+    end
 end
 end
 
@@ -853,6 +944,11 @@ end
     end
     Metal.@sync @metal threads = N kernel(mtlout, mtlarr1, mtlarr2)
     @eval @test Array($mtlout) ≈ $fun.($arr1, $arr2)
+end
+@testset "cmp()::$T" for T in (Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64)
+    x = T[0, 1, 2, typemin(T), typemax(T)]
+    y = T[1, 1, 1, typemax(T), typemin(T)]
+    @test Array(cmp.(MtlArray(x), MtlArray(y))) == cmp.(x, y)
 end
 # 3-arg functions
 @testset "$(fun)()::$T" for T in (Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64), fun in INT_MATH_INTR_FUNCS_3_ARG
@@ -985,6 +1081,38 @@ end
     # the CPU computes Float16 powers in Float32
     h, m = Float16[0.5, -1.5, 3, -3, 1.25], Int32[-3, 2, 5, -4, 7]
     @test Array(pow.(MtlArray(h), MtlArray(m))) ≈ pow.(h, m)
+end
+
+# Apple's back-end can't select a 64-bit multiplication with overflow check, as used by
+# `checked_mul` and thus `Rational` arithmetic (#570); GPUCompiler expands it using `mul_hi`.
+@testset "multiplication with overflow $T" for T in (Int64, UInt64)
+    edge = T[0, 1, 3, typemax(T), typemin(T), typemax(T) ÷ 2 + 1, T(2)^31, T(2)^32]
+    T <: Signed && append!(edge, T[-1, -3, -(T(2)^31), -(T(2)^32)])
+    x, y = vec([x for x in edge, y in edge]), vec([y for x in edge, y in edge])
+    mulo(x, y) = Base.Checked.mul_with_overflow(x, y)
+    @test Array(mulo.(MtlArray(x), MtlArray(y))) == mulo.(x, y)
+
+    @test Array(map(x -> x * 3 // 2, MtlArray(T[1, 4]))) == T[1, 4] .* 3 .// 2
+end
+
+# Base compares rationals using the 128-bit products of their numerators and denominators,
+# which GPUToolbox computes in 64-bit words instead (#550)
+@testset "rational comparisons" begin
+    xs = Float32[0, -1, 1.4, 1.5, 1.6, Inf, NaN]
+    @test Array(map(x -> x < 3 // 2, MtlArray(xs))) == (xs .< 3 // 2)
+
+    qs = [1//3, -5//7, 3//2, typemax(Int)//2, 2^40//3, -typemax(Int)//(2^40 + 1)]
+    ns = [0, -1, 2, 2^35, typemax(Int), typemin(Int)]
+    fs = Float32[0.3, -0.7, 1.5, 2f0^62, 3.6f11, -Inf]
+    for op in (<, <=, cmp)
+        @test Array(op.(MtlArray(qs), MtlArray(fs))) == op.(qs, fs)
+        @test Array(op.(MtlArray(fs), MtlArray(qs))) == op.(fs, qs)
+    end
+    for op in (<, <=)
+        @test Array(op.(MtlArray(qs), MtlArray(reverse(qs)))) == op.(qs, reverse(qs))
+        @test Array(op.(MtlArray(qs), MtlArray(ns))) == op.(qs, ns)
+        @test Array(op.(MtlArray(ns), MtlArray(qs))) == op.(ns, qs)
+    end
 end
 
 end

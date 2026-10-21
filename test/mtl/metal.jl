@@ -1,7 +1,5 @@
 using .MTL
 
-@autoreleasepool begin
-
 @testset "devices" begin
 
 devs = devices()
@@ -80,6 +78,13 @@ opts.fastMathEnabled = val
 @test opts.languageVersion isa VersionNumber
 opts.languageVersion = v"1.0"
 @test opts.languageVersion == v"1.0"
+
+@test convert(MTL.MTLLanguageVersion, v"4.1") == MTL.MTLLanguageVersion4_1
+@test convert(VersionNumber, MTL.MTLLanguageVersion4_1) == v"4.1"
+if Metal.macos_version() >= v"27"
+    opts.languageVersion = v"4.1"
+    @test opts.languageVersion == v"4.1"
+end
 
 end
 
@@ -694,5 +699,3 @@ end # @testset "residency sets" begin
 end
 
 # TODO: continue adding tests
-
-end # @autoreleasepool begin

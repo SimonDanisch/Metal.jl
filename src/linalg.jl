@@ -2,8 +2,6 @@ using LinearAlgebra
 using LinearAlgebra: MulAddMul, wrap
 using .MPS
 using .MPS: MPS_VALID_MATMUL_TYPES, MPS_VALID_MATVECMUL_TYPES, MtlFloat
-using .MPSGraphs: MPSGRAPH_VALID_MATMUL_TYPES, MPSGRAPH_VALID_MATVECMUL_TYPES,
-                  graph_matmul!, graph_matvecmul!
 
 @inline function supports_mps_matmul(A, B, C, valid_types)
     MPS.is_supported(device(C)) &&
@@ -11,15 +9,6 @@ using .MPSGraphs: MPSGRAPH_VALID_MATMUL_TYPES, MPSGRAPH_VALID_MATVECMUL_TYPES,
         (eltype(A), eltype(C)) in valid_types
 end
 
-@inline function supports_mpsgraph_matmul(A, B, C, valid_types)
-    MPS.is_supported(device(C)) &&
-        eltype(A) == eltype(B) &&
-        (eltype(A), eltype(C)) in valid_types &&
-        # TODO: remove this limitation
-        A.offset == 0 &&
-        B.offset == 0 &&
-        C.offset == 0
-end
 
 # Supported values:
 #   :auto     - best available: vendor (MPSGraph/MPS) where supported, else a native kernel
@@ -67,7 +56,7 @@ function empty_matmul!(C, beta)
     iszero(beta) ? fill!(C, zero(eltype(C))) : rmul!(C, beta)
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlMatrix, tA, tB, A::MtlMatrix, B::MtlMatrix,
+function LinearAlgebra.mul!(C::MtlMatrix, tA, tB, A::MtlMatrix, B::MtlMatrix,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
     mB, nB = LinearAlgebra.lapack_size(tB, B)
@@ -75,35 +64,33 @@ end
     if nA != mB
         throw(DimensionMismatch("A has dimensions ($mA,$nA) but B has dimensions ($mB,$nB)"))
     end
+    if size(C) != (mA, nB)
+        throw(DimensionMismatch("C has dimensions $(size(C)), should have ($mA,$nB)"))
+    end
 
     if C === A || B === C
         throw(ArgumentError("output matrix must not be aliased with input matrix"))
     end
 
     if mA == 0 || nA == 0 || nB == 0
-        if size(C) != (mA, nB)
-            throw(DimensionMismatch("C has dimensions $(size(C)), should have ($mA,$nB)"))
-        end
         return empty_matmul!(C, beta)
     end
 
     alg = matmul_alg[]
-    # the MPS paths only handle plain transpose/adjoint operands; only probe MPSGraph
+    # the MPS path only handles plain transpose/adjoint operands; only probe MPSGraph
     # support when a branch below can actually use it
     ntc = is_ntc(tA) && is_ntc(tB)
-    mpsgraph_supported = (alg === :MPSGraph || alg === :auto) && ntc &&
-                         supports_mpsgraph_matmul(A, B, C, MPSGRAPH_VALID_MATMUL_TYPES)
+    mpsgraph_supported = (alg === :MPSGraph || alg === :auto) &&
+        MPSGraphs.supports(MPSGraphs.matmul!, C, A, B, alpha, beta; tA, tB)
     # If possible, dispatch to MPSGraphs, then performance shaders
     if alg === :MPSGraph || (alg === :auto && mpsgraph_supported)
         mpsgraph_supported || matmul_alg_error(alg, eltype(A), eltype(C), false)
-        graph_matmul!(C, A, B, alpha, beta, tA, tB)
+        MPSGraphs.matmul!(C, A, B, alpha, beta; tA, tB)
     elseif alg === :native || alg === :auto || alg === :simd || alg === :scalar || alg === :tensor
         native_matmul!(C, tA, tB, A, B, alpha, beta, alg)
     elseif alg === :MPS
         (ntc && supports_mps_matmul(A, B, C, MPS_VALID_MATMUL_TYPES)) || matmul_alg_error(alg, eltype(A), eltype(C), false)
-        transA = tA == 'T' || tA == 'C'
-        transB = tB == 'T' || tB == 'C'
-        matmul!(C, A, B, alpha, beta, transA, transB)
+        MPS.matmul!(C, A, B, alpha, beta; tA, tB)
     elseif alg === :GPUArrays
         GPUArrays.generic_matmatmul!(C, wrap(A, tA), wrap(B, tB), alpha, beta)
     else
@@ -111,7 +98,7 @@ end
     end
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlMatrixOperand, tA, tB,
+function LinearAlgebra.mul!(C::MtlMatrixOperand, tA, tB,
                                              A::MtlMatrixOperand, B::MtlMatrixOperand,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
@@ -120,15 +107,15 @@ end
     if nA != mB
         throw(DimensionMismatch("A has dimensions ($mA,$nA) but B has dimensions ($mB,$nB)"))
     end
+    if size(C) != (mA, nB)
+        throw(DimensionMismatch("C has dimensions $(size(C)), should have ($mA,$nB)"))
+    end
 
     if C === A || B === C
         throw(ArgumentError("output matrix must not be aliased with input matrix"))
     end
 
     if mA == 0 || nA == 0 || nB == 0
-        if size(C) != (mA, nB)
-            throw(DimensionMismatch("C has dimensions $(size(C)), should have ($mA,$nB)"))
-        end
         return empty_matmul!(C, beta)
     end
 
@@ -155,7 +142,7 @@ if isdefined(LinearAlgebra, :generic_matmatmul_wrapper!)
     end
 end
 
-@autoreleasepool function LinearAlgebra.mul!(C::MtlVector, tA::AbstractChar, A::MtlMatrix, B::MtlVector,
+function LinearAlgebra.mul!(C::MtlVector, tA::AbstractChar, A::MtlMatrix, B::MtlVector,
                                              alpha::Number, beta::Number)
     mA, nA = LinearAlgebra.lapack_size(tA, A)
     mB = length(B)
@@ -164,28 +151,28 @@ end
     if nA != mB
         throw(DimensionMismatch("A has dimensions ($mA,$nA) but B is a vector of length ($mB)"))
     end
+    if mC != mA
+        throw(DimensionMismatch("C has length ($mC), should have ($mA)"))
+    end
 
     if B === C
         throw(ArgumentError("output matrix must not be aliased with input matrix"))
     end
 
     if mA == 0 || nA == 0 || mB == 0
-        if mC != mA
-            throw(DimensionMismatch("C has length ($mC), should have ($mA)"))
-        end
         return empty_matmul!(C, beta)
     end
 
     alg = matmul_alg[]
-    # the MPS paths only handle plain transpose/adjoint operands; only probe MPSGraph
+    # the MPS path only handles plain transpose/adjoint operands; only probe MPSGraph
     # support when a branch below can actually use it
     ntc = is_ntc(tA)
-    mpsgraph_supported = (alg === :MPSGraph || alg === :auto) && ntc &&
-                         supports_mpsgraph_matmul(A, B, C, MPSGRAPH_VALID_MATVECMUL_TYPES)
+    mpsgraph_supported = (alg === :MPSGraph || alg === :auto) &&
+        MPSGraphs.supports(MPSGraphs.matvecmul!, C, A, B, alpha, beta; tA)
     # If possible, dispatch to MPSGraphs, then performance shaders
     if alg === :MPSGraph || (alg === :auto && mpsgraph_supported)
         mpsgraph_supported || matmul_alg_error(alg, eltype(A), eltype(C), true)
-        graph_matvecmul!(C, A, B, alpha, beta, tA)
+        MPSGraphs.matvecmul!(C, A, B, alpha, beta; tA)
     elseif alg === :native || alg === :auto || alg === :simd || alg === :scalar
         # matrix-vector products go through the native gemv; `:simd`/`:scalar` force the
         # kernel. The tensor kernel is matrix-only, so `:tensor` isn't handled here and
@@ -197,8 +184,7 @@ end
         gemv!(C, cA, A, B, alpha, beta; kernel)
     elseif alg === :MPS
         (ntc && supports_mps_matmul(A, B, C, MPS_VALID_MATVECMUL_TYPES)) || matmul_alg_error(alg, eltype(A), eltype(C), true)
-        transA = tA == 'T' || tA == 'C'
-        matvecmul!(C, A, B, alpha, beta, transA)
+        MPS.matvecmul!(C, A, B, alpha, beta; tA)
     elseif alg === :GPUArrays
         GPUArrays.generic_matmatmul!(C, wrap(A, tA), B, alpha, beta)
     else
@@ -249,7 +235,7 @@ LinearAlgebra.ipiv2perm(v::MtlVector, maxi::Integer) =
 LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
     LinearAlgebra.ipiv2perm(unsafe_wrap(Array, v), maxi)
 
-@autoreleasepool function LinearAlgebra.lu(A::MtlMatrix{T};
+function LinearAlgebra.lu(A::MtlMatrix{T};
                                            check::Bool = true) where {T <: MtlFloat}
     M, N = size(A)
     dev = device()
@@ -291,10 +277,10 @@ LinearAlgebra.ipiv2perm(v::MtlVector{<:Any, CPUStorage}, maxi::Integer) =
 
     # One element, read after the synchronize above. A Shared array is host-visible
     # but refuses element access outside `@allowscalar`, like every device array.
-    status = convert(LinearAlgebra.BlasInt, @allowscalar(status[])::MPS.MPSMatrixDecompositionStatus)
-    check && checknonsingular(status)
+    info = convert(LinearAlgebra.BlasInt, @allowscalar(status[])::MPS.MPSMatrixDecompositionStatus)
+    check && checknonsingular(info)
 
-    return LinearAlgebra.LU(B, p, status)
+    return LinearAlgebra.LU(B, p, info)
 end
 
 function check_lu_success(info, allowsingular)
@@ -310,7 +296,7 @@ function check_lu_success(info, allowsingular)
 end
 
 # TODO: dispatch on pivot strategy
-@autoreleasepool function LinearAlgebra.lu!(A::MtlMatrix{T};
+function LinearAlgebra.lu!(A::MtlMatrix{T};
                                             check::Bool = true,
                                             allowsingular::Bool = false) where {T <: MtlFloat}
     M, N = size(A)
@@ -348,13 +334,13 @@ end
 
     synchronize(cmdbuf)
 
-    status = convert(LinearAlgebra.BlasInt, @allowscalar status[])
-    check && check_lu_success(status, allowsingular)
+    info = convert(LinearAlgebra.BlasInt, @allowscalar status[])
+    check && check_lu_success(info, allowsingular)
 
-    return LinearAlgebra.LU(A, p, status)
+    return LinearAlgebra.LU(A, p, info)
 end
 
-@autoreleasepool function LinearAlgebra.transpose!(B::MtlMatrix{T},
+function LinearAlgebra.transpose!(B::MtlMatrix{T},
                                                    A::MtlMatrix{T}) where {T}
     axes(B, 2) == axes(A, 1) && axes(B, 1) == axes(A, 2) || throw(DimensionMismatch("transpose"))
 

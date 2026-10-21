@@ -226,21 +226,21 @@ function mtl4_indirect_probe!(a::Metal.MtlVector{Float32}, value::Float32, group
     alloc = MTL.MTL4CommandAllocator(dev)
     cb = MTL.MTL4CommandBuffer(dev)
 
-    table = MTL.MTL4ArgumentTable(dev; buffers = 4)
+    table = MTL.MTL4ArgumentTable(dev; buffers = 4, initialize = true)
     let gpu = UInt64(argbuf.gpuAddress)
         for (i, off) in enumerate((0, 256, 512))
             MTL.set_address!(table, gpu + UInt64(off), i)
         end
     end
 
-    MTL.begin_command_buffer!(cb, alloc)
-    enc = MTL.compute_encoder(cb)
+    MTL.beginCommandBuffer!(cb, alloc)
+    enc = MTL.MTL4ComputeCommandEncoder(cb)
     MTL.use_residency_set!(cb, resset)
     MTL.set_argument_table!(enc, table)
     MTL.set_function!(enc, kernel.pipeline)
     MTL.dispatch_threadgroups_indirect!(enc, gridbuf, 0, Metal.MTLSize(64))
     MTL.endEncoding!(enc)
-    MTL.end_command_buffer!(cb)
+    MTL.endCommandBuffer!(cb)
     MTL.commit!(q, [cb])
 
     ev = MTL.MTLSharedEvent(dev)

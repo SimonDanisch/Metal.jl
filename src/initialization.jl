@@ -45,7 +45,20 @@ function is_supported(dev)
                           supports_family(dev, MTL.MTLGPUFamilyMetal3)
 end
 
+# the default language version depends on the SDK Julia was linked against, so it can be
+# newer than the versions we know about. it's only informational: don't throw on it.
+function describe_language_version(ver::MTL.MTLLanguageVersion)
+    v = get(MTL.language_versions, ver, nothing)
+    v === nothing ? "unknown (0x$(string(UInt64(ver); base=16)))" : "v$v"
+end
+
 function __init__()
+    # buffers freed while generating the package image don't exist in this process. this
+    # also applies when precompiling another package, whose workload may allocate.
+    Base.@atomic freed_buffers.head = nothing
+
+    init_label_resources!()
+
     precompiling = ccall(:jl_generating_output, Cint, ()) != 0
     precompiling && return
 
@@ -63,7 +76,7 @@ function __init__()
         @warn "Metal.jl has not been tested on macOS 28 or later, you may run into issues."
     end
 
-    @autoreleasepool try
+    try
         load_framework("CoreGraphics")
         load_framework("MetalPerformanceShadersGraph")
         # `CAMetalLayer` lives here, and it is the only way anything Metal draws
@@ -71,8 +84,18 @@ function __init__()
         # rather than by whoever first asks for a layer, so the class resolves
         # wherever it is named.
         load_framework("QuartzCore")
-        ver = MTL.MTLCompileOptions().languageVersion
-        @debug "Successfully loaded Metal; targeting v$ver."
+        opts = MTL.MTLCompileOptions()
+        ver = @objc [opts::id{MTL.MTLCompileOptions} languageVersion]::MTL.MTLLanguageVersion
+        @debug "Successfully loaded Metal; default language version $(describe_language_version(ver))."
+
+        # the preference is fixed at compile time, but support depends on this system
+        if COMMAND_API === :metal4
+            reason = metal4_unsupported_reason(MTLDevice(1))
+            if reason !== nothing
+                @error "The `command_api` preference selects the Metal 4 command API, but $reason."
+                return
+            end
+        end
 
         initialized[] = true
     catch err
@@ -92,10 +115,8 @@ function __init__()
     atexit() do
         has_active_batched_queues() || return
         try
-            @autoreleasepool for bq in active_batched_queues()
-                cmdbuf = bq.cmdbuf
-                end_encoder!(bq)
-                cmdbuf === nothing || discard_open_cmdbuf!(bq, cmdbuf)
+            for bq in active_batched_queues()
+                abandon_open_batch!(bq)
             end
         catch err
             @error "Failed to close open batched command queues at exit" exception=(err, catch_backtrace())

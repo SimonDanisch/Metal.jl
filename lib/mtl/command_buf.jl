@@ -124,9 +124,6 @@ references itself. Allocates, so not for a per-submission path.
 retained(cmdbuf::MTLCommandBufferRef) = retain(MTLCommandBuffer, pointer(cmdbuf))
 retained(cmdbuf::MTLCommandBufferLike) = cmdbuf
 
-"""Whether `cmdbuf` has run to the end, successfully or not."""
-completed(cmdbuf::MTLCommandBufferLike) = cmdbuf.status >= MTLCommandBufferStatusCompleted
-
 """
     enqueue!(cmdbuf::MTLCommandBuffer)
 
@@ -142,7 +139,7 @@ into the command buffers and those threads can complete in any order.
 function enqueue!(cmdbuf::MTLCommandBufferLike)
     cmdbuf.status in (MTLCommandBufferStatusCompleted, MTLCommandBufferStatusEnqueued) &&
         error("Cannot enqueue an already enqueued command buffer")
-    submit(cmdbuf) do
+    submit(cmdbuf, false) do
         @objc [cmdbuf::id{MTLCommandBuffer} enqueue]::Nothing
     end
 end
@@ -184,6 +181,35 @@ function Base.showerror(io::IO, exc::CommandBufferError)
 end
 
 """
+    MTL4Submission
+
+The completion state of Metal 4 command buffers that were committed together (see
+[`commit_tracked!`](@ref)). Metal 4 command buffers are recycled as soon as they are
+committed, so unlike a Metal 3 `MTLCommandBuffer` they can't be asked whether they have
+completed: their commit feedback, and a shared event the queue signals after them, report
+it instead.
+"""
+mutable struct MTL4Submission
+    # signalled to `value` by the queue once the GPU is done with the command buffers
+    const event::MTLSharedEvent
+    const value::UInt64
+    const label::Union{Nothing,String}
+    const queue_label::Union{Nothing,String}
+    # whether a feedback handler reports completion. without one (e.g., while generating
+    # output, where Metal's threads can't run Julia code), only the event does, and errors
+    # aren't reported.
+    const feedback::Bool
+    # set by the feedback handler, after the error and timings
+    Base.@atomic completed::Bool
+    Base.@atomic error::Union{Nothing,CommandBufferErrorInfo}
+    Base.@atomic gpu_start::Float64
+    Base.@atomic gpu_end::Float64
+end
+
+# what is tracked per queue: Metal 3 command buffers, or Metal 4 submissions
+const Submission = Union{MTLCommandBufferLike,MTL4Submission}
+
+"""
 What one queue has committed and synchronization has not yet accounted for.
 
 ONE record per queue for the life of the process, updated in place. It used to be
@@ -196,14 +222,24 @@ The command buffers are `MTLCommandBufferRef`s, and each place one is stored her
 holds a reference of its own: one per entry of `pending`, one for `last`. Without
 those, an entry whose batch had already retired it would be a dangling pointer the
 next prune reads a status from.
+
+Metal 4 submissions (the batches of a `Metal4Backend` queue, recorded under the Metal 3
+queue it batches for) are kept apart, in `pending4`. Not one vector of both: a vector of
+a `Union` with a mutable type boxes every isbits `MTLCommandBufferRef` pushed into it,
+which would be an allocation per commit on the Metal 3 path. And not ordered against the
+command buffers: a submission is only known to have completed once its feedback ran, and
+that can come after work committed later, so a synchronization waits for each of them.
 """
 mutable struct QueueSubmissionState
     # Committed and not yet seen to complete, in commit order.
     pending::Vector{MTLCommandBufferRef}
+    pending4::Vector{MTL4Submission}
     # Diagnostics of failures that completed but no synchronization has reported yet.
     errors::Union{Nothing,Vector{CommandBufferErrorInfo}}
     # The newest commit: the queue runs in order, so waiting for it waits for all.
     last::Union{Nothing,MTLCommandBufferRef}
+    # The newest Metal 4 submission, if it came after `last`, for `last_committed`.
+    last4::Union{Nothing,MTL4Submission}
     # How many command buffers were ever recorded, and how many of those have been
     # pruned. A synchronization notes the first before it waits and checks the second
     # against it afterwards, which is what "everything committed before I started has
@@ -212,7 +248,8 @@ mutable struct QueueSubmissionState
     retired::Int
 end
 
-QueueSubmissionState() = QueueSubmissionState(MTLCommandBufferRef[], nothing, nothing, 0, 0)
+QueueSubmissionState() = QueueSubmissionState(MTLCommandBufferRef[], MTL4Submission[], nothing,
+                                                nothing, nothing, 0, 0)
 
 const submission_state_per_queue = Dict{id{MTLCommandQueue},QueueSubmissionState}()
 
@@ -256,16 +293,21 @@ function _prune_completed_submissions!(pending, errors, is_completed, error_info
     return errors
 end
 
-failure_info(cmdbuf::MTLCommandBufferRef) =
-    cmdbuf.status == MTLCommandBufferStatusError ? command_buffer_error_info(cmdbuf) :
-                                                   nothing
+"""Whether `cmdbuf` has run to the end, successfully or not."""
+is_completed(cmdbuf::MTLCommandBufferLike) = cmdbuf.status >= MTLCommandBufferStatusCompleted
+
+error_info(cmdbuf::MTLCommandBufferLike) =
+    cmdbuf.status == MTLCommandBufferStatusError ? command_buffer_error_info(cmdbuf) : nothing
 
 # `last_committed_lock` held.
 function prune_completed_submissions!(state::QueueSubmissionState)
-    before = length(state.pending)
+    before = length(state.pending) + length(state.pending4)
     state.errors = _prune_completed_submissions!(state.pending, state.errors,
-                                                 completed, failure_info, release)
-    state.retired += before - length(state.pending)
+                                                 is_completed, error_info, release)
+    isempty(state.pending4) ||
+        (state.errors = _prune_completed_submissions!(state.pending4, state.errors,
+                                                      is_completed, error_info))
+    state.retired += before - length(state.pending) - length(state.pending4)
     return
 end
 
@@ -285,6 +327,19 @@ function record_committed!(cmdbuf::MTLCommandBufferLike, key::id{MTLCommandQueue
         previous = state.last
         state.last = ref
         previous === nothing || release(previous)
+        # the newest submission is this command buffer now (see `last_committed`)
+        state.last4 = nothing
+        state.committed += 1
+    end
+    return
+end
+
+function record_committed!(sub::MTL4Submission, key::id{MTLCommandQueue})
+    @lock last_committed_lock begin
+        state = get!(QueueSubmissionState, submission_state_per_queue, key)
+        prune_completed_submissions!(state)
+        push!(state.pending4, sub)
+        state.last4 = sub
         state.committed += 1
     end
     return
@@ -292,7 +347,8 @@ end
 
 """
 What a synchronization waits for on one queue: the newest command buffer committed
-to it, or `nothing`, and how many command buffers had been committed to it by then.
+to it, or `nothing`, the Metal 4 submissions not yet seen to complete, or `nothing`
+when there are none, and how many had been committed to it by then.
 
 A struct and not a tuple, and that is the whole reason it exists: a tuple holding a
 `Union` is an abstract type, so returning `(last, committed)` boxed the tuple and both
@@ -302,6 +358,8 @@ concrete, and comes back without a heap allocation.
 struct SyncPoint
     queue::id{MTLCommandQueue}
     last::Union{Nothing,MTLCommandBufferRef}
+    # a copy, as other tasks prune the queue's own while this one waits
+    pending4::Union{Nothing,Vector{MTL4Submission}}
     committed::Int
 end
 
@@ -319,7 +377,7 @@ function sync_point(queue::MTLCommandQueue)
     key = pointer(queue)
     @lock last_committed_lock begin
         state = get(submission_state_per_queue, key, nothing)
-        state === nothing && return SyncPoint(key, nothing, 0)
+        state === nothing && return SyncPoint(key, nothing, nothing, 0)
         return sync_point(key, state)
     end
 end
@@ -328,7 +386,8 @@ end
 function sync_point(key::id{MTLCommandQueue}, state::QueueSubmissionState)
     last = state.last
     last === nothing || retain(last)
-    return SyncPoint(key, last, state.committed)
+    pending4 = isempty(state.pending4) ? nothing : copy(state.pending4)
+    return SyncPoint(key, last, pending4, state.committed)
 end
 
 """
@@ -346,10 +405,11 @@ end
 """
     finish_submissions!(point::SyncPoint) -> errors
 
-Account for a synchronization that has waited for `point`, and claim the failures
-nobody has reported yet on its queue: the diagnostics, or `nothing`. The queue runs in
-order, so after that wait every command buffer the point covers has to be done; one
-that is not is an error here rather than a silent gap in the error report.
+Account for a synchronization that has waited for `point` (its `last` and each of its
+`pending4`), and claim the failures nobody has reported yet on its queue: the
+diagnostics, or `nothing`. The queue runs in order, so after that wait every command
+buffer the point covers has to be done; one that is not is an error here rather than a
+silent gap in the error report.
 """
 function finish_submissions!(point::SyncPoint)
     @lock last_committed_lock begin
@@ -365,6 +425,30 @@ function finish_submissions!(point::SyncPoint)
 end
 
 """
+    oldest_pending(point::SyncPoint) -> Union{Nothing,MTLCommandBufferRef}
+
+The oldest command buffer `point` covers that has not completed, with a reference that
+belongs to the caller, or `nothing` once all of them have.
+
+A queue runs its command buffers in the order they were ENQUEUED, which `commit!` does
+implicitly, so waiting for the newest commit covers the earlier ones only while none was
+enqueued ahead of its commit (`enqueue!`). A batch committed while such a buffer waits for
+its own commit runs after it, and is waited for through this.
+"""
+function oldest_pending(point::SyncPoint)
+    @lock last_committed_lock begin
+        state = get(submission_state_per_queue, point.queue, nothing)
+        state === nothing && return nothing
+        prune_completed_submissions!(state)
+        state.retired >= point.committed && return nothing
+        isempty(state.pending) && return nothing
+        cmdbuf = first(state.pending)
+        retain(cmdbuf)
+        return cmdbuf
+    end
+end
+
+"""
     all_completed(queue) -> Bool
 
 Whether every command buffer committed to `queue` so far has completed — what
@@ -375,7 +459,7 @@ function all_completed(queue::MTLCommandQueue)
         state = get(submission_state_per_queue, pointer(queue), nothing)
         state === nothing && return true
         last = state.last
-        return last === nothing || completed(last)
+        (last === nothing || is_completed(last)) && all(is_completed, state.pending4)
     end
 end
 
@@ -397,24 +481,28 @@ function pending_submission_count(queue::MTLCommandQueue)
     key = pointer(queue)
     @lock last_committed_lock begin
         state = get(submission_state_per_queue, key, nothing)
-        state === nothing ? 0 : length(state.pending)
+        state === nothing ? 0 : length(state.pending) + length(state.pending4)
     end
 end
 
 # optional profiling hook. when set, it is invoked for every committed command buffer.
 const profile_hook = Ref{Any}(nothing)
 
-# optional submission hook. when set, it is invoked as `hook(f, cmdbuf)` to enqueue or
-# commit a command buffer, which happens by calling `f()`.
+# optional submission hook. when set, it is invoked as `hook(f, cmdbuf, commit)` to enqueue
+# (`commit=false`) or commit (`commit=true`) a command buffer, which happens by calling `f()`.
 const submit_hook = Ref{Any}(nothing)
 
-@inline function submit(f, cmdbuf::MTLCommandBufferLike)
+@inline function submit(f, cmdbuf::MTLCommandBufferLike, commit::Bool)
     hook = submit_hook[]
-    hook === nothing ? f() : hook(f, cmdbuf)
+    hook === nothing ? f() : hook(f, cmdbuf, commit)
 end
 
 # optional profiling data for operation metadata (e.g. kernel dimensions, copy sizes).
 const profile_metadata = Ref{Any}(nothing)
+
+# What a `ProfileCollector` files a submission's operations under: its address.
+profile_key(cmdbuf::MTLCommandBufferLike) = UInt(pointer(cmdbuf))
+profile_key(sub::MTL4Submission) = UInt(pointer_from_objref(sub))
 
 struct ProfileCollector
     lock::ReentrantLock
@@ -430,38 +518,41 @@ end
 ProfileCollector() = ProfileCollector(ReentrantLock(), Dict{UInt,Vector{Any}}(),
                                       Tuple{String,Any}[])
 
-@inline function note_operation!(collector::ProfileCollector, cmdbuf::MTLCommandBufferLike, op)
+@inline function note_operation!(collector::ProfileCollector, cmdbuf::Submission, op)
     @lock collector.lock begin
-        ops = get!(Vector{Any}, collector.metadata, UInt(pointer(cmdbuf)))
+        ops = get!(Vector{Any}, collector.metadata, profile_key(cmdbuf))
         push!(ops, op)
     end
     return
 end
 
 """
-    last_committed(queue::MTLCommandQueue)::Union{MTLCommandBuffer, Nothing}
+    last_committed(queue::MTLCommandQueue)::Union{MTLCommandBuffer, MTL4Submission, Nothing}
 
-Return the most recently committed command buffer on `queue`, or `nothing` if
-nothing has been committed. A managed wrapper with a reference of its own, so it
-allocates; [`all_completed`](@ref) asks the common question without one.
+Return the most recently committed command buffer on `queue`, or with the Metal 4 backend
+the most recent submission if that came later, or `nothing` if nothing has been committed.
+A command buffer comes as a managed wrapper with a reference of its own, so it allocates;
+[`all_completed`](@ref) asks the common question without one.
 """
 function last_committed(queue::MTLCommandQueue)
     @lock last_committed_lock begin
         state = get(submission_state_per_queue, pointer(queue), nothing)
         state === nothing && return nothing
         last = state.last
+        last4 = state.last4
+        last4 === nothing || return last4
         return last === nothing ? nothing : retained(last)
     end
 end
 
 function commit!(cmdbuf::MTLCommandBufferLike)
-    submit(cmdbuf) do
+    submit(cmdbuf, true) do
         commit_with_queue_key!(cmdbuf, pointer(cmdbuf.commandQueue))
     end
 end
 
 function commit!(cmdbuf::MTLCommandBufferLike, queue::MTLCommandQueue)
-    submit(cmdbuf) do
+    submit(cmdbuf, true) do
         commit_with_queue_key!(cmdbuf, pointer(queue))
     end
 end

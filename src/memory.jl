@@ -18,7 +18,7 @@ mutable struct Managed
     const host_ptr::Ptr{Cvoid}
 
     # the queue that last used the buffer
-    queue::Union{Nothing,BatchedCommandQueue}
+    queue::Union{Nothing,ConcreteBatchedQueue}
 
     # whether operations on `queue` may still be using the buffer
     Base.@atomic dirty::Bool
@@ -57,7 +57,7 @@ end
 @noinline function synchronize(managed::Managed)
     while true
         # look up the work to wait for
-        queue, epoch = @autoreleasepool Base.@lock submission_lock begin
+        queue, epoch = Base.@lock submission_lock begin
             (Base.@atomic managed.dirty) ? (managed.queue, managed.epoch) : (nothing, nothing)
         end
         epoch === nothing && return
@@ -66,7 +66,7 @@ end
         queue === nothing || synchronize_queue(queue)
 
         # the buffer may have been used again while we were waiting
-        done = @autoreleasepool Base.@lock submission_lock begin
+        done = Base.@lock submission_lock begin
             managed.epoch == epoch && (Base.@atomic managed.dirty = false; true)
         end
         done && return
@@ -128,7 +128,7 @@ end
 # return the GPU virtual address, so that alignment checks like
 # `UInt(ptr) % N == 0` work the same as for a regular Ptr. note that this is
 # the GPU-side address, distinct from the CPU-side `contents` pointer.
-Base.UInt(ptr::MtlPtr) = UInt(ptr.buffer.gpuAddress) + ptr.offset
+Base.UInt(ptr::MtlPtr) = UInt(MTL.gpu_address(ptr.buffer)) + ptr.offset
 Base.Int(ptr::MtlPtr) = Int(UInt(ptr))
 
 
@@ -207,27 +207,25 @@ function Base.unsafe_copyto!(dev::MTLDevice, dst::MtlPtr{T}, src::MtlPtr{T}, N::
     return dst
 end
 
-@autoreleasepool function encode_copy!(bq::BatchedCommandQueue, dst::MtlPtr, src::MtlPtr,
+function encode_copy!(bq::BatchedCommandQueue, dst::MtlPtr, src::MtlPtr,
                                        nbytes::Integer)
     Base.@lock submission_lock begin
         conflict = try_take_ownership!(bq, dst, src)
         conflict === nothing || return conflict
 
-        total_bytes = nbytes
         chunk_size = 2^31
         enc = blit_encoder(bq)
         offset = 0
-        while nbytes > 0
-            transfer_bytes = min(nbytes, chunk_size)
+        while offset < nbytes
+            transfer_bytes = min(nbytes - offset, chunk_size)
             append_copy!(enc, dst.buffer, dst.offset + offset,
                          src.buffer, src.offset + offset, transfer_bytes)
             offset += transfer_bytes
-            nbytes -= transfer_bytes
         end
 
         op = MTL.profile_metadata[] === nothing ? nothing :
-             (; kind = :copy, name = "copyto!", bytes = Int(total_bytes))
-        record_operation!(bq, dst.buffer, src.buffer; bytes=total_bytes, op=op)
+             (; kind = :copy, name = "copyto!", bytes = Int(nbytes))
+        record_operation!(bq, dst.buffer, src.buffer; bytes=nbytes, op=op)
     end
     return nothing
 end
@@ -247,7 +245,7 @@ function unsafe_fill!(dev::MTLDevice, dst::MtlPtr{T}, value::Union{UInt8,Int8}, 
     return dst
 end
 
-@autoreleasepool function encode_fill!(bq::BatchedCommandQueue, dst::MtlPtr,
+function encode_fill!(bq::BatchedCommandQueue, dst::MtlPtr,
                                        value::Union{UInt8,Int8}, nbytes::Integer)
     Base.@lock submission_lock begin
         conflict = try_take_ownership!(bq, dst)

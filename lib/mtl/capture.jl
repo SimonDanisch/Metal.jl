@@ -18,6 +18,9 @@ end
 function MTLCaptureScope(queue::MTLCommandQueue, manager=MTLCaptureManager())
     @objc [manager::id{MTLCaptureManager} newCaptureScopeWithCommandQueue:queue::id{MTLCommandQueue}]::MTLCaptureScope
 end
+function MTLCaptureScope(queue::MTL4CommandQueue, manager=MTLCaptureManager())
+    @objc [manager::id{MTLCaptureManager} newCaptureScopeWithMTL4CommandQueue:queue::id{MTL4CommandQueue}]::MTLCaptureScope
+end
 
 # @objcwrapper MTLCaptureScope <: NSObject
 
@@ -131,10 +134,10 @@ function startCapture(manager::MTLCaptureManager, desc::MTLCaptureDescriptor)
     # Check not already capturing
     manager.isCapturing && throw(error("Capture manager is already capturing."))
 
-    err = Ref{id{NSError}}(nil)
+    err = Out{NSError}()
     success = @objc [manager::id{MTLCaptureManager} startCaptureWithDescriptor:desc::id{MTLCaptureDescriptor}
-                                                    error:err::Ptr{id{NSError}}]::Bool
-    success || throw_error(err[])
+                                                    error:err::Out{NSError}]::Bool
+    success || throw_error(err)
     return
 end
 

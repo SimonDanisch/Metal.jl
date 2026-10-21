@@ -223,6 +223,7 @@ function lower_texture_bindings!(@nospecialize(job::CompilerJob), mod::LLVM.Modu
     textures = LLVM.Value[params[i + offset] for i in eachindex(kinds) if kinds[i] == 1]
     samplers = LLVM.Value[params[i + offset] for i in eachindex(kinds) if kinds[i] == 2]
     name_texture_pointees!(mod, entry, kinds, offset)
+    drop_alias_scopes!(mod)
 
     for (name, bound, what) in ((AIR_TEXTURE_PLACEHOLDER, textures, "texture"),
                                 (AIR_SAMPLER_PLACEHOLDER, samplers, "sampler"))
@@ -346,6 +347,36 @@ function name_texture_pointees!(mod::LLVM.Module, entry::LLVM.Function,
         push!(entry.parameter_attributes[i + offset], TypeAttribute(:byref, T))
     end
     strip_debuginfo_for_byref!(mod)
+    return nothing
+end
+
+"""
+    drop_alias_scopes!(mod)
+
+Remove every `!alias.scope` and `!noalias` attachment from a module that binds a
+texture.
+
+The macOS 27.0.1 compiler for the M5 (Apple10) crashes on a stage that samples a
+texture and also loads through a pointer carrying Julia's scopes (`jnoalias_const`,
+`jnoalias_stack`), and `MTLRenderPipelineState` reports it as
+`XPC_ERROR_CONNECTION_INTERRUPTED`, like the pointee crash above. Either half alone
+builds. Such loads read a stage argument passed by reference: GPUCompiler 2.14
+passes one that already lives in the device address space through unchanged, so
+Julia's own loads of it reach AIR with their metadata. 2.13 copied it into a stack
+slot first, and the copy's plain load was all that reached the driver. Measured on
+RayMakie's image fragment and on `gfx_tex_args_fragment` in `test/graphics.jl`
+(2026-10-16): both build again once the two attachments are gone.
+
+Julia's optimizer has finished by the time this runs, so it loses nothing. Apple's
+back end could still have used the scopes to reorder memory operations; that cost
+is not measured. A kernel that binds no texture keeps them.
+"""
+function drop_alias_scopes!(mod::LLVM.Module)
+    for f in mod.functions, bb in f.blocks, inst in bb.instructions
+        md = inst.metadata
+        delete!(md, LLVM.MD_alias_scope)
+        delete!(md, LLVM.MD_noalias)
+    end
     return nothing
 end
 
