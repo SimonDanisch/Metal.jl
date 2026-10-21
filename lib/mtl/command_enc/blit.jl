@@ -1,4 +1,4 @@
-export MTLBlitCommandEncoder, append_copy!, append_fillbuffer!, append_sync!
+export MTLBlitCommandEncoder, append_copy!, append_fillbuffer!, append_sync!, append_generate_mipmaps!
 
 # @objcwrapper MTLBlitCommandEncoder <: MTLCommandEncoder
 
@@ -118,4 +118,14 @@ end
 # only for managed resources
 function append_sync!(enc::MTLBlitCommandEncoderLike, src::MTLBuffer)
     @objc [enc::id{MTLBlitCommandEncoder} synchronizeResource:src::id{MTLBuffer}]::Nothing
+end
+
+"""
+    append_generate_mipmaps!(enc, tex::MTLTexture)
+
+Fill the mip levels of `tex` above level 0 from level 0, each a filtered half of
+the one before. `tex` must have been made with more than one level.
+"""
+function append_generate_mipmaps!(enc::MTLBlitCommandEncoderLike, tex::MTLTexture)
+    @objc [enc::id{MTLBlitCommandEncoder} generateMipmapsForTexture:tex::id{MTLTexture}]::Nothing
 end
