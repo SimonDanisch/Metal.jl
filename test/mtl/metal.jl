@@ -280,6 +280,19 @@ end
 
 end
 
+@testset "layers" begin
+
+dev = first(devices())
+
+let layer = CAMetalLayer(dev, 64, 64)
+    take_and_drop(n) = (for _ in 1:n; next_drawable(layer); end)
+    take_and_drop(3)
+    GC.gc(true)
+    @test layer.retainCount == 1
+end
+
+end
+
 @testset "buffers" begin
 
 dev = first(devices())
