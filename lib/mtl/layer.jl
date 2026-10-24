@@ -12,7 +12,7 @@
 # frame pacing, and the reason it must not be called until the frame is ready
 # to be recorded.
 
-export CAMetalLayer, CAMetalDrawable, next_drawable, present_drawable!
+export CAMetalLayer, CAMetalDrawable, next_drawable, present_drawable!, flush_transactions
 
 """A size in points, as Core Graphics spells one."""
 struct CGSize
@@ -20,7 +20,7 @@ struct CGSize
     height::Cdouble
 end
 
-@objcwrapper managed = false CAMetalLayer <: NSObject
+@objcwrapper CAMetalLayer <: NSObject
 
 @objcproperties CAMetalLayer begin
     @autoproperty device::id{MTLDevice} setter = setDevice
@@ -32,12 +32,26 @@ end
     @autoproperty contentsScale::Cdouble setter = setContentsScale
 end
 
-@objcwrapper managed = false CAMetalDrawable <: MTLDrawable
+@objcwrapper CAMetalDrawable <: MTLDrawable
 
 @objcproperties CAMetalDrawable begin
     @autoproperty texture::id{MTLTexture}
     @autoproperty layer::id{CAMetalLayer}
 end
+
+@objcwrapper managed = false CATransaction <: NSObject
+
+"""
+    flush_transactions()
+
+Commit the implicit `CATransaction` that setting a layer property opens.
+
+That transaction retains the layer until a run loop commits it, and nothing runs
+a Core Animation run loop on a Julia thread: without a flush after the setters,
+the layer and every drawable texture it allocated live for the rest of the
+process.
+"""
+flush_transactions() = @objc [CATransaction flush]::Nothing
 
 """
     CAMetalLayer(dev, width, height; format, vsync) -> CAMetalLayer
@@ -54,14 +68,14 @@ resolution and is scaled up.
 function CAMetalLayer(dev::MTLDevice, width::Integer, height::Integer;
                       format::MTLPixelFormat = MTLPixelFormatBGRA8Unorm,
                       vsync::Bool = true, readable::Bool = true)
-    layer = @objc [CAMetalLayer layer]::id{CAMetalLayer}
-    iszero(UInt(layer)) && error("could not create a CAMetalLayer")
-    l = CAMetalLayer(layer)
+    l = @objc [CAMetalLayer layer]::Union{Nothing,CAMetalLayer}
+    l === nothing && error("could not create a CAMetalLayer")
     l.device = dev
     l.pixelFormat = format
     l.drawableSize = CGSize(Cdouble(width), Cdouble(height))
     l.framebufferOnly = !readable
     l.displaySyncEnabled = vsync
+    flush_transactions()
     return l
 end
 
@@ -75,8 +89,7 @@ are outstanding and `nextDrawable` gives up rather than waiting for ever. A
 caller skips the frame.
 """
 function next_drawable(layer::CAMetalLayer)
-    d = @objc [layer::id{CAMetalLayer} nextDrawable]::id{CAMetalDrawable}
-    return iszero(UInt(d)) ? nothing : CAMetalDrawable(d)
+    return @objc [layer::id{CAMetalLayer} nextDrawable]::Union{Nothing,CAMetalDrawable}
 end
 
 """

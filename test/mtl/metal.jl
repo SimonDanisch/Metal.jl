@@ -265,6 +265,32 @@ let heap = MTLHeap(dev, desc)
     #=@test=# heap.resourceOptions == desc.resourceOptions
 end
 
+texdesc = MTLTextureDescriptor(MTL.MTLPixelFormatRGBA8Unorm, 64, 64)
+texdesc.storageMode = MTL.MTLStorageModePrivate
+placement = MTLHeapDescriptor()
+placement.type = MTL.MTLHeapTypePlacement
+placement.storageMode = MTL.MTLStorageModePrivate
+placement.size = MTL.heap_texture_size_and_align(dev, texdesc).size
+let heap = MTLHeap(dev, placement)
+    place_and_drop(n) = (for _ in 1:n; MTLTexture(heap, texdesc, 0); end)
+    place_and_drop(3)
+    GC.gc(true)
+    @test heap.retainCount == 1
+end
+
+end
+
+@testset "layers" begin
+
+dev = first(devices())
+
+let layer = CAMetalLayer(dev, 64, 64)
+    take_and_drop(n) = (for _ in 1:n; next_drawable(layer); end)
+    take_and_drop(3)
+    GC.gc(true)
+    @test layer.retainCount == 1
+end
+
 end
 
 @testset "buffers" begin
