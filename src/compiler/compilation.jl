@@ -810,47 +810,64 @@ end
 # Run inference + LLVM codegen, downgrade to AIR, wrap in a Metal library.
 # Returns the per-phase artifacts as a NamedTuple so the caller can hand them
 # onto the cached `MetalResults`. All byte/string fields are session-portable.
+# Found instead of lowered when an earlier session lowered the same module
+# (`persisted_key`); counted in `compile_stats` either way.
 const compilations = Threads.Atomic{Int}(0)
 function compile_to_metallib(@nospecialize(job::CompilerJob))
     Threads.atomic_add!(compilations, 1)
     @signpost_event log=log_compiler() "Compile" "Job=$job"
 
     # TODO: on 1.9, this actually creates a context. cache those.
-    ir, air, entry, loggingEnabled, relocations = JuliaContext() do _
+    JuliaContext() do _
         @signpost_interval log=log_compiler() "Generate LLVM IR" begin
             mod, meta = invoke_frozen(GPUCompiler.compile, :llvm, job)
         end
 
         # the IR belongs to us: lower and inspect it, then dispose of it
         @dispose mod=mod begin
-            # Detect logging after optimization so dead logging calls do not enable log state.
-            local loggingEnabled = haskey(mod.functions, "air.os_log")
-
-            @signpost_interval log=log_compiler() "Downgrade to AIR" begin
-                # generate AIR, having GPUCompiler lower the IR to AIR-compatible form and
-                # invoke the LLVM downgrader (both as part of Metal's `mcgen`).
-                #
-                # Passing `meta.relocations` (the 4-arg `emit_asm`) is load-bearing: surviving
-                # relocations (interned symbols, type tags, boxed non-smalltag constants) are then
-                # rewritten into indexed loads from the kernel state's relocation table, and
-                # `meta.relocations` is finalized into the manifest the loader resolves against.
-                # The 3-arg form would hand the lowering an empty table and strand the slots.
-                local air
-                air, _ = try
-                    invoke_frozen(GPUCompiler.emit_asm, job, mod, meta.relocations,
-                                  LLVM.CodeGenFileType.Object)
-                catch err
-                    # `emit_asm` has already lowered the module in-place, so stringifying it
-                    # here shows exactly what the downgrader was fed
-                    ir_file, = dump_artifacts(".ll" => string(mod))
-                    error("""Compilation to AIR failed: $(sprint(showerror, err))
-                             If you think this is a bug, please file an issue and attach $(ir_file)""")
-                end
+            key = persisted_key(job, mod, meta)
+            found = key === nothing ? nothing : ObjCache.get(PERSISTED_NAMESPACE, key)
+            if found !== nothing
+                COMPILE_HITS[] += 1
+                return persisted_artifacts(found)
             end
-
-            string(mod), air, meta.entry.name, loggingEnabled, meta.relocations
+            COMPILE_MISSES[] += 1
+            artifacts = lower_to_metallib(job, mod, meta)
+            key === nothing || ObjCache.put!(PERSISTED_NAMESPACE, key, persisted_bytes(artifacts))
+            artifacts
         end
     end
+end
+
+# The AIR and Metal library of the module GPUCompiler made of `job`, which this lowers in place.
+function lower_to_metallib(@nospecialize(job::CompilerJob), mod::LLVM.Module, meta)
+    # Detect logging after optimization so dead logging calls do not enable log state.
+    loggingEnabled = haskey(mod.functions, "air.os_log")
+
+    local air
+    @signpost_interval log=log_compiler() "Downgrade to AIR" begin
+        # generate AIR, having GPUCompiler lower the IR to AIR-compatible form and
+        # invoke the LLVM downgrader (both as part of Metal's `mcgen`).
+        #
+        # Passing `meta.relocations` (the 4-arg `emit_asm`) is load-bearing: surviving
+        # relocations (interned symbols, type tags, boxed non-smalltag constants) are then
+        # rewritten into indexed loads from the kernel state's relocation table, and
+        # `meta.relocations` is finalized into the manifest the loader resolves against.
+        # The 3-arg form would hand the lowering an empty table and strand the slots.
+        air, _ = try
+            invoke_frozen(GPUCompiler.emit_asm, job, mod, meta.relocations,
+                          LLVM.CodeGenFileType.Object)
+        catch err
+            # `emit_asm` has already lowered the module in-place, so stringifying it
+            # here shows exactly what the downgrader was fed
+            ir_file, = dump_artifacts(".ll" => string(mod))
+            error("""Compilation to AIR failed: $(sprint(showerror, err))
+                     If you think this is a bug, please file an issue and attach $(ir_file)""")
+        end
+    end
+    ir = string(mod)
+    entry = meta.entry.name
+    relocations = meta.relocations
 
     @signpost_interval log=log_compiler() "Create Metal library" begin
         metallib = try
@@ -884,6 +901,96 @@ function compile_to_metallib(@nospecialize(job::CompilerJob))
     # and package-image footprint identical to before.
     return (; air, metallib, entry, loggingEnabled,
               relocations = isempty(relocations) ? nothing : relocations)
+end
+
+# ── Across sessions ──────────────────────────────────────────────────────────
+#
+# A kernel compiled at run time has a `CodeInstance` of this session only, and no other
+# process can check that it is still the code the kernel was compiled from. What another
+# process can compare is the LLVM module GPUCompiler makes of it: the AIR downgrade and the
+# Metal library depend on that module, the job's configuration and the compiler, and on
+# nothing else. So the artifacts are kept in CompilerCaching's object cache under those
+# three, and a later session that makes the same module finds them there.
+
+"""Bump to drop every kernel kept under an earlier layout of what is stored."""
+const PERSISTED_SCHEMA = 1
+const PERSISTED_NAMESPACE = "Metal/metallib"
+
+"""
+    persisted_key(job, mod, meta) -> key or nothing
+
+The object-cache key of what `job` lowers its module `mod` to: the module's canonical text
+(`canonical_ir`) and the compiler (`compiler_identity`). `nothing` for what is not kept: a
+kernel referring to host objects, whose relocations name this session's values and are no
+part of its text; anything while a package precompiles, whose image keeps it instead; and
+anything while kernels are dumped, which only lowering does.
+"""
+function persisted_key(@nospecialize(job::CompilerJob), mod::LLVM.Module, meta)
+    (ccall(:jl_generating_output, Cint, ()) == 1 || haskey(ENV, "JULIA_METAL_DUMP_DIR") ||
+     !isempty(meta.relocations)) && return nothing
+    return ObjCache.keyhash(PERSISTED_SCHEMA, canonical_ir(mod), compiler_identity(job))
+end
+
+"""
+    canonical_ir(mod) -> Vector{UInt8}
+
+The text of `mod` without what differs between two sessions compiling the same code. Julia
+numbers the functions and constants it names in the order it compiles them (`julia_f_1234`),
+and the numbers reach the symbols, the names of inlined values, the debug info and the names
+of the alias scopes inlining makes (`!"julia_f_1234: %sret_return"`). A copy of `mod` without
+debug info and value names, its own symbols numbered in module order and the numbers dropped
+from metadata strings, prints the same in every session. A scope is `distinct`, so its name
+tells it from no other. The entry's name in the library is that of the session that lowered
+it, which keeps it with the library.
+"""
+function canonical_ir(mod::LLVM.Module)
+    c = copy(mod)
+    LLVM.strip_debuginfo!(c)
+    i = 0
+    for f in LLVM.functions(c)
+        LLVM.isdeclaration(f) && continue
+        LLVM.name!(f, "f$(i += 1)")
+        foreach(a -> LLVM.name!(a, ""), LLVM.parameters(f))
+        for b in LLVM.blocks(f)
+            LLVM.name!(b, "")
+            foreach(ins -> LLVM.name!(ins, ""), LLVM.instructions(b))
+        end
+    end
+    for g in LLVM.globals(c)
+        LLVM.isdeclaration(g) || LLVM.name!(g, "g$(i += 1)")
+    end
+    text = replace(string(c), r"!\"[^\"]*\"" => name -> replace(name, r"_\d+" => ""))
+    LLVM.dispose(c)
+    # Bytes, not the `String`: SHA reads a `String` a thousand times slower.
+    return Vector{UInt8}(text)
+end
+
+"""
+What lowering depends on besides the module: Metal.jl's build, GPUCompiler's, Julia's, LLVM's
+and the downgrader's versions, and the job's configuration (target, name, kernel or stage).
+"""
+compiler_identity(@nospecialize(job::CompilerJob)) =
+    join((string(Base.module_build_id(@__MODULE__)), string(Base.module_build_id(GPUCompiler)),
+          string(VERSION), string(LLVM.version()), string(pkgversion(LLVMDowngrader_jll)),
+          (repr(getfield(job.config, f)) for f in fieldnames(typeof(job.config))
+           if f !== :cache_owner)...), '\0')
+
+# A relocation-free kernel's artifacts, as the object cache keeps them.
+function persisted_bytes(artifacts)
+    io = IOBuffer()
+    write(io, UInt8(artifacts.loggingEnabled))
+    for field in (artifacts.air, artifacts.metallib, codeunits(artifacts.entry))
+        write(io, UInt64(length(field)), field)
+    end
+    return take!(io)
+end
+
+function persisted_artifacts(bytes::Vector{UInt8})
+    io = IOBuffer(bytes)
+    loggingEnabled = read(io, UInt8) != 0
+    field() = read(io, Int(read(io, UInt64)))
+    air, metallib, entry = field(), field(), String(field())
+    return (; air, metallib, entry, loggingEnabled, relocations = nothing)
 end
 
 # Materialize this session's relocation words for `relocations` in a device buffer, whose GPU
