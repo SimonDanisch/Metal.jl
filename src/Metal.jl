@@ -42,7 +42,6 @@ include("storage_type.jl")
 include("../lib/mtl/MTL.jl")
 using .MTL
 export MTL
-export register_linked_function!
 
 # essential stuff
 include("state.jl")
@@ -66,6 +65,7 @@ include("device/intrinsics/simd.jl")
 include("device/intrinsics/coopmat.jl")
 include("device/intrinsics/indirect.jl")
 include("device/intrinsics/graphics.jl")
+include("device/intrinsics/raytracing.jl")
 include("device/intrinsics/tensor.jl")
 include("device/intrinsics/atomics.jl")
 include("device/malloc.jl")

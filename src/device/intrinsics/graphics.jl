@@ -18,9 +18,7 @@
 # which convention a builtin follows will eventually get it wrong.
 
 export vertex_index, instance_index, frag_coord, frag_coord_x, frag_coord_y,
-       frag_coord_z, frag_coord_w, frag_coord_xy, set_point_size!, dfdx, dfdy,
-       candidate_prim_raw, candidate_ox, candidate_oy, candidate_oz,
-       candidate_dx, candidate_dy, candidate_dz
+       frag_coord_z, frag_coord_w, frag_coord_xy, set_point_size!, dfdx, dfdy
 
 @inline function vertex_index()
     raw = Base.llvmcall(("""
@@ -140,38 +138,3 @@ end
 # whole point of the call IS its side effect.
 @device_function discard_fragment() =
     @typed_ccall("air.discard_fragment", llvmcall, Cvoid, ())
-
-# ── The procedural-candidate builtins ────────────────────────────────────────
-#
-# Read the same way the stage builtins above are: an external global that
-# `stage_builtins!` turns into a trailing parameter of the visible function.
-# See `compiler/graphics.jl` for why these are ambient rather than arguments,
-# and why each component is its own SCALAR rather than a `float3`.
-
-for (fn, gv) in ((:candidate_prim_raw, "__air_candidate_prim"),)
-    @eval @inline function $fn()
-        Base.llvmcall(($("""
-            @$gv = external global i32
-            define i32 @entry() #0 {
-                %val = load i32, ptr @$gv, align 4
-                ret i32 %val
-            }
-            attributes #0 = { alwaysinline }
-        """), "entry"), UInt32, Tuple{})
-    end
-end
-
-for (fn, gv) in ((:candidate_ox, "__air_candidate_ox"), (:candidate_oy, "__air_candidate_oy"),
-                 (:candidate_oz, "__air_candidate_oz"), (:candidate_dx, "__air_candidate_dx"),
-                 (:candidate_dy, "__air_candidate_dy"), (:candidate_dz, "__air_candidate_dz"))
-    @eval @inline function $fn()
-        Base.llvmcall(($("""
-            @$gv = external global float
-            define float @entry() #0 {
-                %val = load float, ptr @$gv, align 4
-                ret float %val
-            }
-            attributes #0 = { alwaysinline }
-        """), "entry"), Float32, Tuple{})
-    end
-end

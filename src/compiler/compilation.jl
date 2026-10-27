@@ -117,138 +117,8 @@ GPUCompiler.relocation_lowering(@nospecialize(job::MetalCompilerJob)) =
 GPUCompiler.isintrinsic(@nospecialize(job::MetalCompilerJob), fn::String) =
     invoke(GPUCompiler.isintrinsic,
            Tuple{CompilerJob{MetalCompilerTarget}, String}, job, fn) ||
-    startswith(fn, "__tensorops_") ||
-    startswith(fn, LINKED_FUNCTION_PREFIX)
+    startswith(fn, "__tensorops_")
 
-
-# ── Externally linked visible functions ───────────────────────────────────────
-#
-# Some things cannot be written in Julia and compiled to AIR. The ray-tracing
-# `intersector<>` is the example that forced this: it is a C++ class template
-# the Metal *frontend* instantiates and inlines, so there is no `air.*` symbol
-# for a `ccall` to name and no `@device_override` that could become one.
-#
-# Metal's answer is `MTLLinkedFunctions`: compile the thing as a `[[visible]]`
-# function in MSL (`MTLLibrary(dev, source)` runs the frontend at runtime, no
-# Xcode needed) and link it into the pipeline of a kernel that calls it. The
-# caller declares it as an ordinary extern:
-#
-#     ccall("extern __metal_linked_trace", llvmcall, Float32,
-#           (LLVMPtr{UInt8,1}, ...), scene_ptr, ...)
-#
-# Two things have to line up for that to work, and both are below: IR
-# validation has to stop treating the symbol as an unknown function (the
-# `isintrinsic` clause above — the same trick `__tensorops_` already uses), and
-# the pipeline has to be created with the function attached.
-#
-# The prefix is load-bearing, not decoration: it is what tells the validator
-# "this is deliberately unresolved, someone will link it". A typo'd name still
-# fails, just later and from Metal rather than from Julia.
-const LINKED_FUNCTION_PREFIX = "__metal_linked_"
-
-const linked_functions_lock = ReentrantLock()
-# Keyed on the device pointer, like `submission_state_per_queue` next door.
-const linked_functions = Dict{id{MTLDevice}, Vector{MTLFunction}}()
-# Those reachable through a VISIBLE FUNCTION TABLE, which is a different
-# promise — see `linked_pipeline`.
-const table_functions = Dict{id{MTLDevice}, Vector{MTLFunction}}()
-
-"""
-    register_table_function!(dev, fun)
-
-Like [`register_linked_function!`](@ref), for a function a shader calls through a
-VISIBLE FUNCTION TABLE rather than by name.
-
-The difference is `functions` against `privateFunctions` in `linked_pipeline`,
-and it is the difference between working and silently not: a private function may
-be INLINED, and an inlined function has no address for a table entry to point at.
-The call is still made, returns undef, and nothing reports it.
-"""
-function register_table_function!(dev::MTLDevice, fun::MTLFunction)
-    name = String(fun.name)
-    Base.@lock linked_functions_lock begin
-        v = get!(() -> MTLFunction[], table_functions, pointer(dev))
-        any(f -> String(f.name) == name, v) || push!(v, fun)
-    end
-    return fun
-end
-
-"""The table-reachable functions registered for `dev`."""
-function table_functions_for(dev::MTLDevice)
-    Base.@lock linked_functions_lock begin
-        v = get(table_functions, pointer(dev), nothing)
-        return v === nothing ? MTLFunction[] : copy(v)
-    end
-end
-
-"""
-    register_linked_function!(dev, fun)
-
-Make `fun` — a `[[visible]]` MSL function — available to every kernel compiled
-for `dev` that calls it by name.
-
-The name must start with `$(LINKED_FUNCTION_PREFIX)`, so that a Julia kernel
-referencing it survives IR validation. Registering the same name twice is a
-no-op, which keeps this callable from a lazy initializer.
-
-Pipelines built while any function is registered take the linked path.
-"""
-function register_linked_function!(dev::MTLDevice, fun::MTLFunction)
-    # `fun.name` is an `NSString`; compare as a Julia `String`.
-    name = String(fun.name)
-    startswith(name, LINKED_FUNCTION_PREFIX) || throw(ArgumentError(
-        "register_linked_function!: name must start with \"$(LINKED_FUNCTION_PREFIX)\" " *
-        "so that IR validation accepts a call to it; got \"$(name)\""))
-    Base.@lock linked_functions_lock begin
-        v = get!(() -> MTLFunction[], linked_functions, pointer(dev))
-        any(f -> String(f.name) == name, v) || push!(v, fun)
-    end
-    return fun
-end
-
-"""The visible functions registered for `dev`, in registration order."""
-function linked_functions_for(dev::MTLDevice)
-    Base.@lock linked_functions_lock begin
-        v = get(linked_functions, pointer(dev), nothing)
-        return v === nothing ? MTLFunction[] : copy(v)
-    end
-end
-
-"""
-Attach `linked` to the pipeline `desc` describes.
-
-`privateFunctions`, not `functions`. Both link the code in, and the difference
-is what the compiler is then allowed to do with it: a function in `functions`
-stays reachable through a visible-function table, so it must survive as a real
-call with a stable ABI; one in `privateFunctions` is visible only to this
-pipeline and CAN BE INLINED. Nothing here ever calls the traversal through a
-function pointer — the kernel names it directly — so the visible-function table
-is API surface promising a reachability nobody uses.
-
-Measured, it is a wash: crown at 1000x1400 / 8 spp came out at 2.770 s against
-2.764 s with `functions`, killeroo at 1.112 s against 1.114 s. So this is not a
-speedup, it is the accurate description of what the pipeline needs; the Metal
-compiler evidently already handles the call boundary well.
-
-`maxCallStackDepth` has to be raised above its default of 1: a linked function
-that itself calls another (the intersector's own helpers count) overflows it,
-and the failure is a pipeline-creation error rather than anything that names
-the cause. Kept even with inlining allowed, because "allowed" is not "will".
-"""
-function link_functions!(desc::MTLComputePipelineDescriptor, dev::MTLDevice,
-                         linked::Vector{MTLFunction})
-    lf = MTL.MTLLinkedFunctions()
-    # the setter takes an ObjC array, not a Julia Vector
-    lf.privateFunctions = NSArray(linked)
-    # …and the table-reachable ones in `functions`, which is the half of this
-    # that survives as a real call. A private function may be inlined and then
-    # has no address for a table entry to name.
-    tbl = table_functions_for(dev)
-    isempty(tbl) || (lf.functions = NSArray(tbl))
-    desc.linkedFunctions = lf
-    desc.maxCallStackDepth = 4
-    return desc
-end
 
 function GPUCompiler.finish_module!(@nospecialize(job::MetalCompilerJob),
                                     mod::LLVM.Module, entry::LLVM.Function)
@@ -457,11 +327,6 @@ function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
         # parameters, so the entry has to be the final one. See
         # `compiler/texture.jl` for why this cannot be an argument the body takes.
         lower_texture_bindings!(job, mod, entry, length(markers))
-        # A visible function's parameters are VALUES; every stage above takes
-        # its arguments the kernel way, one buffer pointer each. Before
-        # `retag_stage!`, because the metadata it writes describes the signature
-        # and would otherwise say `float` over a `ptr addrspace(1)`.
-        isvisiblestage(stage) && (entry = stage_values!(job, mod, entry))
         retag_stage!(job, mod, entry, stage, T_out, markers; pointsize)
         # A stage has no kernel state, so the throw sites GPUCompiler lowered
         # cannot signal through one. Before the cleanup, so the emptied function
@@ -666,14 +531,8 @@ end
                                          gpufamily=nothing, minthreads=nothing,
                                          maxthreads=nothing, stage::Symbol=:kernel,
                                          kwargs...)
-    # `:visible` is not a stage in the rasteriser sense — it is an ordinary AIR
-    # function a kernel CALLS (`MTLLinkedFunctions`), which is how a body that
-    # has to be Julia reaches a loop that has to be MSL. It travels here because
-    # everything a graphics stage needs is what it needs: a real return value
-    # instead of an output pointer, no kernel state, no exception mailbox.
-    stage in (:kernel, :vertex, :fragment, :mesh, :visible, :candidate) ||
-        throw(ArgumentError("stage must be :kernel, :vertex, :fragment, :mesh, " *
-                            ":visible or :candidate, got :$stage"))
+    stage in (:kernel, :vertex, :fragment, :mesh) ||
+        throw(ArgumentError("stage must be :kernel, :vertex, :fragment or :mesh, got :$stage"))
     # A graphics stage reports no exceptions, so it is compiled at debug level 0
     # whatever the session's `-g` is.
     #
@@ -1047,11 +906,6 @@ function link_pipeline(dev::MTLDevice, air::Vector{UInt8},
             desc.requiredThreadsPerThreadgroup = MTLSize(minthreads)
         end
         desc.supportIndirectCommandBuffers = indirect
-        linked = linked_functions_for(dev)
-        # Either registry is enough to take the linked path: a table-only
-        # registration still has to reach `lf.functions`.
-        (isempty(linked) && isempty(table_functions_for(dev))) ||
-            link_functions!(desc, dev, linked)
         try
             return MTLComputePipelineState(dev, desc)
         catch err
