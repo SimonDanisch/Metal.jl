@@ -244,3 +244,28 @@ end
         end
     end
 end
+
+# Kept in the object cache across sessions (`Metal.persisted_key`) is only what a kernel's
+# module shows all of: a relocation names one of this session's values, which the module
+# does not. And the key is the code's, not the names Julia gave it in this session.
+@testset "only relocation-free kernels are kept across sessions" begin
+    function persisted_key(@nospecialize(f), @nospecialize(tt))
+        job = kernel_job(f, tt)
+        GPUCompiler.JuliaContext() do ctx
+            ir, meta = GPUCompiler.compile(:llvm, job)
+            key = Metal.persisted_key(job, ir, meta)
+            LLVM.dispose(ir)
+            key
+        end
+    end
+    tt = Tuple{MtlDeviceVector{Float32,1}}
+    plain!(x) = (@inbounds x[1] = 1f0; return)
+    twin!(x) = (@inbounds x[1] = 1f0; return)
+    other!(x) = (@inbounds x[1] = 2f0; return)
+    @test persisted_key(plain!, tt) !== nothing
+    @test persisted_key(twin!, tt) == persisted_key(plain!, tt)
+    @test persisted_key(other!, tt) != persisted_key(plain!, tt)
+    if LLVM.version() >= v"17"
+        @test persisted_key(reloc_typetag_kernel, Tuple{MtlDeviceVector{UInt,1}}) === nothing
+    end
+end

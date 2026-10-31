@@ -411,8 +411,9 @@ const COMPILE_MISSES = Ref(0)
 """
     compile_stats() -> (; hits, misses)
 
-Kernels served from the compile cache, and kernels built because they were not in
-it. Read through `Mantle.kernelcompiles(device)`; reset with
+Kernels served from the compile cache, in this session, an earlier one (the object
+cache, `persisted_key`) or a package image, and kernels built because they were in
+none of them. Read through `Mantle.kernelcompiles(device)`; reset with
 [`reset_compile_stats!`](@ref).
 """
 compile_stats() = (; hits = COMPILE_HITS[], misses = COMPILE_MISSES[])
@@ -426,7 +427,7 @@ reset_compile_stats!() = (COMPILE_HITS[] = 0; COMPILE_MISSES[] = 0; nothing)
     GPUCompiler.run_compile_hook(job)
     res = GPUCompiler.cached_results(MetalResults, job)
     if res === nothing || res.metallib === nothing
-        COMPILE_MISSES[] += 1
+        # counted there: found in the object cache, or lowered
         artifacts = compile_to_metallib(job)
         res = @something res GPUCompiler.cached_results(MetalResults, job)
         res.air = artifacts.air

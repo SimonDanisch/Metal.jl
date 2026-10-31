@@ -51,15 +51,6 @@ function set_function!(cce::MTLComputeCommandEncoderLike, pip::MTLComputePipelin
     @objc [cce::id{MTLComputeCommandEncoder} setComputePipelineState:pip::id{MTLComputePipelineState}]::Nothing
 end
 
-# A table is bound at a BUFFER index — the shader declares it as a parameter with
-# `[[buffer(n)]]` like any other, and Metal resolves the function pointers behind
-# it. It is also a `MTLResource`, so it needs `useResource!` to be resident just
-# as a buffer reached by address does.
-function set_visible_function_table!(cce::MTLComputeCommandEncoderLike,
-                                     table::MTLVisibleFunctionTable, index::Integer)
-    @objc [cce::id{MTLComputeCommandEncoder} setVisibleFunctionTable:table::id{MTLVisibleFunctionTable} atBufferIndex:index::NSUInteger]::Nothing
-end
-
 function set_buffer!(cce::MTLComputeCommandEncoderLike, buf::MTLBuffer, offset, index)
     @objc [cce::id{MTLComputeCommandEncoder} setBuffer:buf::id{MTLBuffer}
                                              offset:offset::NSUInteger
