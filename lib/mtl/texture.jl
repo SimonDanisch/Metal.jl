@@ -46,14 +46,14 @@ is a LINEAR texture over buffer memory, which an Apple GPU cannot use as a
 render target.
 """
 function MTLTexture(heap::MTLHeap, descriptor, offset)
-    ptr = @objc [heap::id{MTLHeap} newTextureWithDescriptor:descriptor::id{MTLTextureDescriptor}
-                                   offset:offset::NSUInteger]::id{MTLTexture}
+    tex = @objc [heap::id{MTLHeap} newTextureWithDescriptor:descriptor::id{MTLTextureDescriptor}
+                                   offset:offset::NSUInteger]::Union{Nothing,MTLTexture}
     # Metal signals failure by returning nil, and the two ways to get one here
     # are worth telling apart: the heap is too small, or `offset` does not
     # satisfy the alignment `heap_texture_size_and_align` reported. Adopting the
     # nil instead raises `UndefRefError` from inside ObjectiveC, which names
     # neither.
-    if iszero(UInt(ptr))
+    if tex === nothing
         sa = heap_texture_size_and_align(heap.device, descriptor)
         error("could not place a $(descriptor.width)×$(descriptor.height) " *
               "$(descriptor.pixelFormat) texture at offset $offset of a " *
@@ -61,7 +61,7 @@ function MTLTexture(heap::MTLHeap, descriptor, offset)
               "$(sa.align)" *
               (offset % sa.align == 0 ? "" : " — and $offset is not"))
     end
-    return MTLTexture(ptr)
+    return tex
 end
 
 export replace_region!
