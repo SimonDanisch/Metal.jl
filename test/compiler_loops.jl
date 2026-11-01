@@ -23,6 +23,24 @@ end
 @testset "native loop-growth control" begin
     @test which(Metal.GPUCompiler.lower_air!, Tuple{Metal.MetalCompilerJob, LLVM.Module}).module === Metal
     LLVM.Context() do ctx
+        # Dense functions can cross the instruction limit without crossing the
+        # block limit. Exercise its exact boundary independently of block count.
+        for dense in (false, true)
+            mod = parse(LLVM.Module, loop_retention_fixture())
+            try
+                instructions = [inst.ref for f in mod.functions for bb in f.blocks for inst in bb.instructions]
+                limit = length(instructions) + !dense
+                Metal.retain_complex_loops!(mod; min_instructions = limit)
+                @test LLVM.verify(mod) === nothing
+                @test [inst.ref for f in mod.functions for bb in f.blocks for inst in bb.instructions] == instructions
+                @test occursin("llvm.loop.unroll.disable", string(mod)) == dense
+                once = string(mod)
+                Metal.retain_complex_loops!(mod; min_instructions = limit)
+                @test string(mod) == once
+            finally
+                LLVM.dispose(mod)
+            end
+        end
         for (name, metadata) in (
                 ("none", ""),
                 ("vectorize", "!0 = distinct !{!0, !1}\n!1 = !{!\"llvm.loop.vectorize.enable\", i1 true}"),

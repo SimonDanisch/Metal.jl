@@ -55,11 +55,13 @@ end
 # A plain overlay and not `@device_override`, which promises the host's answer: with it,
 # a call on constant arguments is folded with Julia's `min`, where a NaN wins, and the same
 # kernel would answer differently for a literal and for a loaded value.
-for (T, s) in ((:Float32, "f32"), (:Float16, "f16"))
+# Keep LLVM's minNum/maxNum until AIR lowering so optimization can prove bounds
+# such as `max(x, 0) >= 0` and eliminate unreachable square-root error paths.
+for T in (:Float32, :Float16)
     @eval Base.Experimental.@overlay method_table Base.min(x::$T, y::$T) =
-        ccall($"extern air.fmin.$s", llvmcall, $T, ($T, $T), x, y)
+        llvm_math(Val(:minnum), Val(false), x, y)
     @eval Base.Experimental.@overlay method_table Base.max(x::$T, y::$T) =
-        ccall($"extern air.fmax.$s", llvmcall, $T, ($T, $T), x, y)
+        llvm_math(Val(:maxnum), Val(false), x, y)
 end
 
 @device_override FastMath.acos_fast(x::Float32) = llvm_math(Val(:acos), Val(true), x)
