@@ -286,6 +286,15 @@ function zero_undef_phis!(mod::LLVM.Module)
     return mod
 end
 
+# AIR lowering can force-inline helpers containing kernel exits. Inspect its
+# final CFG, immediately before encoding AIR, rather than an earlier graph.
+function GPUCompiler.lower_air!(@nospecialize(job::MetalCompilerJob), mod::LLVM.Module)
+    result = invoke(GPUCompiler.lower_air!,
+                    Tuple{CompilerJob{MetalCompilerTarget}, LLVM.Module}, job, mod)
+    retain_complex_loops!(mod)
+    return result
+end
+
 function GPUCompiler.finish_ir!(@nospecialize(job::MetalCompilerJob),
                                     mod::LLVM.Module, entry::LLVM.Function)
     entry = invoke(GPUCompiler.finish_ir!,
