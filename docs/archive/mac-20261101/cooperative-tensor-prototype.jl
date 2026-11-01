@@ -1,6 +1,6 @@
 using Metal: MtlInlineTensor, TensorOpsMatmul2D, matmul2d_descriptor,
-             matmul2d_multiply, matmul2d_multiply_accumulate, MtlCooperativeTensor,
-             Int2b, coordinate
+    matmul2d_multiply, matmul2d_multiply_accumulate, MtlCooperativeTensor,
+    Int2b, coordinate
 
 # C = A * B sliced over K: a TM x TK slice of A staged in threadgroup memory, B read from the
 # device, the sum held in a cooperative destination and stored once, clipped to C.
@@ -14,8 +14,10 @@ function coop_gemm_kernel!(C, A, B, ::Val{TM}, ::Val{TN}, ::Val{TK}, ::Val{NSIMD
     sA = MtlThreadGroupArray(Float16, (TM, TK))
     tA = MtlInlineTensor(sA)
     tB = MtlInlineTensor(B)
-    op = TensorOpsMatmul2D{matmul2d_descriptor(TM, TN, TK; mode = matmul2d_multiply_accumulate),
-                           Int32(NSIMD)}()
+    op = TensorOpsMatmul2D{
+        matmul2d_descriptor(TM, TN, TK; mode = matmul2d_multiply_accumulate),
+        Int32(NSIMD),
+    }()
     acc = MtlCooperativeTensor{Float32}(op, Float16, Float16)
     ncols = min(Int32(TN), Int32(N) - n0)
     for k0 in Int32(0):Int32(TK):Int32(K - 1)
@@ -90,14 +92,17 @@ end
         # where it is NOT M*N*4/threads (TN = 40 and 24 round up, eight simdgroups over a
         # narrow tile reserve twice), so a guessed size corrupts them.
         @testset "sliced $(M)x$(N)x$K, tile $(TM)x$TN, $NSIMD simdgroups" for
-                (M, N, K, TM, TN, NSIMD) in ((64, 64, 256, 64, 64, 4), (100, 70, 256, 64, 40, 4),
-                                             (64, 48, 128, 64, 24, 4), (64, 32, 128, 32, 64, 8),
-                                             (128, 128, 512, 64, 128, 4), (64, 64, 128, 64, 64, 1))
+            (M, N, K, TM, TN, NSIMD) in (
+                (64, 64, 256, 64, 64, 4), (100, 70, 256, 64, 40, 4),
+                (64, 48, 128, 64, 24, 4), (64, 32, 128, 32, 64, 8),
+                (128, 128, 512, 64, 128, 4), (64, 64, 128, 64, 64, 1),
+            )
             A = rand(Float16, M, K) .- Float16(0.5)
             B = rand(Float16, K, N) .- Float16(0.5)
             C = MtlArray(fill(NaN32, M, N))
             Metal.@sync @metal threads = 32NSIMD groups = (cld(M, TM), cld(N, TN)) coop_gemm_kernel!(
-                C, MtlArray(A), MtlArray(B), Val(TM), Val(TN), Val(32), Val(NSIMD))
+                C, MtlArray(A), MtlArray(B), Val(TM), Val(TN), Val(32), Val(NSIMD)
+            )
             ref = Float32.(A) * Float32.(B)
             @test maximum(abs, Array(C) .- ref) / maximum(abs, ref) < 1.0f-5
         end
@@ -108,8 +113,10 @@ end
             B = rand(Float16, K, TN) .- Float16(0.5)
             C = MtlArray(fill(NaN32, TM, TN))
             D = MtlArray(fill(NaN32, TM, TN))
-            Metal.@sync @metal threads = 128 coop_elements_kernel!(C, D, MtlArray(A), MtlArray(B),
-                                                                   Val(TM), Val(TN), Val(4))
+            Metal.@sync @metal threads = 128 coop_elements_kernel!(
+                C, D, MtlArray(A), MtlArray(B),
+                Val(TM), Val(TN), Val(4)
+            )
             ref = Float32.(A) * Float32.(B)
             @test maximum(abs, Array(C) .- 2 .* ref) / maximum(abs, ref) < 1.0f-5
             @test maximum(abs, Array(D) .- (ref .+ 1)) / maximum(abs, ref) < 1.0f-5
@@ -134,8 +141,10 @@ end
             end
             X = rand(Float16, K, N) .- Float16(0.5)
             C = MtlArray(fill(NaN32, M, N))
-            Metal.@sync @metal threads = 128 coop_int2_kernel!(C, MtlArray(bytes), MtlArray(X),
-                                                               Val(M), Val(N), Val(K))
+            Metal.@sync @metal threads = 128 coop_int2_kernel!(
+                C, MtlArray(bytes), MtlArray(X),
+                Val(M), Val(N), Val(K)
+            )
             ref = Float32.(permutedims(t)) * Float32.(X)
             @test maximum(abs, Array(C) .- ref) / maximum(abs, ref) < 1.0f-5
         end
