@@ -81,6 +81,7 @@ include("array.jl")
 # compiler implementation
 include("compiler/library.jl")
 include("compiler/loops.jl")
+include("compiler/exception_tails.jl")
 include("compiler/compilation.jl")
 include("compiler/graphics.jl")
 # The mesh stage, after `graphics.jl`: it reuses `mangle_varying`, `air_stage_name`

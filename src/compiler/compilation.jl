@@ -291,6 +291,7 @@ end
 function GPUCompiler.lower_air!(@nospecialize(job::MetalCompilerJob), mod::LLVM.Module)
     result = invoke(GPUCompiler.lower_air!,
                     Tuple{CompilerJob{MetalCompilerTarget}, LLVM.Module}, job, mod)
+    merge_exception_tails!(mod)
     retain_complex_loops!(mod)
     return result
 end
