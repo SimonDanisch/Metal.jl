@@ -24,7 +24,7 @@ function binary_function(lib, name)
     return fun
 end
 
-function run()
+function run(; helpers = nothing)
     dev = Metal.device()
     source = """
     #include <metal_stdlib>
@@ -48,7 +48,8 @@ function run()
     """
     lib = MTL.MTLLibrary(dev, source)
     # Compile each helper once, then pass these same objects to both pipelines.
-    funcs = [binary_function(lib, "squared"), binary_function(lib, "doubled")]
+    funcs = isnothing(helpers) ?
+        [binary_function(lib, "squared"), binary_function(lib, "doubled")] : helpers
     linked = @objc [MTLLinkedFunctions new]::MTLLinkedFunctions
     linked.binaryFunctions = NSArray(funcs)
     xs = collect(range(0.1f0, 0.9f0; length = 256))
