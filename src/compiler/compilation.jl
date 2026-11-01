@@ -693,6 +693,13 @@ function compile_to_metallib(@nospecialize(job::CompilerJob))
 
         # the IR belongs to us: lower and inspect it, then dispose of it
         @dispose mod=mod begin
+            # Runtime-library linking can leave references reachable only from dead
+            # helpers. Emission removes those helpers, but the earlier cache policy
+            # would reject their relocation records before that cleanup could run.
+            if ccall(:jl_generating_output, Cint, ()) == 0 &&
+               !haskey(ENV, "JULIA_METAL_DUMP_DIR")
+                prune_cache_relocations!(job, mod, meta.relocations)
+            end
             key = persisted_key(job, mod, meta)
             found = key === nothing ? nothing : ObjCache.get(PERSISTED_NAMESPACE, key)
             if found !== nothing
@@ -783,6 +790,21 @@ end
 """Bump to drop every kernel kept under an earlier layout of what is stored."""
 const PERSISTED_SCHEMA = 1
 const PERSISTED_NAMESPACE = "Metal/metallib"
+
+function prune_cache_relocations!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
+                                  relocs::GPUCompiler.Relocations)
+    isempty(relocs) && return
+    # This pass already runs during prepare_execution!. Running it before the
+    # cache decision exposes which references the emitted module actually needs.
+    @dispose pb=LLVM.PassBuilder() begin
+        LLVM.add!(pb, LLVM.GlobalDCEPass())
+        GPUCompiler.with_llvm_machine(job.config.target) do tm
+            LLVM.run!(pb, mod, tm)
+        end
+    end
+    GPUCompiler.prune_dead_relocations!(mod, relocs)
+    return
+end
 
 """
     persisted_key(job, mod, meta) -> key or nothing
