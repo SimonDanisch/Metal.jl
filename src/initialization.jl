@@ -60,7 +60,13 @@ function __init__()
     init_label_resources!()
 
     precompiling = ccall(:jl_generating_output, Cint, ()) != 0
-    precompiling && return
+    if precompiling
+        # A dependent's workload runs GPU code while its image is built, and the classes
+        # it names resolve only from a loaded framework: without this, every workload
+        # reaching a GEMM stopped at "Couldn't find class MPSGraph".
+        Sys.isapple() && foreach(load_framework, ("CoreGraphics", "MetalPerformanceShadersGraph", "QuartzCore"))
+        return
+    end
 
     MTL.submit_hook[] = submit_command_buffer
 
