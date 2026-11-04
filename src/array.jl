@@ -262,7 +262,7 @@ Base.unaliascopy(x::MtlArray) = copy(x)
     else
         error("unknown memory type")
     end
-    Base.unsafe_convert(PT, x) + Base._memory_offset(x, i)
+    Base.unsafe_convert(PT, x) + Base._memory_offset(x, i)::Int
 end
 
 

@@ -603,11 +603,15 @@ end
             throw(ArgumentError("minthreads should be an integer or a tuple of up to three integers, got $(minthreads)"))
         end
         # normalize, so that equivalent sizes share a compiled kernel
-        minthreads = ntuple(i -> i <= length(minthreads) ? Int(minthreads[i]) : 1, 3)
-        if any(<(1), minthreads) || any(minthreads .> (limits.width, limits.height, limits.depth)) ||
-           prod(minthreads) > maxtotal
-            throw(ArgumentError("minthreads $(minthreads) is not a valid threadgroup size for this device (at most $(Int(limits.width))×$(Int(limits.height))×$(Int(limits.depth)) and $(maxtotal) threads in total)"))
+        #
+        # Typed: the closure boxes `minthreads`, and a `.>` on `Any` here tied every kernel's
+        # lookup to `broadcasted`, which Makie extends, so loading it dropped them from images.
+        threads = ntuple(i -> i <= length(minthreads) ? Int(minthreads[i]) : 1, 3)::NTuple{3,Int}
+        if any(<(1), threads) || any(threads .> (limits.width, limits.height, limits.depth)) ||
+           prod(threads) > maxtotal
+            throw(ArgumentError("minthreads $(threads) is not a valid threadgroup size for this device (at most $(Int(limits.width))×$(Int(limits.height))×$(Int(limits.depth)) and $(maxtotal) threads in total)"))
         end
+        minthreads = threads
         # enforced through the pipeline descriptor's `requiredThreadsPerThreadgroup`, which the
         # runtime only provides on macOS 26, regardless of the targeted Metal version
         if macos_version() < v"26"
