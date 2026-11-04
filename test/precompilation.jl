@@ -28,9 +28,22 @@ if GPUCompiler.supports_relocatable_ir() && LLVM.version() >= v"17"
         # the kernel state's relocation table keeps the metallib session-portable, so it now
         # precompiles (the old session-local bake refused to). Both must launch in the fresh
         # process without re-invoking the compiler.
+        # A kernel and a callable of ANOTHER package than the workload's. Julia verifies such a
+        # kernel's edges when the image loads, which `Bool(::Bool)` used to fail.
+        write(joinpath(load_path, "MetalPersistKernels.jl"), """
+        module MetalPersistKernels
+        struct Cast{T,F}; f::F; end
+        Cast(::Type{T}, f::F) where {T,F} = Cast{T,F}(f)
+        @inline (c::Cast{T})(x) where {T} = T(c.f(x))
+        function apply_kernel(out, a, f)
+            @inbounds out[1] = f(a[1])
+            return
+        end
+        end
+        """)
         write(joinpath(load_path, "MetalPersistWorkload.jl"), """
         module MetalPersistWorkload
-        using Metal, PrecompileTools
+        using Metal, PrecompileTools, MetalPersistKernels
         struct RGB; r::Int32; g::Int32; b::Int32; end
         @noinline produce(cond::Bool, a::Int32) = cond ? a : RGB(11, 22, 33)
         function reloc_kernel(out, cond::Bool, a::Int32)
@@ -38,7 +51,14 @@ if GPUCompiler.supports_relocatable_ir() && LLVM.version() >= v"17"
             @inbounds out[1] = x isa RGB ? x.r : Int32(-2)
             return
         end
+        # What a launch left behind, kept in the image to read back in the next process.
+        const WORKLOAD_FILLED = Ref{Int32}(0)
         @compile_workload begin
+            WORKLOAD_FILLED[] = Array(Metal.fill(Int32(7), 1))[1]
+            let out = Metal.zeros(Bool, 1), a = MtlArray(Bool[true])
+                @metal threads=1 MetalPersistKernels.apply_kernel(out, a, MetalPersistKernels.Cast(Bool, !))
+                Metal.synchronize()
+            end
             let a = MtlArray(Float32[1, 2, 3])
                 a .+ 1f0
                 Metal.synchronize()
@@ -71,6 +91,8 @@ if GPUCompiler.supports_relocatable_ir() && LLVM.version() >= v"17"
         proc_b = raw"""
         using MetalPersistWorkload, Metal
         using .MetalPersistWorkload: reloc_kernel
+        using MetalPersistKernels: apply_kernel, Cast
+        println("FILLED=", MetalPersistWorkload.WORKLOAD_FILLED[])
         c0 = Metal.compilations[]
         a = MtlArray(Float32[1, 2, 3])
         b = a .+ 1f0
@@ -78,7 +100,10 @@ if GPUCompiler.supports_relocatable_ir() && LLVM.version() >= v"17"
         out = Metal.zeros(Int32, 1)
         @metal threads=1 reloc_kernel(out, false, Int32(7))
         Metal.synchronize()
-        println("RESULT=", Array(b) == Float32[2, 3, 4] && Array(out)[1] == 11)
+        flag = Metal.ones(Bool, 1)
+        @metal threads=1 apply_kernel(flag, MtlArray(Bool[true]), Cast(Bool, !))
+        Metal.synchronize()
+        println("RESULT=", Array(b) == Float32[2, 3, 4] && Array(out)[1] == 11 && Array(flag)[1] == false)
         println("COMPILATIONS=", Metal.compilations[] - c0)
         """
         out = read(setenv(`$jl -e $proc_b`, env), String)
@@ -88,6 +113,8 @@ if GPUCompiler.supports_relocatable_ir() && LLVM.version() >= v"17"
         compilations = m === nothing ? -1 : parse(Int, m.captures[1])
 
         @test result
+        # a dependent's workload runs its launches, as it does Mantle's plans
+        @test contains(out, "FILLED=7")
         # the headline: zero compiler invocations in the warm session. On the 1.13
         # pre-releases, external CodeInstances survive only flakily (see above), so
         # the count is skipped rather than marked broken: a lucky run would otherwise

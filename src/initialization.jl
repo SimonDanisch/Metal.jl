@@ -3,6 +3,9 @@
 # World age captured at __init__ time. Used to invoke the GPU-compiler stack
 # in a frozen world to avoid latency from invalidations.
 const initialized = Ref{Bool}(false)
+# Whether `__init__` ran at all, which it has not while Metal's own image is built. A
+# dependent's image build has run it, even though it returned before `initialized` is set.
+const loaded = Ref{Bool}(false)
 const initialization_world = Ref{UInt}(typemax(UInt))
 
 """
@@ -57,18 +60,21 @@ function __init__()
     # also applies when precompiling another package, whose workload may allocate.
     Base.@atomic freed_buffers.head = nothing
 
+    loaded[] = true
     init_label_resources!()
+
+    MTL.submit_hook[] = submit_command_buffer
 
     precompiling = ccall(:jl_generating_output, Cint, ()) != 0
     if precompiling
         # A dependent's workload runs GPU code while its image is built, and the classes
         # it names resolve only from a loaded framework: without this, every workload
-        # reaching a GEMM stopped at "Couldn't find class MPSGraph".
+        # reaching a GEMM stopped at "Couldn't find class MPSGraph". The submit hook above
+        # is for the same workloads: without it, a command buffer committed outside a
+        # batch does not flush the batch in front of it.
         Sys.isapple() && foreach(load_framework, ("CoreGraphics", "MetalPerformanceShadersGraph", "QuartzCore"))
         return
     end
-
-    MTL.submit_hook[] = submit_command_buffer
 
     if !Sys.isapple() || Sys.ARCH != :aarch64
         @error "Metal.jl is only supported on Apple Silicon"

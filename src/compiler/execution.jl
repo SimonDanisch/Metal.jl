@@ -636,7 +636,11 @@ end
 function launch(kernel::HostKernel, gs::MTLSize, ts::MTLSize,
                 bq::BatchedCommandQueue, args::Tuple, submit::Bool,
                 indirect = nothing)
-    precompiling = ccall(:jl_generating_output, Cint, ()) != 0
+    # Only Metal's own image build encodes and drops a launch. A dependent's workload runs
+    # it, because the rest of that workload does: Mantle's plans submit for real, and they
+    # read what a dropped `fill!` or `copyto!` never wrote. Kokoro's text graph threw an
+    # InexactError on such tokens and its workload stopped there.
+    precompiling = !loaded[]
 
     (gs.width>0 && gs.height>0 && gs.depth>0) ||
         throw(ArgumentError("All group dimensions should be non-zero"))
