@@ -69,7 +69,8 @@ include("mtl4.jl")
 # `Foundation.release` is unspecialized, for the finalizers of all managed wrappers, and asking
 # it for a wrapper's traits allocates. These are unmanaged, so a release is one message, and a
 # recorded plan sends it per submission.
-const SubmissionRef = Union{MTLCommandBufferRef, MTLComputeCommandEncoderRef, MTL4ComputeCommandEncoderRef}
+const SubmissionRef = Union{MTLCommandBufferRef, MTLComputeCommandEncoderRef, MTLBlitCommandEncoderRef,
+                            MTL4ComputeCommandEncoderRef}
 function Foundation.release(obj::SubmissionRef)
     ptr = Base.bitcast(id{Object}, getfield(obj, :ptr))
     @objc [ptr::id{Object} release]::Cvoid
