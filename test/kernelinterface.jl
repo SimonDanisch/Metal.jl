@@ -90,6 +90,40 @@ end
     @test_throws ArgumentError kernel(A; ndrange=4, stream=nothing)
 end
 
+@testset "events on a bound queue" begin
+    dev = device()
+    # neither adopted nor the task's own queue: only the backend knows it
+    bq = Metal.BatchedCommandQueue(MTL.MTLCommandQueue(dev))
+    Metal.own_flushes!(bq, true)
+    backend = MetalBackend(bq)
+    A = MtlArray{Int,1,Metal.SharedStorage}(undef, 4)
+    host = unsafe_wrap(Array, A)
+    fill!(host, 0)
+    kernel = KI.@launch backend launch=false ki_fill!(A)
+
+    # the signal follows the work open on the bound queue, and submits it
+    kernel(A; ndrange=4)
+    event, value = KI.record_event(backend)
+    t0 = time()
+    while event.signaledValue < value && time() - t0 < 10
+        yield()
+    end
+    @test event.signaledValue >= value
+    @test host == 1:4
+
+    # the bound queue waits for the event
+    fill!(host, 0)
+    gate = MTL.MTLSharedEvent(dev)
+    KI.wait_event(backend, (gate, UInt64(1)))
+    kernel(A; ndrange=4)
+    Metal.flush!(bq)
+    sleep(0.2)
+    @test host == zeros(Int, 4)
+    gate.signaledValue = 1
+    KI.synchronize(backend)
+    @test host == 1:4
+end
+
 @testset "limits" begin
     backend = MetalBackend()
     dims = KI.max_work_group_dims(backend)

@@ -10,9 +10,11 @@ function compiler_clamped_sqrt_kernel!(out, input)
     return
 end
 
+# Julia's NaN-propagating `max` (`llvm.maximum`) is never ordered less than zero against
+# +0.0 either, so LLVM still removes `sqrt`'s domain-error path.
 @testset "optimizable floating-point bounds" begin
     ir = sprint(io -> Metal.code_llvm(io, compiler_clamped_sqrt, Tuple{Float32}; debuginfo = :none))
-    @test occursin("llvm.maxnum.f32", ir)
+    @test occursin("llvm.maximum.f32", ir)
     @test !occursin("throw_complex_domainerror", ir)
     @test !occursin("llvm.trap", ir)
 
@@ -30,6 +32,6 @@ end
     inputs = Float32[-Inf, -4, -0.0, 0, 4, Inf, NaN]
     input = MtlArray(inputs);output = similar(input)
     Metal.@sync @metal threads = length(inputs) compiler_clamped_sqrt_kernel!(output, input)
-    expected = [isnan(x) ? 0.0f0 : sqrt(max(x, 0.0f0)) for x in inputs]
-    @test Array(output) == expected
+    expected = [sqrt(max(x, 0.0f0)) for x in inputs]
+    @test isequal(Array(output), expected)
 end

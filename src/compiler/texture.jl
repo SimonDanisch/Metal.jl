@@ -1,6 +1,6 @@
 # Sampling a bound 2D texture, on Metal.
 #
-# `KernelInterface.sample_texture_2d(binding, u, v, component)` names a SLOT, not a
+# `Lava.sample_texture_2d(binding, u, v, component)` names a SLOT, not a
 # handle, because that is the shape a descriptor set gives on Vulkan: the texture is
 # a module-level resource there and a shader reaches it by number. AIR has no such
 # thing — a texture is a PARAMETER of the entry function, and a shader body several
@@ -132,7 +132,7 @@ const AIR_SAMPLER_PLACEHOLDER = "air.jl.sampler_at_binding"
 # texture_2d_at_binding(binding) / sampler_at_binding(binding)
 #
 # "The texture bound at `binding`", as a value the shader can hand the intrinsic.
-# `binding` counts from ZERO, matching `KernelInterface.sample_texture_2d`, and has
+# `binding` counts from ZERO, matching `Lava.sample_texture_2d`, and has
 # to be a literal: `lower_texture_bindings!` reads it off the call.
 #
 # `air.jl.` and not `air.`, because nothing in AIR answers these: they exist only
@@ -154,7 +154,7 @@ end
 One component of a filtered sample from the 2D texture bound at `binding`.
 
 `binding` and `component` both count from zero, which is
-`KernelInterface.sample_texture_2d`'s convention and not this package's — a component
+`Lava.sample_texture_2d`'s convention and not this package's — a component
 is a vector lane and a binding is an encoder slot, and neither is an index into
 anything Julia owns.
 """

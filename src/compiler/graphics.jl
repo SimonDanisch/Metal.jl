@@ -90,7 +90,7 @@
 #    air.arg_name, "output"}
 #
 # The two integers are max_vertices and max_primitives, and the string is the
-# topology. They are part of the TYPE, which is why `KernelInterface.MeshConfig`
+# topology. They are part of the TYPE, which is why `Lava.MeshConfig`
 # holds them rather than a runtime: a backend cannot emit this entry without
 # them.
 #

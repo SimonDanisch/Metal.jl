@@ -96,6 +96,7 @@ while holding `submission_lock`:
   `dispatch_indirect!(ctx, buf, offset, threads)`;
 - `blit_encoder(bq)`: return a context supporting `append_copy!` and `append_fillbuffer!`;
 - `encode_event_wait!(bq, event, value)`: make subsequent work wait for `event`;
+- `encode_event_signal!(bq, event, value)`: signal `event` once the work so far completes;
 - `end_encoder!(bq)`: close the current encoder, if any;
 - `commit_open_batch!(bq)`: submit the open batch and forget about it (`has_open_batch`
   becomes false), returning a completion token that holds the batch's reference to what
@@ -686,6 +687,12 @@ end
 function encode_event_wait!(bq::Metal3Queue, event, value)
     end_encoder!(bq)
     encode_wait!(ensure_cmdbuf!(bq), event, value)
+    return
+end
+
+function encode_event_signal!(bq::Metal3Queue, event, value)
+    end_encoder!(bq)
+    encode_signal!(ensure_cmdbuf!(bq), event, value)
     return
 end
 

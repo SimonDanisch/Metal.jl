@@ -353,6 +353,15 @@ function encode_event_wait!(bq::Metal4Queue, event, value)
     return
 end
 
+# and signal them themselves: commit a batch, which orders itself after the Metal 3 work
+# submitted before it, then signal after it
+function encode_event_signal!(bq::Metal4Queue, event, value)
+    ensure_cmdbuf!(bq)
+    commit_batch!(bq)
+    MTL.signal_event!(bq.backend.queue4, event, value)
+    return
+end
+
 
 ## submission
 

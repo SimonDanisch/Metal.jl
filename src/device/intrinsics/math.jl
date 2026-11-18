@@ -47,21 +47,9 @@ end
     return call
 end
 
-# `min`/`max` of floats in a kernel are IEEE 754-2008 minNum/maxNum: a NaN operand loses to
-# a number, and only two NaNs give a NaN. That is MSL's `fmin`/`fmax`, and it is how CUDA.jl
-# (`fminf`), AMDGPU.jl (ocml `fmin`) and the SPIR-V backends lower `Base.min`, so a kernel
-# gives the same answer on all of them; a NaN in a max-reduction is dropped, not spread.
-#
-# A plain overlay and not `@device_override`, which promises the host's answer: with it,
-# a call on constant arguments is folded with Julia's `min`, where a NaN wins, and the same
-# kernel would answer differently for a literal and for a loaded value.
-# Keep LLVM's minNum/maxNum until AIR lowering so optimization can prove bounds
-# such as `max(x, 0) >= 0` and eliminate unreachable square-root error paths.
-for T in (:Float32, :Float16)
-    @eval Base.Experimental.@overlay method_table Base.min(x::$T, y::$T) =
-        llvm_math(Val(:minnum), Val(false), x, y)
-    @eval Base.Experimental.@overlay method_table Base.max(x::$T, y::$T) =
-        llvm_math(Val(:maxnum), Val(false), x, y)
+@static if VERSION < v"1.12"
+    @device_override Base.min(x::Float16, y::Float16) = ccall("llvm.minimum.f16", llvmcall, Float16, (Float16, Float16), x, y)
+    @device_override Base.max(x::Float16, y::Float16) = ccall("llvm.maximum.f16", llvmcall, Float16, (Float16, Float16), x, y)
 end
 
 @device_override FastMath.acos_fast(x::Float32) = llvm_math(Val(:acos), Val(true), x)

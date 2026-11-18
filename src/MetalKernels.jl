@@ -60,12 +60,6 @@ KI.supports_partitionable_subgroups(::MetalBackend) = true
 # other primitive types (e.g. 64-bit integers) and structs as `UInt32` words.
 const ShuffleTypes = Union{Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8}
 KI.supports_shuffle(::MetalBackend, ::Type{<:ShuffleTypes}) = true
-# `simd_shuffle` takes the same types as `simd_shuffle_down`: both come from
-# `simd_shuffle_map`. Float64 is absent because an Apple GPU does not have it.
-KI.shfl_types(::MetalBackend) =
-    DataType[Float32, Float16, Int32, UInt32, Int16, UInt16, Int8, UInt8]
-# the types `simd_sum` is tested with on the device
-KI.sub_group_reduce_add_types(::MetalBackend) = DataType[Float32, Float16, Int32, UInt32]
 
 Adapt.adapt_storage(::MetalBackend, a::AbstractArray) = Adapt.adapt(MtlArray, a)
 Adapt.adapt_storage(::MetalBackend, a::MtlArray) = a
@@ -236,23 +230,26 @@ end
 
 ## events
 
-# signal a new event once the work the task has queued so far completes
-function KI.record_event(::MetalBackend)
-    dev = device()
-    event = MTLSharedEvent(dev)
+# the queue the backend's work goes to: its own, or the calling task's
+launch_queue(b::MetalBackend) = b.queue === nothing ? global_queue(device()) : b.queue
+
+# signal a new event once the work queued so far on the backend's queue completes. the
+# signal ends the open batch, which is submitted with it, so it also works for a queue the
+# commit hook does not know (one bound to the backend that is neither adopted nor the task's)
+function KI.record_event(b::MetalBackend)
+    bq = launch_queue(b)
+    event = MTLSharedEvent(bq.device)
     value = event.signaledValue + 1
-    # committing the command buffer first submits the task's open batch of work
-    cmdbuf = MTLCommandBuffer(global_queue(dev))
-    encode_signal!(cmdbuf, event, value)
-    commit!(cmdbuf)
+    Base.@lock Metal.submission_lock Metal.encode_event_signal!(bq, event, value)
+    Metal.flush!(bq)
     return (event, value)
 end
 
-# make the GPU wait, instead of blocking the host: the wait goes into the task's open batch
-# of work, before the work that is queued next
-function KI.wait_event(::MetalBackend, ev::Tuple{MTLSharedEvent, UInt64})
+# make the GPU wait, instead of blocking the host: the wait goes into the open batch of the
+# backend's queue, before the work that is queued next
+function KI.wait_event(b::MetalBackend, ev::Tuple{MTLSharedEvent, UInt64})
     event, value = ev
-    bq = global_queue(device())
+    bq = launch_queue(b)
     # other tasks may commit the open batch, but only while holding this lock
     Base.@lock Metal.submission_lock begin
         Metal.encode_event_wait!(bq, event, value)
@@ -324,9 +321,11 @@ end
 @device_override @inline KI.sub_group_any(pred::Bool) = ballot(pred) != 0
 @device_override @inline KI.sub_group_all(pred::Bool) = ballot(!pred) == 0
 
-# the hardware reduction, rather than a shuffle loop
-@device_override function KI.sub_group_reduce_add(val::T) where T
-    simd_sum(val)
+# `+` with the hardware reduction rather than KI's shuffle butterfly, which KI allows to
+# combine the values in another order; `simd_sum` sums the active lanes, which is KI's
+# sub-group in a partial SIMD-group
+for T in (Float32, Float16, Int32, UInt32)
+    @eval @device_override @inline KI.sub_group_reduce(::typeof(+), val::$T) = simd_sum(val)
 end
 
 
