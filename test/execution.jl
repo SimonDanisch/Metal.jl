@@ -1842,6 +1842,13 @@ end
     Base.invokelatest(launch)
     @test count() == n+1
 
+    # in a newer world the lookup runs again, and finds the kernel compiled
+    hits = Metal.cache_hits[]
+    @eval mod unrelated() = nothing
+    Base.invokelatest(launch)
+    @test count() == n+1
+    @test Metal.cache_hits[] == hits+1
+
     # jobs differing only in codegen-level settings get their own artifacts...
     Metal.mtlfunction(mod.kernel, Tuple{}; name="custom")
     @test count() == n+2

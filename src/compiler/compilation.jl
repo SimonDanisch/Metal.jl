@@ -1027,6 +1027,11 @@ end
 # onto the cached `MetalResults`. All byte/string fields are session-portable.
 const compilations = Threads.Atomic{Int}(0)
 
+# The lookups `compile_or_lookup` answered with a kernel compiled earlier: in this session,
+# or while a package precompiled. Next to `compilations`, it tells a workload that compiled
+# nothing apart from one that ran no kernels.
+const cache_hits = Threads.Atomic{Int}(0)
+
 @public compile_to_metallib
 
 """
